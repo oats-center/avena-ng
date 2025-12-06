@@ -8,8 +8,9 @@ pub mod wg;
 
 pub use address::NetworkConfig;
 pub use crypto::{
-    derive_session_keys, CertError, Certificate, CertificateChain, CertValidator,
-    EphemeralKeypair, HandshakeError, HandshakeMessage, SessionKeys,
+    derive_session_keys, derive_wireguard_keypair, wireguard_pubkey, CertError, Certificate,
+    CertificateChain, CertValidator, EphemeralKeypair, HandshakeError, HandshakeMessage,
+    SessionKeys, WireguardKeypair,
 };
 pub use discovery::{
     Capability, DiscoveredPeer, DiscoveryConfig, DiscoveryError, DiscoveryEvent,

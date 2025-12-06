@@ -29,6 +29,12 @@ impl EphemeralKeypair {
         Self { secret, public }
     }
 
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let secret = StaticSecret::from(seed);
+        let public = X25519PublicKey::from(&secret);
+        Self { secret, public }
+    }
+
     pub fn public_key(&self) -> &X25519PublicKey {
         &self.public
     }
@@ -50,6 +56,8 @@ pub struct HandshakeMessage {
     #[serde_as(as = "Bytes")]
     pub nonce: [u8; 32],
     #[serde_as(as = "Bytes")]
+    pub wg_pubkey: [u8; 32],
+    #[serde_as(as = "Bytes")]
     pub signature: [u8; 64],
 }
 
@@ -58,22 +66,25 @@ impl HandshakeMessage {
         device: &DeviceKeypair,
         ephemeral: &EphemeralKeypair,
         peer_id: &DeviceId,
+        wg_pubkey: [u8; 32],
     ) -> Self {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
 
         let ephemeral_pubkey = ephemeral.public_key_bytes();
 
-        let mut message_to_sign = Vec::with_capacity(32 + 32 + 16);
+        let mut message_to_sign = Vec::with_capacity(32 + 32 + 16 + 32);
         message_to_sign.extend_from_slice(&ephemeral_pubkey);
         message_to_sign.extend_from_slice(&nonce);
         message_to_sign.extend_from_slice(peer_id.as_bytes());
+        message_to_sign.extend_from_slice(&wg_pubkey);
 
         let signature = device.sign(&message_to_sign);
 
         Self {
             ephemeral_pubkey,
             nonce,
+            wg_pubkey,
             signature: signature.to_bytes(),
         }
     }
@@ -83,10 +94,11 @@ impl HandshakeMessage {
         peer_pubkey: &VerifyingKey,
         local_id: &DeviceId,
     ) -> Result<(), HandshakeError> {
-        let mut message_to_verify = Vec::with_capacity(32 + 32 + 16);
+        let mut message_to_verify = Vec::with_capacity(32 + 32 + 16 + 32);
         message_to_verify.extend_from_slice(&self.ephemeral_pubkey);
         message_to_verify.extend_from_slice(&self.nonce);
         message_to_verify.extend_from_slice(local_id.as_bytes());
+        message_to_verify.extend_from_slice(&self.wg_pubkey);
 
         let signature = Signature::from_bytes(&self.signature);
         peer_pubkey
@@ -105,9 +117,35 @@ pub struct SessionKeys {
     pub wireguard_psk: Zeroizing<[u8; 32]>,
 }
 
+#[derive(Clone)]
+pub struct WireguardKeypair {
+    pub private: Zeroizing<[u8; 32]>,
+    pub public: [u8; 32],
+}
+
 const SESSION_KEY_SALT: &[u8] = b"avena-session-keys-v1";
 const WG_PRIVATE_INFO: &[u8] = b"wireguard-private";
 const WG_PSK_INFO: &[u8] = b"wireguard-psk";
+const WG_DEVICE_KEY_SALT: &[u8] = b"avena-wireguard-device-key-v1";
+const WG_DEVICE_KEY_INFO: &[u8] = b"wireguard-interface";
+
+pub fn wireguard_pubkey(private_key: &[u8; 32]) -> [u8; 32] {
+    X25519PublicKey::from(&StaticSecret::from(*private_key)).to_bytes()
+}
+
+pub fn derive_wireguard_keypair(device: &DeviceKeypair) -> WireguardKeypair {
+    let hkdf = Hkdf::<Sha256>::new(Some(WG_DEVICE_KEY_SALT), &*device.to_bytes());
+
+    let mut private = [0u8; 32];
+    hkdf.expand(WG_DEVICE_KEY_INFO, &mut private)
+        .expect("32 bytes is valid for HKDF-SHA256");
+    let public = wireguard_pubkey(&private);
+
+    WireguardKeypair {
+        private: Zeroizing::new(private),
+        public,
+    }
+}
 
 pub fn derive_session_keys(
     local_ephemeral: &EphemeralKeypair,
@@ -153,11 +191,13 @@ mod tests {
     fn test_handshake_message_create_and_verify() {
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
+        let alice_wg = derive_wireguard_keypair(&alice_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_id = bob_device.device_id();
 
-        let message = HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id);
+        let message =
+            HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id, alice_wg.public);
 
         assert!(message.verify(&alice_device.public_key(), &bob_id).is_ok());
     }
@@ -167,12 +207,14 @@ mod tests {
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
         let charlie_device = DeviceKeypair::generate();
+        let alice_wg = derive_wireguard_keypair(&alice_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_id = bob_device.device_id();
         let charlie_id = charlie_device.device_id();
 
-        let message = HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id);
+        let message =
+            HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id, alice_wg.public);
 
         assert!(message.verify(&alice_device.public_key(), &charlie_id).is_err());
     }
@@ -181,11 +223,13 @@ mod tests {
     fn test_handshake_message_fails_wrong_signer() {
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
+        let alice_wg = derive_wireguard_keypair(&alice_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_id = bob_device.device_id();
 
-        let message = HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id);
+        let message =
+            HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id, alice_wg.public);
 
         assert!(message.verify(&bob_device.public_key(), &bob_id).is_err());
     }
@@ -226,18 +270,40 @@ mod tests {
     }
 
     #[test]
+    fn wireguard_keypair_deterministic() {
+        let device = DeviceKeypair::from_seed(&[9u8; 32]);
+
+        let keys1 = derive_wireguard_keypair(&device);
+        let keys2 = derive_wireguard_keypair(&device);
+
+        assert_eq!(*keys1.private, *keys2.private);
+        assert_eq!(keys1.public, keys2.public);
+    }
+
+    #[test]
+    fn wireguard_pubkey_matches_private() {
+        let device = DeviceKeypair::from_seed(&[7u8; 32]);
+
+        let keys = derive_wireguard_keypair(&device);
+
+        assert_eq!(wireguard_pubkey(&*keys.private), keys.public);
+    }
+
+    #[test]
     fn test_handshake_serialization() {
         let device = DeviceKeypair::generate();
         let ephemeral = EphemeralKeypair::generate();
         let peer_id = DeviceKeypair::generate().device_id();
+        let wg_keys = derive_wireguard_keypair(&device);
 
-        let message = HandshakeMessage::create(&device, &ephemeral, &peer_id);
+        let message = HandshakeMessage::create(&device, &ephemeral, &peer_id, wg_keys.public);
 
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: HandshakeMessage = serde_json::from_str(&json).unwrap();
 
         assert_eq!(message.ephemeral_pubkey, deserialized.ephemeral_pubkey);
         assert_eq!(message.nonce, deserialized.nonce);
+        assert_eq!(message.wg_pubkey, deserialized.wg_pubkey);
         assert_eq!(message.signature, deserialized.signature);
     }
 
@@ -245,6 +311,8 @@ mod tests {
     fn test_full_handshake_flow() {
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
+        let alice_wg = derive_wireguard_keypair(&alice_device);
+        let bob_wg = derive_wireguard_keypair(&bob_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_ephemeral = EphemeralKeypair::generate();
@@ -253,11 +321,13 @@ mod tests {
             &alice_device,
             &alice_ephemeral,
             &bob_device.device_id(),
+            alice_wg.public,
         );
         let bob_msg = HandshakeMessage::create(
             &bob_device,
             &bob_ephemeral,
             &alice_device.device_id(),
+            bob_wg.public,
         );
 
         assert!(alice_msg.verify(&alice_device.public_key(), &bob_device.device_id()).is_ok());

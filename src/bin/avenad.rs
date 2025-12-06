@@ -1,8 +1,8 @@
 use avena_overlay::{
-    derive_session_keys, AvenadConfig, DeviceId, DeviceKeypair, DiscoveredPeer,
-    DiscoveryEvent, DiscoveryService, EphemeralKeypair, HandshakeMessage, KernelBackend,
-    LocalAnnouncement, NetworkConfig, PeerConfig, PeerState, TunnelBackend, TunnelMode,
-    UserspaceBackend,
+    derive_session_keys, derive_wireguard_keypair, AvenadConfig, DeviceId, DeviceKeypair,
+    DiscoveredPeer, DiscoveryEvent, DiscoveryService, EphemeralKeypair, HandshakeMessage,
+    KernelBackend, LocalAnnouncement, NetworkConfig, PeerConfig, PeerState, TunnelBackend,
+    TunnelMode, UserspaceBackend,
 };
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
@@ -15,7 +15,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use x25519_dalek::PublicKey as X25519PublicKey;
 
 const HANDSHAKE_MAGIC: &[u8; 4] = b"AVHS";
 const HANDSHAKE_VERSION: u8 = 1;
@@ -23,6 +22,7 @@ const HANDSHAKE_VERSION: u8 = 1;
 struct Avenad {
     config: AvenadConfig,
     keypair: DeviceKeypair,
+    wg_public: [u8; 32],
     network: NetworkConfig,
     tunnel: Arc<dyn TunnelBackend>,
     discovery: DiscoveryService,
@@ -37,6 +37,8 @@ impl Avenad {
         let device_id = keypair.device_id();
         info!(device_id = %device_id, "Initialized device identity");
 
+        let wg_keys = derive_wireguard_keypair(&keypair);
+
         let network = config.network.clone();
         let overlay_ip = network.device_address(&device_id);
         info!(overlay_ip = %overlay_ip, "Overlay address");
@@ -48,6 +50,7 @@ impl Avenad {
         info!(mode = ?config.tunnel_mode, "Tunnel backend created");
 
         tunnel.ensure_interface(&config.interface_name).await?;
+        tunnel.set_private_key(&*wg_keys.private).await?;
 
         assign_interface_address(&config.interface_name, overlay_ip)?;
         info!(interface = %config.interface_name, addr = %overlay_ip, "Assigned overlay address to interface");
@@ -69,6 +72,7 @@ impl Avenad {
         Ok(Self {
             config,
             keypair,
+            wg_public: wg_keys.public,
             network,
             tunnel,
             discovery,
@@ -202,8 +206,12 @@ impl Avenad {
         let mut stream = TcpStream::connect(addr).await?;
 
         let local_ephemeral = EphemeralKeypair::generate();
-        let local_msg =
-            HandshakeMessage::create(&self.keypair, &local_ephemeral, &peer.device_id);
+        let local_msg = HandshakeMessage::create(
+            &self.keypair,
+            &local_ephemeral,
+            &peer.device_id,
+            self.wg_public,
+        );
 
         stream.write_all(HANDSHAKE_MAGIC).await?;
         stream.write_u8(HANDSHAKE_VERSION).await?;
@@ -247,11 +255,7 @@ impl Avenad {
 
         let peer_ephemeral = peer_msg.ephemeral_public_key();
         let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral, true);
-        let peer_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral, false);
-
-        self.tunnel.set_private_key(&our_keys.wireguard_private).await?;
-
-        let peer_wg_pubkey = derive_wg_pubkey(&peer_keys.wireguard_private);
+        let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer.device_id);
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
@@ -300,8 +304,12 @@ impl Avenad {
             .map_err(|e| AvenadError::Handshake(format!("signature verification failed: {}", e)))?;
 
         let local_ephemeral = EphemeralKeypair::generate();
-        let local_msg =
-            HandshakeMessage::create(&self.keypair, &local_ephemeral, &peer_device_id);
+        let local_msg = HandshakeMessage::create(
+            &self.keypair,
+            &local_ephemeral,
+            &peer_device_id,
+            self.wg_public,
+        );
 
         stream.write_all(HANDSHAKE_MAGIC).await?;
         stream.write_u8(HANDSHAKE_VERSION).await?;
@@ -315,11 +323,7 @@ impl Avenad {
 
         let peer_ephemeral = peer_msg.ephemeral_public_key();
         let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral, false);
-        let peer_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral, true);
-
-        self.tunnel.set_private_key(&our_keys.wireguard_private).await?;
-
-        let peer_wg_pubkey = derive_wg_pubkey(&peer_keys.wireguard_private);
+        let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer_device_id);
 
         let peer_wg_endpoint = self.discovery
@@ -420,12 +424,6 @@ fn load_or_generate_keypair(config: &AvenadConfig) -> Result<DeviceKeypair, Aven
     }
 
     Ok(keypair)
-}
-
-fn derive_wg_pubkey(private_key: &[u8; 32]) -> [u8; 32] {
-    use x25519_dalek::StaticSecret;
-    let secret = StaticSecret::from(*private_key);
-    X25519PublicKey::from(&secret).to_bytes()
 }
 
 fn assign_interface_address(interface_name: &str, addr: std::net::Ipv6Addr) -> Result<(), std::io::Error> {
