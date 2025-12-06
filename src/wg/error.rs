@@ -1,3 +1,5 @@
+//! Shared error types returned by WireGuard backends.
+
 use std::io;
 use thiserror::Error;
 

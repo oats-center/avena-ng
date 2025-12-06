@@ -1,8 +1,15 @@
+//! IPv6 addressing helpers for the overlay network.
+//!
+//! Each device ID deterministically maps to a host address within a configured
+//! ULA prefix. Workloads run on a device get distinct addresses derived from
+//! the same ID and a workload index.
+
 use crate::identity::DeviceId;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv6Addr;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Overlay network prefix configuration and address derivation helpers.
 pub struct NetworkConfig {
     pub prefix: Ipv6Addr,
     pub prefix_len: u8,
@@ -10,9 +17,14 @@ pub struct NetworkConfig {
 
 impl NetworkConfig {
     pub fn new(prefix: Ipv6Addr, prefix_len: u8) -> Self {
+        assert!(
+            prefix_len == 48,
+            "only /48 prefixes are supported for address derivation"
+        );
         Self { prefix, prefix_len }
     }
 
+    /// Default ULA space used when no config is provided.
     pub fn default_ula() -> Self {
         Self {
             prefix: "fd00:a0e0:a000::".parse().unwrap(),
@@ -20,6 +32,7 @@ impl NetworkConfig {
         }
     }
 
+    /// Deterministically derive a device's host address from its ID.
     pub fn device_address(&self, id: &DeviceId) -> Ipv6Addr {
         let prefix_segments = self.prefix.segments();
         let suffix = id.to_ipv6_suffix();
@@ -41,6 +54,7 @@ impl NetworkConfig {
         )
     }
 
+    /// Derive a workload address for a given device and workload index.
     pub fn workload_address(&self, host_id: &DeviceId, workload_idx: u16) -> Ipv6Addr {
         let prefix_segments = self.prefix.segments();
         let suffix = host_id.to_ipv6_suffix();
@@ -62,6 +76,7 @@ impl NetworkConfig {
         )
     }
 
+    /// Check whether an address falls inside the overlay prefix.
     pub fn is_overlay_address(&self, addr: &Ipv6Addr) -> bool {
         let prefix_segments = self.prefix.segments();
         let addr_segments = addr.segments();

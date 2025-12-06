@@ -1,9 +1,15 @@
+//! WireGuard kernel backend wrapper.
+//!
+//! Uses the OS WireGuard interface when available, mirroring the `TunnelBackend`
+//! trait for parity with the userspace backend.
+
 use crate::tunnel::backend::{PeerConfig, PeerStats, TunnelBackend, TunnelError};
 use crate::wg::{self, Host, IpAddrMask, Key, Peer as WgPeer};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
+#[derive(Debug)]
 pub struct KernelBackend {
     wg: Mutex<Option<wg::KernelBackend>>,
     interface_name: Mutex<Option<String>>,

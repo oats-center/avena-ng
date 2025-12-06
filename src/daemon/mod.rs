@@ -1,3 +1,5 @@
+//! Daemon-facing types such as runtime configuration and peer state.
+
 mod config;
 mod peer_state;
 

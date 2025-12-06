@@ -1,3 +1,5 @@
+//! WireGuard backend abstraction shared by kernel and userspace implementations.
+
 use async_trait::async_trait;
 use ipnet::IpNet;
 use std::net::SocketAddr;
@@ -28,6 +30,7 @@ pub enum TunnelError {
     Io(#[from] std::io::Error),
 }
 
+/// Configuration for a single WireGuard peer.
 #[derive(Clone, Debug)]
 pub struct PeerConfig {
     pub wireguard_pubkey: [u8; 32],
@@ -38,6 +41,7 @@ pub struct PeerConfig {
 }
 
 impl PeerConfig {
+    /// Create a minimal peer config with a mandatory public key.
     pub fn new(wireguard_pubkey: [u8; 32]) -> Self {
         Self {
             wireguard_pubkey,
@@ -48,27 +52,32 @@ impl PeerConfig {
         }
     }
 
+    /// Attach a preshared key used for this peer.
     pub fn with_psk(mut self, psk: [u8; 32]) -> Self {
         self.psk = Some(psk);
         self
     }
 
+    /// Set allowed IP prefixes for this peer.
     pub fn with_allowed_ips(mut self, allowed_ips: Vec<IpNet>) -> Self {
         self.allowed_ips = allowed_ips;
         self
     }
 
+    /// Set the peer's reachable endpoint.
     pub fn with_endpoint(mut self, endpoint: SocketAddr) -> Self {
         self.endpoint = Some(endpoint);
         self
     }
 
+    /// Enable persistent keepalive packets.
     pub fn with_keepalive(mut self, interval: u16) -> Self {
         self.persistent_keepalive = Some(interval);
         self
     }
 }
 
+/// Basic counters and timestamps for a configured peer.
 #[derive(Clone, Debug, Default)]
 pub struct PeerStats {
     pub last_handshake: Option<SystemTime>,
@@ -77,6 +86,7 @@ pub struct PeerStats {
 }
 
 #[async_trait]
+/// Abstraction over kernel and userspace WireGuard implementations.
 pub trait TunnelBackend: Send + Sync {
     async fn ensure_interface(&self, name: &str) -> Result<(), TunnelError>;
     async fn set_private_key(&self, private_key: &[u8; 32]) -> Result<(), TunnelError>;

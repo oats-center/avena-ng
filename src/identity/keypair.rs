@@ -1,20 +1,23 @@
 use crate::identity::device_id::DeviceId;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
+#[expect(missing_debug_implementations, reason = "contains secret signing key")]
 pub struct DeviceKeypair {
     signing_key: SigningKey,
     device_id: DeviceId,
 }
 
 impl DeviceKeypair {
+    /// Generate a new random long-lived device identity.
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
         let device_id = DeviceId::from_public_key(&signing_key.verifying_key());
         Self { signing_key, device_id }
     }
 
+    /// Deterministically create a device identity from a seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(seed);
         let device_id = DeviceId::from_public_key(&signing_key.verifying_key());
@@ -43,12 +46,6 @@ impl DeviceKeypair {
 
 }
 
-impl Drop for DeviceKeypair {
-    fn drop(&mut self) {
-        let mut bytes = self.signing_key.to_bytes();
-        bytes.zeroize();
-    }
-}
 
 #[cfg(test)]
 mod tests {

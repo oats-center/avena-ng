@@ -1,3 +1,12 @@
+//! Handshake primitives for establishing per-peer WireGuard state.
+//!
+//! Each device holds a long-lived Ed25519 identity and a deterministic WireGuard
+//! keypair derived from it. During a TCP-based handshake, peers exchange an
+//! ephemeral X25519 key, advertise their stable WireGuard public key, and sign
+//! the bundle so the receiver can authenticate the peer and learn which
+//! interface key to configure. Per-connection WireGuard PSKs are derived from
+//! the ephemeral Diffie-Hellman to keep traffic separation at the peer level.
+
 use crate::identity::{DeviceId, DeviceKeypair};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -17,18 +26,22 @@ pub enum HandshakeError {
     PeerIdMismatch { expected: DeviceId, actual: DeviceId },
 }
 
+/// Short-lived X25519 key used to derive session secrets during a handshake.
+#[expect(missing_debug_implementations, reason = "contains secret key material")]
 pub struct EphemeralKeypair {
     secret: StaticSecret,
     public: X25519PublicKey,
 }
 
 impl EphemeralKeypair {
+    /// Generate a fresh ephemeral keypair for a single handshake.
     pub fn generate() -> Self {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = X25519PublicKey::from(&secret);
         Self { secret, public }
     }
 
+    /// Deterministic constructor used in tests.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let secret = StaticSecret::from(seed);
         let public = X25519PublicKey::from(&secret);
@@ -48,20 +61,26 @@ impl EphemeralKeypair {
     }
 }
 
+/// Payload exchanged during the TCP handshake that bootstraps a WireGuard peer.
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HandshakeMessage {
+    /// Ephemeral X25519 public key for Diffie-Hellman.
     #[serde_as(as = "Bytes")]
     pub ephemeral_pubkey: [u8; 32],
+    /// Random nonce to mix into the signed payload.
     #[serde_as(as = "Bytes")]
     pub nonce: [u8; 32],
+    /// WireGuard interface public key this node will use.
     #[serde_as(as = "Bytes")]
     pub wg_pubkey: [u8; 32],
+    /// Signature over (ephemeral_pubkey || nonce || local_id || wg_pubkey).
     #[serde_as(as = "Bytes")]
     pub signature: [u8; 64],
 }
 
 impl HandshakeMessage {
+    /// Build a signed handshake payload advertising our ephemeral and WireGuard keys.
     pub fn create(
         device: &DeviceKeypair,
         ephemeral: &EphemeralKeypair,
@@ -89,6 +108,7 @@ impl HandshakeMessage {
         }
     }
 
+    /// Verify the handshake signature against the expected peer and local ID.
     pub fn verify(
         &self,
         peer_pubkey: &VerifyingKey,
@@ -111,13 +131,21 @@ impl HandshakeMessage {
     }
 }
 
+/// WireGuard key material derived for a single peer connection.
+///
+/// The private key is role-specific (initiator vs responder), while the PSK
+/// matches on both ends so traffic is protected even if peers share the same
+/// long-lived interface key across sessions.
 #[derive(Clone)]
+#[expect(missing_debug_implementations, reason = "contains secret key material")]
 pub struct SessionKeys {
     pub wireguard_private: Zeroizing<[u8; 32]>,
     pub wireguard_psk: Zeroizing<[u8; 32]>,
 }
 
+/// Stable WireGuard key material derived from a device identity.
 #[derive(Clone)]
+#[expect(missing_debug_implementations, reason = "contains secret key material")]
 pub struct WireguardKeypair {
     pub private: Zeroizing<[u8; 32]>,
     pub public: [u8; 32],
@@ -129,10 +157,15 @@ const WG_PSK_INFO: &[u8] = b"wireguard-psk";
 const WG_DEVICE_KEY_SALT: &[u8] = b"avena-wireguard-device-key-v1";
 const WG_DEVICE_KEY_INFO: &[u8] = b"wireguard-interface";
 
+/// Compute the WireGuard public key for a given private key.
 pub fn wireguard_pubkey(private_key: &[u8; 32]) -> [u8; 32] {
     X25519PublicKey::from(&StaticSecret::from(*private_key)).to_bytes()
 }
 
+/// Derive a deterministic WireGuard keypair from the device's Ed25519 identity.
+///
+/// This keeps the interface key stable across peer connections so multiple
+/// tunnels can coexist without clobbering one another.
 pub fn derive_wireguard_keypair(device: &DeviceKeypair) -> WireguardKeypair {
     let hkdf = Hkdf::<Sha256>::new(Some(WG_DEVICE_KEY_SALT), &*device.to_bytes());
 
@@ -147,6 +180,10 @@ pub fn derive_wireguard_keypair(device: &DeviceKeypair) -> WireguardKeypair {
     }
 }
 
+/// Derive per-connection WireGuard keys from the shared ephemeral secret.
+///
+/// The `initiator` flag picks a different HKDF info string so each side derives
+/// complementary private keys while still agreeing on the preshared key.
 pub fn derive_session_keys(
     local_ephemeral: &EphemeralKeypair,
     peer_ephemeral: &X25519PublicKey,

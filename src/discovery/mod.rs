@@ -1,3 +1,9 @@
+//! Peer discovery across the overlay network.
+//!
+//! Supports static peer configuration and optional mDNS browsing/advertising.
+//! Events are emitted over a broadcast channel so the daemon can react to
+//! discovered or lost peers.
+
 mod mdns;
 mod static_peers;
 
@@ -71,6 +77,7 @@ pub struct DiscoveredPeer {
 }
 
 impl DiscoveredPeer {
+    /// Create a record for a newly learned peer endpoint.
     pub fn new(
         device_id: DeviceId,
         endpoint: SocketAddr,
@@ -97,12 +104,16 @@ pub enum DiscoveryEvent {
     PeerLost(DeviceId),
 }
 
+/// Announcement broadcast over discovery backends.
+#[derive(Debug)]
 pub struct LocalAnnouncement {
     pub device_id: DeviceId,
     pub wg_endpoint: SocketAddr,
     pub capabilities: HashSet<Capability>,
 }
 
+/// Runtime configuration for discovery backends.
+#[derive(Debug)]
 pub struct DiscoveryConfig {
     pub enable_mdns: bool,
     pub mdns_interface: Option<String>,
@@ -119,6 +130,7 @@ impl Default for DiscoveryConfig {
     }
 }
 
+#[expect(missing_debug_implementations, reason = "contains broadcast channel")]
 pub struct DiscoveryService {
     mdns: Option<MdnsDiscovery>,
     static_peers: StaticPeers,
@@ -127,6 +139,7 @@ pub struct DiscoveryService {
 }
 
 impl DiscoveryService {
+    /// Construct discovery service with configured static peers and optional mDNS.
     pub fn new(config: DiscoveryConfig) -> Result<Self, DiscoveryError> {
         let (tx, _) = broadcast::channel(64);
 
@@ -150,6 +163,7 @@ impl DiscoveryService {
         self.tx.subscribe()
     }
 
+    /// Broadcast our endpoint to any discovery backends.
     pub async fn announce(&self, local: &LocalAnnouncement) -> Result<(), DiscoveryError> {
         if let Some(ref mdns) = self.mdns {
             mdns.advertise(local).await?;
@@ -161,6 +175,7 @@ impl DiscoveryService {
         self.static_peers.resolve().await
     }
 
+    /// Start mDNS browsing in the background and forward events to subscribers.
     pub fn start_mdns_browse(&self) -> Result<(), DiscoveryError> {
         if let Some(ref mdns) = self.mdns {
             let mut rx = mdns.browse()?;
@@ -182,10 +197,12 @@ impl DiscoveryService {
         Ok(())
     }
 
+    /// Access the mDNS helper when enabled.
     pub fn mdns(&self) -> Option<&MdnsDiscovery> {
         self.mdns.as_ref()
     }
 
+    /// Get the most recently cached endpoint for a peer.
     pub fn get_discovered_endpoint(&self, device_id: &DeviceId) -> Option<SocketAddr> {
         self.discovered_peers
             .read()
@@ -193,6 +210,7 @@ impl DiscoveryService {
             .and_then(|guard| guard.get(device_id).map(|p| p.endpoint))
     }
 
+    /// Cache a peer record discovered through any channel.
     pub fn cache_discovered_peer(&self, peer: &DiscoveredPeer) {
         if let Ok(mut guard) = self.discovered_peers.write() {
             guard.insert(peer.device_id, peer.clone());

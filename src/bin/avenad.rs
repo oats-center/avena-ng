@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 
 const HANDSHAKE_MAGIC: &[u8; 4] = b"AVHS";
 const HANDSHAKE_VERSION: u8 = 1;
+const MAX_HANDSHAKE_MSG_LEN: usize = 8 * 1024;
 
 struct Avenad {
     config: AvenadConfig,
@@ -245,6 +246,9 @@ impl Avenad {
         }
 
         let msg_len = stream.read_u32().await? as usize;
+        if msg_len > MAX_HANDSHAKE_MSG_LEN {
+            return Err(AvenadError::Handshake("message too large".into()));
+        }
         let mut msg_bytes = vec![0u8; msg_len];
         stream.read_exact(&mut msg_bytes).await?;
         let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;
@@ -295,6 +299,9 @@ impl Avenad {
         let peer_device_id = DeviceId::from_public_key(&peer_pubkey);
 
         let msg_len = stream.read_u32().await? as usize;
+        if msg_len > MAX_HANDSHAKE_MSG_LEN {
+            return Err(AvenadError::Handshake("message too large".into()));
+        }
         let mut msg_bytes = vec![0u8; msg_len];
         stream.read_exact(&mut msg_bytes).await?;
         let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;

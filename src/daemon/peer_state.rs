@@ -1,8 +1,11 @@
+//! In-memory bookkeeping for connected peers.
+
 use crate::DeviceId;
 use ed25519_dalek::VerifyingKey;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Instant;
 
+/// Tracks metadata for a connected peer managed by the daemon.
 #[derive(Debug)]
 pub struct PeerState {
     pub device_id: DeviceId,

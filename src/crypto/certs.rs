@@ -1,3 +1,8 @@
+//! Minimal Ed25519 certificate chain support for devices and workloads.
+//!
+//! A certificate attests a `DeviceId` is valid for a time window; chains are
+//! validated against a provided trusted root.
+
 use crate::identity::{DeviceId, DeviceKeypair};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -127,6 +132,7 @@ impl CertificateChain {
     }
 }
 
+#[derive(Debug)]
 pub struct CertValidator {
     trusted_root: Certificate,
 }
@@ -173,6 +179,20 @@ impl CertValidator {
         }
 
         Ok(())
+    }
+
+    pub fn validate_chain_for_device(
+        &self,
+        chain: &CertificateChain,
+        expected_device_id: &DeviceId,
+    ) -> Result<(), CertError> {
+        if chain.leaf.device_id != *expected_device_id {
+            return Err(CertError::DeviceIdMismatch {
+                cert_id: chain.leaf.device_id,
+                expected_id: *expected_device_id,
+            });
+        }
+        self.validate_chain(chain)
     }
 
     pub fn check_expiry(&self, cert: &Certificate) -> Result<(), CertError> {

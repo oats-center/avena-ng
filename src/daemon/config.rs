@@ -1,3 +1,8 @@
+//! Configuration types for the `avenad` daemon.
+//!
+//! Settings include network prefix, discovery backends, interface name, and
+//! backend selection (kernel vs userspace).
+
 use crate::discovery::StaticPeerConfig;
 use crate::NetworkConfig;
 use serde::{Deserialize, Serialize};
@@ -17,43 +22,57 @@ impl Default for TunnelMode {
     }
 }
 
+/// Runtime configuration for the avena daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AvenadConfig {
     #[serde(default = "default_interface_name")]
+    /// WireGuard interface name to create/manage.
     pub interface_name: String,
 
     #[serde(default)]
+    /// Choose kernel WireGuard or userspace backend.
     pub tunnel_mode: TunnelMode,
 
     #[serde(default)]
+    /// Overlay addressing configuration.
     pub network: NetworkConfig,
 
     #[serde(default = "default_listen_port")]
+    /// WireGuard listen port for the overlay.
     pub listen_port: u16,
 
     #[serde(default)]
+    /// Optional explicit socket address for the TCP handshake listener.
     pub listen_address: Option<SocketAddr>,
 
+    /// Optional path to persist the device keypair seed.
     pub keypair_path: Option<PathBuf>,
 
     #[serde(default)]
+    /// Peer discovery configuration (mDNS/static peers).
     pub discovery: DiscoveryConfig,
 
     #[serde(default = "default_keepalive")]
+    /// Persistent keepalive in seconds sent to peers.
     pub persistent_keepalive: u16,
 
     #[serde(default = "default_dead_peer_timeout")]
+    /// How long before an inactive peer is removed.
     pub dead_peer_timeout_secs: u64,
 }
 
+/// Discovery-specific configuration embedded in `AvenadConfig`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DiscoveryConfig {
     #[serde(default = "default_mdns_enabled")]
+    /// Enable mDNS advertising/browsing when true.
     pub enable_mdns: bool,
 
+    /// Network interface to bind mDNS to (defaults to system pick).
     pub mdns_interface: Option<String>,
 
     #[serde(default)]
+    /// Statically configured peer endpoints.
     pub static_peers: Vec<StaticPeerConfig>,
 }
 

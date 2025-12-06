@@ -1,9 +1,15 @@
+//! Userspace WireGuard backend powered by wireguard-go.
+//!
+//! Implements the `TunnelBackend` trait using the vendored userspace
+//! implementation when the kernel module is unavailable.
+
 use crate::tunnel::backend::{PeerConfig, PeerStats, TunnelBackend, TunnelError};
 use crate::wg::{self, Host, IpAddrMask, Key, Peer as WgPeer};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
+#[derive(Debug)]
 pub struct UserspaceBackend {
     wg: Mutex<Option<wg::UserspaceBackend>>,
     interface_name: Mutex<Option<String>>,

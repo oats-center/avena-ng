@@ -15,7 +15,7 @@ path = "src/bin/avena_keygen.rs"
 
 [dependencies]
 # Crypto
-ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde", "zeroize"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 sha2 = "0.10"
 hkdf = "0.12"
@@ -64,3 +64,11 @@ netlink-sys = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

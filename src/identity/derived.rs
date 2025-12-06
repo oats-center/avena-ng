@@ -4,6 +4,7 @@ use sha2::Sha256;
 
 const WORKLOAD_DERIVATION_SALT: &[u8] = b"avena-workload-key-derivation-v1";
 
+/// Deterministically derive a child keypair for a workload running under a device.
 pub fn derive_workload_keypair(parent: &DeviceKeypair, workload_id: &str) -> DeviceKeypair {
     let parent_seed = parent.to_bytes();
     let hkdf = Hkdf::<Sha256>::new(Some(WORKLOAD_DERIVATION_SALT), &*parent_seed);

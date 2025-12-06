@@ -1,3 +1,8 @@
+//! Userspace WireGuard backend driven by the `wireguard-go` executable.
+//!
+//! Spawns wireguard-go, communicates over its Unix control socket, and maps the
+//! API into the common backend types.
+
 mod socket;
 
 use std::fs;
@@ -17,6 +22,7 @@ pub use socket::socket_path;
 
 const WIREGUARD_GO_EXECUTABLE: &str = "wireguard-go";
 
+#[derive(Debug)]
 pub struct UserspaceBackend {
     ifname: Mutex<Option<String>>,
 }

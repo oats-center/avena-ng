@@ -1,3 +1,8 @@
+//! Thin wrappers around WireGuard kernel and userspace backends.
+//!
+//! The public surface exposes common types (keys, peers, stats) and selects the
+//! kernel backend on Linux when available, otherwise falling back to userspace.
+
 pub mod error;
 pub mod types;
 pub mod uapi;

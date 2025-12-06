@@ -1,3 +1,7 @@
+//! Linux WireGuard backend that talks to the kernel via netlink.
+//!
+//! Provides the concrete implementation behind `wg::KernelBackend`.
+
 pub mod netlink;
 
 use std::sync::Mutex;
@@ -5,6 +9,7 @@ use std::sync::Mutex;
 use crate::wg::error::WgError;
 use crate::wg::types::{Host, Key, Peer, PeerStats};
 
+#[derive(Debug)]
 pub struct KernelBackend {
     ifname: Mutex<Option<String>>,
 }

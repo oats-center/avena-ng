@@ -1,3 +1,8 @@
+//! Static peer configuration and resolution.
+//!
+//! Converts user-specified endpoints into `DiscoveredPeer` records, optionally
+//! tagging them with capabilities and pre-known device IDs.
+
 use crate::DeviceId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -54,6 +59,7 @@ impl StaticPeerConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct StaticPeers {
     peers: Vec<StaticPeerConfig>,
 }

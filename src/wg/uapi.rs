@@ -1,3 +1,7 @@
+//! Helpers to serialize/deserialize WireGuard state with the kernel UAPI.
+//!
+//! Converts the Rust wrappers into the textual UAPI format and back.
+
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::str::FromStr;

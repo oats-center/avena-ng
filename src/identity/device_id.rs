@@ -11,6 +11,7 @@ pub enum DecodeError {
     InvalidLength(usize),
 }
 
+/// Stable identifier derived from an Ed25519 public key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DeviceId([u8; 16]);
 

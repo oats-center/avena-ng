@@ -1,3 +1,8 @@
+//! mDNS-based peer discovery for local networks.
+//!
+//! Advertises a device's WireGuard endpoint and capabilities, and listens for
+//! peers broadcasting the same service type.
+
 use crate::DeviceId;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::net::SocketAddr;
@@ -13,14 +18,22 @@ const TXT_AVENA_ID: &str = "avena-id";
 const TXT_WG_ENDPOINT: &str = "wg-endpoint";
 const TXT_CAPABILITIES: &str = "cap";
 
+#[expect(missing_debug_implementations, reason = "ServiceDaemon does not implement Debug")]
 pub struct MdnsDiscovery {
     daemon: ServiceDaemon,
 }
 
 impl MdnsDiscovery {
-    pub fn new(_interface: Option<&str>) -> Result<Self, DiscoveryError> {
+    pub fn new(interface: Option<&str>) -> Result<Self, DiscoveryError> {
         let daemon = ServiceDaemon::new()
             .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
+
+        if let Some(if_name) = interface {
+            daemon
+                .enable_interface(if_name)
+                .map_err(|e| DiscoveryError::Mdns(format!("failed to bind to interface {}: {}", if_name, e)))?;
+            debug!(interface = if_name, "mDNS bound to specific interface");
+        }
 
         Ok(Self { daemon })
     }

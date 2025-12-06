@@ -1,3 +1,8 @@
+//! WireGuard public types mirrored for both kernel and userspace backends.
+//!
+//! Provides thin wrappers around keys, peers, allowed IPs, and host config so
+//! the higher-level code can remain backend-agnostic.
+
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};

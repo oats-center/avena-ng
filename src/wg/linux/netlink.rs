@@ -1,3 +1,5 @@
+//! Netlink serialization helpers for configuring WireGuard on Linux.
+
 use std::fmt::Debug;
 use std::io::ErrorKind;
 use std::net::IpAddr;
