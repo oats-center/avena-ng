@@ -1,0 +1,7 @@
+# /etc/sudoers.d/avena-test
+# Allow running avena tunnel tests without password
+# Install: sudo cp sudoers.d/avena-test /etc/sudoers.d/ && sudo chmod 440 /etc/sudoers.d/avena-test
+
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/ip link delete av*
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/ip link delete ak*
+%wheel ALL=(ALL) NOPASSWD: /usr/local/bin/wireguard-go-bin
