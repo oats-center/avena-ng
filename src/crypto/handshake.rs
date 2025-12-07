@@ -18,12 +18,18 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+const HANDSHAKE_TIMESTAMP_VALIDITY_SECS: u64 = 60;
+
 #[derive(Error, Debug)]
 pub enum HandshakeError {
     #[error("signature verification failed")]
     InvalidSignature,
     #[error("peer ID mismatch: expected {expected}, got {actual}")]
     PeerIdMismatch { expected: DeviceId, actual: DeviceId },
+    #[error("message expired: timestamp {timestamp_secs}s, now {now_secs}s")]
+    Expired { timestamp_secs: u64, now_secs: u64 },
+    #[error("message from the future: timestamp {timestamp_secs}s, now {now_secs}s")]
+    FutureTimestamp { timestamp_secs: u64, now_secs: u64 },
 }
 
 /// Short-lived X25519 key used to derive session secrets during a handshake.
@@ -71,10 +77,12 @@ pub struct HandshakeMessage {
     /// Random nonce to mix into the signed payload.
     #[serde_as(as = "Bytes")]
     pub nonce: [u8; 32],
+    /// Unix timestamp (seconds) for replay protection.
+    pub timestamp_secs: u64,
     /// WireGuard interface public key this node will use.
     #[serde_as(as = "Bytes")]
     pub wg_pubkey: [u8; 32],
-    /// Signature over (ephemeral_pubkey || nonce || local_id || wg_pubkey).
+    /// Signature over (ephemeral_pubkey || nonce || timestamp || peer_id || wg_pubkey).
     #[serde_as(as = "Bytes")]
     pub signature: [u8; 64],
 }
@@ -90,11 +98,17 @@ impl HandshakeMessage {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
 
+        let timestamp_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs();
+
         let ephemeral_pubkey = ephemeral.public_key_bytes();
 
-        let mut message_to_sign = Vec::with_capacity(32 + 32 + 16 + 32);
+        let mut message_to_sign = Vec::with_capacity(32 + 32 + 8 + 16 + 32);
         message_to_sign.extend_from_slice(&ephemeral_pubkey);
         message_to_sign.extend_from_slice(&nonce);
+        message_to_sign.extend_from_slice(&timestamp_secs.to_le_bytes());
         message_to_sign.extend_from_slice(peer_id.as_bytes());
         message_to_sign.extend_from_slice(&wg_pubkey);
 
@@ -103,20 +117,41 @@ impl HandshakeMessage {
         Self {
             ephemeral_pubkey,
             nonce,
+            timestamp_secs,
             wg_pubkey,
             signature: signature.to_bytes(),
         }
     }
 
-    /// Verify the handshake signature against the expected peer and local ID.
+    /// Verify the handshake signature and timestamp against the expected peer and local ID.
     pub fn verify(
         &self,
         peer_pubkey: &VerifyingKey,
         local_id: &DeviceId,
     ) -> Result<(), HandshakeError> {
-        let mut message_to_verify = Vec::with_capacity(32 + 32 + 16 + 32);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs();
+
+        if self.timestamp_secs > now_secs + HANDSHAKE_TIMESTAMP_VALIDITY_SECS {
+            return Err(HandshakeError::FutureTimestamp {
+                timestamp_secs: self.timestamp_secs,
+                now_secs,
+            });
+        }
+
+        if now_secs > self.timestamp_secs + HANDSHAKE_TIMESTAMP_VALIDITY_SECS {
+            return Err(HandshakeError::Expired {
+                timestamp_secs: self.timestamp_secs,
+                now_secs,
+            });
+        }
+
+        let mut message_to_verify = Vec::with_capacity(32 + 32 + 8 + 16 + 32);
         message_to_verify.extend_from_slice(&self.ephemeral_pubkey);
         message_to_verify.extend_from_slice(&self.nonce);
+        message_to_verify.extend_from_slice(&self.timestamp_secs.to_le_bytes());
         message_to_verify.extend_from_slice(local_id.as_bytes());
         message_to_verify.extend_from_slice(&self.wg_pubkey);
 

@@ -6,34 +6,127 @@ use avena_overlay::{
 };
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 const HANDSHAKE_MAGIC: &[u8; 4] = b"AVHS";
 const HANDSHAKE_VERSION: u8 = 1;
 const MAX_HANDSHAKE_MSG_LEN: usize = 8 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const NONCE_CACHE_EXPIRY: Duration = Duration::from_secs(70);
+const MAX_CONCURRENT_HANDSHAKES: usize = 32;
+const MAX_HANDSHAKES_PER_IP: u32 = 5;
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
-struct Avenad {
+struct NonceCache {
+    entries: Mutex<HashMap<(DeviceId, [u8; 32]), Instant>>,
+}
+
+impl NonceCache {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn check_and_insert(&self, device_id: DeviceId, nonce: [u8; 32]) -> bool {
+        let mut entries = self.entries.lock().await;
+        let now = Instant::now();
+
+        let key = (device_id, nonce);
+        if let Some(&expiry) = entries.get(&key) {
+            if expiry > now {
+                return false;
+            }
+        }
+
+        entries.insert(key, now + NONCE_CACHE_EXPIRY);
+        true
+    }
+
+    async fn cleanup(&self) {
+        let mut entries = self.entries.lock().await;
+        let now = Instant::now();
+        entries.retain(|_, &mut expiry| expiry > now);
+    }
+}
+
+struct RateLimiter {
+    counts: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new(window: Duration) -> Self {
+        Self {
+            counts: Mutex::new(HashMap::new()),
+            window,
+        }
+    }
+
+    async fn check(&self, addr: IpAddr) -> bool {
+        let mut counts = self.counts.lock().await;
+        let now = Instant::now();
+
+        match counts.entry(addr) {
+            Entry::Vacant(e) => {
+                e.insert((1, now + self.window));
+                true
+            }
+            Entry::Occupied(mut e) => {
+                let (count, expiry) = e.get_mut();
+                if *expiry <= now {
+                    *count = 1;
+                    *expiry = now + self.window;
+                    true
+                } else if *count >= MAX_HANDSHAKES_PER_IP {
+                    false
+                } else {
+                    *count += 1;
+                    true
+                }
+            }
+        }
+    }
+
+    async fn cleanup(&self) {
+        let mut counts = self.counts.lock().await;
+        let now = Instant::now();
+        counts.retain(|_, (_, expiry)| *expiry > now);
+    }
+}
+
+struct AvenadInner {
     config: AvenadConfig,
     keypair: DeviceKeypair,
     wg_public: [u8; 32],
     network: NetworkConfig,
     tunnel: Arc<dyn TunnelBackend>,
     discovery: DiscoveryService,
-    discovery_rx: Option<tokio::sync::broadcast::Receiver<DiscoveryEvent>>,
     peers: RwLock<HashMap<DeviceId, PeerState>>,
+    nonce_cache: NonceCache,
+    rate_limiter: RateLimiter,
+    handshake_semaphore: Arc<Semaphore>,
+}
+
+struct Avenad {
+    inner: Arc<AvenadInner>,
+    discovery_rx: Option<tokio::sync::broadcast::Receiver<DiscoveryEvent>>,
     handshake_listener: TcpListener,
 }
 
 impl Avenad {
     async fn new(config: AvenadConfig) -> Result<Self, AvenadError> {
+        validate_interface_name(&config.interface_name)?;
+
         let keypair = load_or_generate_keypair(&config)?;
         let device_id = keypair.device_id();
         info!(device_id = %device_id, "Initialized device identity");
@@ -70,49 +163,68 @@ impl Avenad {
         let handshake_listener = TcpListener::bind(listen_addr).await?;
         info!(addr = %listen_addr, "Handshake listener bound");
 
-        Ok(Self {
+        let inner = Arc::new(AvenadInner {
             config,
             keypair,
             wg_public: wg_keys.public,
             network,
             tunnel,
             discovery,
-            discovery_rx: Some(discovery_rx),
             peers: RwLock::new(HashMap::new()),
+            nonce_cache: NonceCache::new(),
+            rate_limiter: RateLimiter::new(Duration::from_secs(60)),
+            handshake_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
+        });
+
+        Ok(Self {
+            inner,
+            discovery_rx: Some(discovery_rx),
             handshake_listener,
         })
     }
 
     async fn run(&mut self) -> Result<(), AvenadError> {
         let mut discovery_rx = self.discovery_rx.take().expect("discovery_rx already taken");
+        let inner = Arc::clone(&self.inner);
 
-        self.announce_presence().await?;
+        inner.announce_presence().await?;
 
-        for peer in self.discovery.resolve_static_peers().await {
+        for peer in inner.discovery.resolve_static_peers().await {
             info!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Resolved static peer");
-            if let Err(e) = self.handle_discovered_peer(peer).await {
-                warn!("Failed to connect to static peer: {}", e);
-            }
+            let inner_clone = Arc::clone(&inner);
+            tokio::spawn(async move {
+                if let Err(e) = inner_clone.handle_discovered_peer(peer).await {
+                    warn!("Failed to connect to static peer: {}", e);
+                }
+            });
         }
 
         info!("Avenad running. Press Ctrl+C to stop.");
+
+        let mut dead_peer_interval = tokio::time::interval(Duration::from_secs(inner.config.dead_peer_timeout_secs));
+        let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
+        dead_peer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 result = discovery_rx.recv() => {
                     match result {
                         Ok(DiscoveryEvent::PeerDiscovered(peer)) => {
-                            if peer.device_id != self.keypair.device_id() {
+                            if peer.device_id != inner.keypair.device_id() {
                                 info!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Peer discovered");
-                                self.discovery.cache_discovered_peer(&peer);
-                                if let Err(e) = self.handle_discovered_peer(peer).await {
-                                    warn!("Failed to handle discovered peer: {}", e);
-                                }
+                                inner.discovery.cache_discovered_peer(&peer);
+                                let inner_clone = Arc::clone(&inner);
+                                tokio::spawn(async move {
+                                    if let Err(e) = inner_clone.handle_discovered_peer(peer).await {
+                                        warn!("Failed to handle discovered peer: {}", e);
+                                    }
+                                });
                             }
                         }
                         Ok(DiscoveryEvent::PeerLost(device_id)) => {
                             info!(peer_id = %device_id, "Peer lost");
-                            self.handle_peer_lost(&device_id).await;
+                            inner.handle_peer_lost(&device_id).await;
                         }
                         Err(e) => {
                             debug!("Discovery channel error: {}", e);
@@ -122,24 +234,55 @@ impl Avenad {
                 result = self.handshake_listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            info!(addr = %addr, "Incoming handshake connection");
-                            match self.handle_incoming_handshake(stream, addr).await {
-                                Ok(peer_state) => {
-                                    info!(peer_id = %peer_state.device_id, "Peer connected via incoming handshake");
-                                    self.peers.write().await.insert(peer_state.device_id, peer_state);
-                                }
-                                Err(e) => {
-                                    warn!(addr = %addr, "Incoming handshake failed: {}", e);
-                                }
+                            if !inner.rate_limiter.check(addr.ip()).await {
+                                debug!(addr = %addr, "Rate limited handshake connection");
+                                continue;
                             }
+
+                            let permit = match inner.handshake_semaphore.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    debug!(addr = %addr, "Too many concurrent handshakes");
+                                    continue;
+                                }
+                            };
+
+                            info!(addr = %addr, "Incoming handshake connection");
+                            let inner_clone = Arc::clone(&inner);
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                match inner_clone.handle_incoming_handshake(stream, addr).await {
+                                    Ok(peer_state) => {
+                                        let device_id = peer_state.device_id;
+                                        let mut peers = inner_clone.peers.write().await;
+                                        if let Entry::Vacant(entry) = peers.entry(device_id) {
+                                            entry.insert(peer_state);
+                                            info!(peer_id = %device_id, "Peer connected via incoming handshake");
+                                        } else {
+                                            debug!(peer_id = %device_id, "Peer already connected, cleaning up duplicate");
+                                            drop(peers);
+                                            if let Err(e) = inner_clone.tunnel.remove_peer(&peer_state.wg_pubkey).await {
+                                                warn!(peer_id = %device_id, "Failed to remove duplicate peer: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(addr = %addr, "Incoming handshake failed: {}", e);
+                                    }
+                                }
+                            });
                         }
                         Err(e) => {
                             error!("Failed to accept connection: {}", e);
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(self.config.dead_peer_timeout_secs)) => {
-                    self.check_dead_peers().await;
+                _ = dead_peer_interval.tick() => {
+                    inner.check_dead_peers().await;
+                }
+                _ = cleanup_interval.tick() => {
+                    inner.nonce_cache.cleanup().await;
+                    inner.rate_limiter.cleanup().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutdown signal received");
@@ -148,10 +291,12 @@ impl Avenad {
             }
         }
 
-        self.shutdown().await;
+        inner.shutdown().await;
         Ok(())
     }
+}
 
+impl AvenadInner {
     async fn announce_presence(&self) -> Result<(), AvenadError> {
         let wg_port = self.tunnel.listen_port().await.unwrap_or(self.config.listen_port);
 
@@ -174,18 +319,19 @@ impl Avenad {
     }
 
     async fn handle_discovered_peer(&self, peer: DiscoveredPeer) -> Result<(), AvenadError> {
-        {
-            let peers = self.peers.read().await;
-            if peers.contains_key(&peer.device_id) {
-                debug!(peer_id = %peer.device_id, "Already connected to peer");
-                return Ok(());
-            }
-        }
-
         let should_initiate = self.keypair.device_id() > peer.device_id;
         if !should_initiate {
             debug!(peer_id = %peer.device_id, "Waiting for peer to initiate");
             return Ok(());
+        }
+
+        {
+            let mut peers = self.peers.write().await;
+            if let Entry::Vacant(_) = peers.entry(peer.device_id) {
+            } else {
+                debug!(peer_id = %peer.device_id, "Already connected to peer");
+                return Ok(());
+            }
         }
 
         info!(peer_id = %peer.device_id, "Initiating handshake");
@@ -193,13 +339,31 @@ impl Avenad {
         let handshake_addr = SocketAddr::new(peer.endpoint.ip(), peer.endpoint.port() + 1);
         let peer_state = self.perform_outgoing_handshake(handshake_addr, &peer).await?;
 
-        self.peers.write().await.insert(peer.device_id, peer_state);
-        info!(peer_id = %peer.device_id, "Peer connected");
+        let mut peers = self.peers.write().await;
+        if let Entry::Vacant(entry) = peers.entry(peer.device_id) {
+            entry.insert(peer_state);
+            info!(peer_id = %peer.device_id, "Peer connected");
+        } else {
+            debug!(peer_id = %peer.device_id, "Peer already connected by another task, cleaning up");
+            if let Err(e) = self.tunnel.remove_peer(&peer_state.wg_pubkey).await {
+                warn!(peer_id = %peer.device_id, "Failed to remove duplicate peer: {}", e);
+            }
+        }
 
         Ok(())
     }
 
     async fn perform_outgoing_handshake(
+        &self,
+        addr: SocketAddr,
+        peer: &DiscoveredPeer,
+    ) -> Result<PeerState, AvenadError> {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.perform_outgoing_handshake_inner(addr, peer))
+            .await
+            .map_err(|_| AvenadError::Timeout)?
+    }
+
+    async fn perform_outgoing_handshake_inner(
         &self,
         addr: SocketAddr,
         peer: &DiscoveredPeer,
@@ -278,6 +442,16 @@ impl Avenad {
 
     async fn handle_incoming_handshake(
         &self,
+        stream: TcpStream,
+        addr: SocketAddr,
+    ) -> Result<PeerState, AvenadError> {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.handle_incoming_handshake_inner(stream, addr))
+            .await
+            .map_err(|_| AvenadError::Timeout)?
+    }
+
+    async fn handle_incoming_handshake_inner(
+        &self,
         mut stream: TcpStream,
         addr: SocketAddr,
     ) -> Result<PeerState, AvenadError> {
@@ -309,6 +483,10 @@ impl Avenad {
         peer_msg
             .verify(&peer_pubkey, &self.keypair.device_id())
             .map_err(|e| AvenadError::Handshake(format!("signature verification failed: {}", e)))?;
+
+        if !self.nonce_cache.check_and_insert(peer_device_id, peer_msg.nonce).await {
+            return Err(AvenadError::Handshake("replay detected".into()));
+        }
 
         let local_ephemeral = EphemeralKeypair::generate();
         let local_msg = HandshakeMessage::create(
@@ -406,6 +584,22 @@ impl Avenad {
     }
 }
 
+fn validate_interface_name(name: &str) -> Result<(), AvenadError> {
+    if name.is_empty() {
+        return Err(AvenadError::Config("interface name cannot be empty".into()));
+    }
+    if name.len() > 15 {
+        return Err(AvenadError::Config("interface name too long (max 15 chars)".into()));
+    }
+    if name.starts_with('-') {
+        return Err(AvenadError::Config("interface name cannot start with '-'".into()));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(AvenadError::Config("interface name contains invalid characters".into()));
+    }
+    Ok(())
+}
+
 fn load_or_generate_keypair(config: &AvenadConfig) -> Result<DeviceKeypair, AvenadError> {
     if let Some(ref path) = config.keypair_path {
         if path.exists() {
@@ -426,7 +620,27 @@ fn load_or_generate_keypair(config: &AvenadConfig) -> Result<DeviceKeypair, Aven
             std::fs::create_dir_all(parent)?;
         }
         let bytes = keypair.to_bytes();
-        std::fs::write(path, &*bytes)?;
+
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            file.write_all(&*bytes)?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, &*bytes)?;
+        }
+
         info!(path = %path.display(), "Generated and saved new keypair");
     }
 
@@ -517,6 +731,7 @@ enum AvenadError {
     Io(std::io::Error),
     Handshake(String),
     Json(serde_json::Error),
+    Timeout,
 }
 
 impl std::fmt::Display for AvenadError {
@@ -528,6 +743,7 @@ impl std::fmt::Display for AvenadError {
             AvenadError::Io(e) => write!(f, "io error: {}", e),
             AvenadError::Handshake(e) => write!(f, "handshake error: {}", e),
             AvenadError::Json(e) => write!(f, "json error: {}", e),
+            AvenadError::Timeout => write!(f, "handshake timeout"),
         }
     }
 }
