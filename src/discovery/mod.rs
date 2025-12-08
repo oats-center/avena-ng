@@ -64,6 +64,7 @@ impl Capability {
 pub enum DiscoverySource {
     Mdns,
     Static,
+    /// Reserved for mesh routing integration (Phase 5: Babel)
     Gossip,
 }
 

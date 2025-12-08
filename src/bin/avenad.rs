@@ -411,13 +411,13 @@ impl AvenadInner {
             .map_err(|e| AvenadError::Handshake(format!("signature verification failed: {}", e)))?;
 
         let peer_ephemeral = peer_msg.ephemeral_public_key();
-        let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral, true);
+        let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer.device_id);
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
-            .with_allowed_ips(vec![IpNet::new(peer_overlay_ip.into(), 128).unwrap()])
+            .with_allowed_ips(vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")])
             .with_endpoint(peer.endpoint)
             .with_keepalive(self.config.persistent_keepalive);
 
@@ -496,7 +496,7 @@ impl AvenadInner {
         stream.write_all(&msg_bytes).await?;
 
         let peer_ephemeral = peer_msg.ephemeral_public_key();
-        let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral, false);
+        let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer_device_id);
 
@@ -509,7 +509,7 @@ impl AvenadInner {
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
-            .with_allowed_ips(vec![IpNet::new(peer_overlay_ip.into(), 128).unwrap()])
+            .with_allowed_ips(vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")])
             .with_endpoint(peer_wg_endpoint)
             .with_keepalive(self.config.persistent_keepalive);
 
@@ -665,49 +665,37 @@ fn assign_interface_address(
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn add_peer_route(
     interface_name: &str,
     peer_addr: std::net::Ipv6Addr,
 ) -> Result<(), std::io::Error> {
-    use std::process::Command;
+    use avena_overlay::wg::linux::netlink;
 
-    let addr_str = format!("{}/128", peer_addr);
-    let output = Command::new("ip")
-        .args(["-6", "route", "add", &addr_str, "dev", interface_name])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("File exists") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to add route: {}", stderr),
-            ));
-        }
-    }
-
-    Ok(())
+    netlink::add_ipv6_route(interface_name, peer_addr, 128).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("add route: {e}"))
+    })
 }
 
-fn get_interface_ip(interface_name: &str) -> Option<IpAddr> {
-    let output = std::process::Command::new("ip")
-        .args(["-4", "-o", "addr", "show", interface_name])
-        .output()
-        .ok()?;
+#[cfg(not(target_os = "linux"))]
+fn add_peer_route(
+    _interface_name: &str,
+    _peer_addr: std::net::Ipv6Addr,
+) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "requires Linux",
+    ))
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(idx) = parts.iter().position(|&s| s == "inet") {
-            if let Some(addr_cidr) = parts.get(idx + 1) {
-                if let Some(addr_str) = addr_cidr.split('/').next() {
-                    if let Ok(ip) = addr_str.parse::<IpAddr>() {
-                        return Some(ip);
-                    }
-                }
-            }
-        }
-    }
+#[cfg(target_os = "linux")]
+fn get_interface_ip(interface_name: &str) -> Option<IpAddr> {
+    use avena_overlay::wg::linux::netlink;
+    netlink::get_interface_ipv4(interface_name).map(IpAddr::V4)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_interface_ip(_interface_name: &str) -> Option<IpAddr> {
     None
 }
 

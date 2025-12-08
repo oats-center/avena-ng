@@ -216,7 +216,6 @@ pub fn derive_wireguard_keypair(device: &DeviceKeypair) -> WireguardKeypair {
 pub fn derive_session_keys(
     local_ephemeral: &EphemeralKeypair,
     peer_ephemeral: &X25519PublicKey,
-    _initiator: bool,
 ) -> SessionKeys {
     let shared_secret = local_ephemeral.diffie_hellman(peer_ephemeral);
     let hkdf = Hkdf::<Sha256>::new(Some(SESSION_KEY_SALT), &shared_secret);
@@ -294,8 +293,8 @@ mod tests {
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_ephemeral = EphemeralKeypair::generate();
 
-        let alice_keys = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key(), true);
-        let alice_keys2 = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key(), true);
+        let alice_keys = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key());
+        let alice_keys2 = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key());
 
         assert_eq!(*alice_keys.wireguard_psk, *alice_keys2.wireguard_psk);
     }
@@ -305,8 +304,8 @@ mod tests {
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_ephemeral = EphemeralKeypair::generate();
 
-        let alice_keys = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key(), true);
-        let bob_keys = derive_session_keys(&bob_ephemeral, alice_ephemeral.public_key(), false);
+        let alice_keys = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key());
+        let bob_keys = derive_session_keys(&bob_ephemeral, alice_ephemeral.public_key());
 
         assert_eq!(*alice_keys.wireguard_psk, *bob_keys.wireguard_psk);
     }
@@ -378,12 +377,10 @@ mod tests {
         let alice_keys = derive_session_keys(
             &alice_ephemeral,
             &bob_msg.ephemeral_public_key(),
-            true,
         );
         let bob_keys = derive_session_keys(
             &bob_ephemeral,
             &alice_msg.ephemeral_public_key(),
-            false,
         );
 
         assert_eq!(*alice_keys.wireguard_psk, *bob_keys.wireguard_psk);
