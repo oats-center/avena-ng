@@ -202,6 +202,25 @@ impl TunnelBackend for UserspaceBackend {
         wg.listen_port()
             .map_err(|e| TunnelError::Wireguard(e.to_string()))
     }
+
+    async fn set_listen_port(&self, port: u16) -> Result<(), TunnelError> {
+        self.require_wg()?;
+        let wg_guard = self
+            .wg
+            .lock()
+            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+        let wg = wg_guard.as_ref().unwrap();
+
+        let current = wg
+            .read_host()
+            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+        let mut host = Host::default();
+        host.listen_port = port;
+        host.private_key = current.private_key;
+        wg.write_host(&host)
+            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -338,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and wireguard-go"]
     async fn create_userspace_interface() {
         require_wireguard_go();
 
@@ -353,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and wireguard-go"]
     async fn add_and_query_peer_userspace() {
         require_wireguard_go();
 
@@ -375,7 +394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and wireguard-go"]
     async fn remove_peer_userspace() {
         require_wireguard_go();
 
@@ -396,7 +415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and wireguard-go"]
     async fn idempotent_ensure_interface() {
         require_wireguard_go();
 

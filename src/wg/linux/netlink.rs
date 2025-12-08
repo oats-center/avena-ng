@@ -2,9 +2,8 @@
 
 use std::fmt::Debug;
 use std::io::ErrorKind;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use bytes::BytesMut;
 use netlink_packet_core::{
     NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable,
     NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
@@ -14,8 +13,10 @@ use netlink_packet_generic::{
     GenlFamily, GenlMessage,
 };
 use netlink_packet_route::{
+    address::{AddressAttribute, AddressMessage},
     link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
-    RouteNetlinkMessage,
+    route::{RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
+    AddressFamily, RouteNetlinkMessage,
 };
 use netlink_packet_wireguard::{
     constants::{WGDEVICE_F_REPLACE_PEERS, WGPEER_F_REMOVE_ME, WGPEER_F_REPLACE_ALLOWEDIPS},
@@ -48,7 +49,12 @@ where
     let mut buf = vec![0u8; len];
     req.serialize(&mut buf);
 
-    let socket = Socket::new(protocol).map_err(|e| WgError::NetlinkError(e.to_string()))?;
+    let mut socket = Socket::new(protocol).map_err(|e| WgError::NetlinkError(e.to_string()))?;
+    // Bind to get an auto-assigned port ID (required for proper responses in user namespaces)
+    let local_addr = SocketAddr::new(0, 0);
+    socket
+        .bind(&local_addr)
+        .map_err(|e| WgError::NetlinkError(format!("bind failed: {}", e)))?;
     let kernel_addr = SocketAddr::new(0, 0);
     socket
         .connect(&kernel_addr)
@@ -56,23 +62,47 @@ where
 
     let n_sent = socket
         .send(&buf, 0)
-        .map_err(|e| WgError::NetlinkError(e.to_string()))?;
+        .map_err(|e| WgError::NetlinkError(format!("send failed: {}", e)))?;
 
     if n_sent != len {
-        return Err(WgError::NetlinkError("failed to send full message".into()));
+        return Err(WgError::NetlinkError(format!(
+            "partial send: sent {} of {} bytes",
+            n_sent, len
+        )));
     }
 
     let mut responses = Vec::new();
     loop {
-        let mut recv_buf = BytesMut::zeroed(SOCKET_BUFFER_LENGTH);
+        let mut recv_buf = Vec::with_capacity(SOCKET_BUFFER_LENGTH);
         let n_received = socket
             .recv(&mut recv_buf, 0)
             .map_err(|e| WgError::NetlinkError(e.to_string()))?;
 
+        if n_received == 0 {
+            return Ok(responses);
+        }
+
         let mut offset = 0;
         loop {
+            if offset >= n_received {
+                break;
+            }
+
+            let remaining = n_received - offset;
+            if remaining < 16 {
+                break;
+            }
+
             let response = NetlinkMessage::<I>::deserialize(&recv_buf[offset..n_received])
-                .map_err(|e| WgError::NetlinkError(e.to_string()))?;
+                .map_err(|e| {
+                    WgError::NetlinkError(format!(
+                        "{} (offset={}, n_received={}, first_bytes={:02x?})",
+                        e,
+                        offset,
+                        n_received,
+                        &recv_buf[offset..std::cmp::min(offset + 16, n_received)]
+                    ))
+                })?;
 
             match &response.payload {
                 NetlinkPayload::Error(msg) if msg.code.is_none() => return Ok(responses),
@@ -361,6 +391,132 @@ pub fn delete_peer(ifname: &str, pubkey: &Key) -> Result<(), WgError> {
 
     netlink_request_genl(genlmsg, NLM_F_REQUEST | NLM_F_ACK)?;
     Ok(())
+}
+
+const RT_TABLE_MAIN: u8 = 254;
+
+fn get_interface_index(ifname: &str) -> Result<u32, WgError> {
+    let mut message = LinkMessage::default();
+    message
+        .attributes
+        .push(LinkAttribute::IfName(ifname.into()));
+
+    let responses = netlink_request(
+        RouteNetlinkMessage::GetLink(message),
+        NLM_F_REQUEST | NLM_F_DUMP,
+        NETLINK_ROUTE,
+    )?;
+
+    for response in responses {
+        if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link)) = response.payload {
+            for attr in &link.attributes {
+                if let LinkAttribute::IfName(name) = attr {
+                    if name == ifname {
+                        return Ok(link.header.index);
+                    }
+                }
+            }
+        }
+    }
+
+    Err(WgError::InterfaceNotFound(ifname.into()))
+}
+
+pub fn add_ipv6_address(ifname: &str, addr: Ipv6Addr, prefix_len: u8) -> Result<(), WgError> {
+    let ifindex = get_interface_index(ifname)?;
+
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet6;
+    message.header.prefix_len = prefix_len;
+    message.header.index = ifindex;
+
+    message
+        .attributes
+        .push(AddressAttribute::Address(IpAddr::V6(addr)));
+    message
+        .attributes
+        .push(AddressAttribute::Local(IpAddr::V6(addr)));
+
+    netlink_request(
+        RouteNetlinkMessage::NewAddress(message),
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        NETLINK_ROUTE,
+    )?;
+
+    Ok(())
+}
+
+pub fn add_ipv6_route(ifname: &str, dest: Ipv6Addr, prefix_len: u8) -> Result<(), WgError> {
+    let ifindex = get_interface_index(ifname)?;
+
+    let mut message = RouteMessage::default();
+    message.header.address_family = AddressFamily::Inet6;
+    message.header.destination_prefix_length = prefix_len;
+    message.header.table = RT_TABLE_MAIN;
+    message.header.protocol = RouteProtocol::Boot;
+    message.header.scope = RouteScope::Universe;
+    message.header.kind = RouteType::Unicast;
+
+    message
+        .attributes
+        .push(RouteAttribute::Destination(IpAddr::V6(dest).into()));
+    message.attributes.push(RouteAttribute::Oif(ifindex));
+
+    netlink_request(
+        RouteNetlinkMessage::NewRoute(message),
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        NETLINK_ROUTE,
+    )?;
+
+    Ok(())
+}
+
+pub fn set_link_up(ifname: &str) -> Result<(), WgError> {
+    let ifindex = get_interface_index(ifname)?;
+
+    let mut message = LinkMessage::default();
+    message.header.index = ifindex;
+    message.header.flags = LinkFlags::Up;
+    message.header.change_mask = LinkFlags::Up;
+
+    netlink_request(
+        RouteNetlinkMessage::SetLink(message),
+        NLM_F_REQUEST | NLM_F_ACK,
+        NETLINK_ROUTE,
+    )?;
+
+    Ok(())
+}
+
+pub fn get_interface_ipv4(ifname: &str) -> Option<Ipv4Addr> {
+    let ifindex = get_interface_index(ifname).ok()?;
+
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet;
+
+    let responses = netlink_request(
+        RouteNetlinkMessage::GetAddress(message),
+        NLM_F_REQUEST | NLM_F_DUMP,
+        NETLINK_ROUTE,
+    )
+    .ok()?;
+
+    for response in responses {
+        if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(addr_msg)) =
+            response.payload
+        {
+            if addr_msg.header.index != ifindex {
+                continue;
+            }
+            for attr in &addr_msg.attributes {
+                if let AddressAttribute::Address(IpAddr::V4(ip)) = attr {
+                    return Some(*ip);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

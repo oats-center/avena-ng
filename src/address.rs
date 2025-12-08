@@ -7,6 +7,13 @@
 use crate::identity::DeviceId;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv6Addr;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum NetworkConfigError {
+    #[error("only /48 prefixes are supported, got /{0}")]
+    UnsupportedPrefixLen(u8),
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Overlay network prefix configuration and address derivation helpers.
@@ -16,12 +23,11 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
-    pub fn new(prefix: Ipv6Addr, prefix_len: u8) -> Self {
-        assert!(
-            prefix_len == 48,
-            "only /48 prefixes are supported for address derivation"
-        );
-        Self { prefix, prefix_len }
+    pub fn new(prefix: Ipv6Addr, prefix_len: u8) -> Result<Self, NetworkConfigError> {
+        if prefix_len != 48 {
+            return Err(NetworkConfigError::UnsupportedPrefixLen(prefix_len));
+        }
+        Ok(Self { prefix, prefix_len })
     }
 
     /// Default ULA space used when no config is provided.
@@ -190,7 +196,7 @@ mod tests {
     #[test]
     fn test_custom_prefix() {
         let prefix: Ipv6Addr = "fd12:3456:7890::".parse().unwrap();
-        let config = NetworkConfig::new(prefix, 48);
+        let config = NetworkConfig::new(prefix, 48).unwrap();
 
         let keypair = DeviceKeypair::generate();
         let addr = config.device_address(&keypair.device_id());
@@ -214,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_prefix_boundary_48() {
-        let config = NetworkConfig::new("fd00:1234:5678::".parse().unwrap(), 48);
+        let config = NetworkConfig::new("fd00:1234:5678::".parse().unwrap(), 48).unwrap();
 
         let in_prefix: Ipv6Addr = "fd00:1234:5678:ffff::1".parse().unwrap();
         let out_prefix: Ipv6Addr = "fd00:1234:5679::1".parse().unwrap();

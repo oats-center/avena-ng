@@ -204,6 +204,25 @@ impl TunnelBackend for KernelBackend {
         wg.listen_port()
             .map_err(|e| TunnelError::Wireguard(e.to_string()))
     }
+
+    async fn set_listen_port(&self, port: u16) -> Result<(), TunnelError> {
+        self.require_wg()?;
+        let wg_guard = self
+            .wg
+            .lock()
+            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+        let wg = wg_guard.as_ref().unwrap();
+
+        let current = wg
+            .read_host()
+            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+        let mut host = Host::default();
+        host.listen_port = port;
+        host.private_key = current.private_key;
+        wg.write_host(&host)
+            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -328,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and WireGuard kernel module"]
     async fn create_kernel_interface() {
         let guard = InterfaceGuard::new();
         let backend = KernelBackend::new();
@@ -341,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and WireGuard kernel module"]
     async fn add_and_query_peer_kernel() {
         let guard = InterfaceGuard::new();
         let backend = KernelBackend::new();
@@ -361,7 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and WireGuard kernel module"]
     async fn remove_peer_kernel() {
         let guard = InterfaceGuard::new();
         let backend = KernelBackend::new();

@@ -269,8 +269,8 @@ mod tests {
                 .unwrap();
         let peer2 = host.peers.get(&peer2_key).unwrap();
         assert!(peer2.endpoint.is_some());
-        assert_eq!(peer2.tx_bytes, 52759980);
-        assert_eq!(peer2.rx_bytes, 3683056);
+        assert_eq!(peer2.tx_bytes, 52_759_980);
+        assert_eq!(peer2.rx_bytes, 3_683_056);
     }
 
     #[test]

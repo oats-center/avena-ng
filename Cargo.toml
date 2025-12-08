@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Avena Overlay Network - encrypted, authenticated IP connectivity"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/avena-overlay"
+keywords = ["wireguard", "overlay", "mesh", "vpn", "networking"]
+categories = ["network-programming", "cryptography"]
 
 [[bin]]
 name = "avenad"
@@ -50,6 +53,9 @@ directories = "5"
 # Error handling
 thiserror = "1"
 
+# Data structures
+lru = "0.12"
+
 # Time (for certificate expiry)
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -64,6 +70,7 @@ netlink-sys = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
 
 [lints.rust]
 missing_debug_implementations = "warn"

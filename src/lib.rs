@@ -1,11 +1,12 @@
 //! Avena overlay networking primitives: device identity, discovery, handshakes,
-//! and WireGuard tunnel management for the avenad daemon.
+//! and `WireGuard` tunnel management for the avenad daemon.
 //!
 //! The crate exposes small, composable modules so the daemon can:
 //! - derive deterministic device identities and overlay addresses,
 //! - discover peers (mDNS or static),
-//! - perform authenticated handshakes that yield WireGuard keys, and
-//! - configure kernel or userspace WireGuard tunnels.
+//! - perform authenticated handshakes that yield `WireGuard` keys, and
+//! - configure kernel or userspace `WireGuard` tunnels.
+//!
 //! Most types are re-exported for ergonomic use by `avenad`.
 
 pub mod address;
@@ -16,7 +17,7 @@ pub mod identity;
 pub mod tunnel;
 pub mod wg;
 
-pub use address::NetworkConfig;
+pub use address::{NetworkConfig, NetworkConfigError};
 pub use crypto::{
     derive_session_keys, derive_wireguard_keypair, wireguard_pubkey, CertError, Certificate,
     CertificateChain, CertValidator, EphemeralKeypair, HandshakeError, HandshakeMessage,

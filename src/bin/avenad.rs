@@ -6,9 +6,11 @@ use avena_overlay::{
 };
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
+use lru::LruCache;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,50 +26,49 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const NONCE_CACHE_EXPIRY: Duration = Duration::from_secs(70);
 const MAX_CONCURRENT_HANDSHAKES: usize = 32;
 const MAX_HANDSHAKES_PER_IP: u32 = 5;
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_NONCE_CACHE_SIZE: usize = 10_000;
+const MAX_RATE_LIMITER_SIZE: usize = 10_000;
+const MAX_CONCURRENT_OUTGOING_HANDSHAKES: usize = 16;
 
 struct NonceCache {
-    entries: Mutex<HashMap<(DeviceId, [u8; 32]), Instant>>,
+    entries: Mutex<LruCache<(DeviceId, [u8; 32]), Instant>>,
 }
 
 impl NonceCache {
     fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_NONCE_CACHE_SIZE).unwrap(),
+            )),
         }
     }
 
     async fn check_and_insert(&self, device_id: DeviceId, nonce: [u8; 32]) -> bool {
         let mut entries = self.entries.lock().await;
         let now = Instant::now();
-
         let key = (device_id, nonce);
+
         if let Some(&expiry) = entries.get(&key) {
             if expiry > now {
                 return false;
             }
         }
-
-        entries.insert(key, now + NONCE_CACHE_EXPIRY);
+        entries.put(key, now + NONCE_CACHE_EXPIRY);
         true
-    }
-
-    async fn cleanup(&self) {
-        let mut entries = self.entries.lock().await;
-        let now = Instant::now();
-        entries.retain(|_, &mut expiry| expiry > now);
     }
 }
 
 struct RateLimiter {
-    counts: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    counts: Mutex<LruCache<IpAddr, (u32, Instant)>>,
     window: Duration,
 }
 
 impl RateLimiter {
     fn new(window: Duration) -> Self {
         Self {
-            counts: Mutex::new(HashMap::new()),
+            counts: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_RATE_LIMITER_SIZE).unwrap(),
+            )),
             window,
         }
     }
@@ -76,31 +77,21 @@ impl RateLimiter {
         let mut counts = self.counts.lock().await;
         let now = Instant::now();
 
-        match counts.entry(addr) {
-            Entry::Vacant(e) => {
-                e.insert((1, now + self.window));
+        if let Some((count, expiry)) = counts.get_mut(&addr) {
+            if *expiry <= now {
+                *count = 1;
+                *expiry = now + self.window;
+                true
+            } else if *count >= MAX_HANDSHAKES_PER_IP {
+                false
+            } else {
+                *count += 1;
                 true
             }
-            Entry::Occupied(mut e) => {
-                let (count, expiry) = e.get_mut();
-                if *expiry <= now {
-                    *count = 1;
-                    *expiry = now + self.window;
-                    true
-                } else if *count >= MAX_HANDSHAKES_PER_IP {
-                    false
-                } else {
-                    *count += 1;
-                    true
-                }
-            }
+        } else {
+            counts.put(addr, (1, now + self.window));
+            true
         }
-    }
-
-    async fn cleanup(&self) {
-        let mut counts = self.counts.lock().await;
-        let now = Instant::now();
-        counts.retain(|_, (_, expiry)| *expiry > now);
     }
 }
 
@@ -115,6 +106,7 @@ struct AvenadInner {
     nonce_cache: NonceCache,
     rate_limiter: RateLimiter,
     handshake_semaphore: Arc<Semaphore>,
+    outgoing_semaphore: Arc<Semaphore>,
 }
 
 struct Avenad {
@@ -144,6 +136,7 @@ impl Avenad {
         info!(mode = ?config.tunnel_mode, "Tunnel backend created");
 
         tunnel.ensure_interface(&config.interface_name).await?;
+        tunnel.set_listen_port(config.listen_port).await?;
         tunnel.set_private_key(&*wg_keys.private).await?;
 
         assign_interface_address(&config.interface_name, overlay_ip)?;
@@ -174,6 +167,7 @@ impl Avenad {
             nonce_cache: NonceCache::new(),
             rate_limiter: RateLimiter::new(Duration::from_secs(60)),
             handshake_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
+            outgoing_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTGOING_HANDSHAKES)),
         });
 
         Ok(Self {
@@ -202,9 +196,7 @@ impl Avenad {
         info!("Avenad running. Press Ctrl+C to stop.");
 
         let mut dead_peer_interval = tokio::time::interval(Duration::from_secs(inner.config.dead_peer_timeout_secs));
-        let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
         dead_peer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -212,10 +204,19 @@ impl Avenad {
                     match result {
                         Ok(DiscoveryEvent::PeerDiscovered(peer)) => {
                             if peer.device_id != inner.keypair.device_id() {
+                                let permit = match inner.outgoing_semaphore.clone().try_acquire_owned() {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        warn!(peer_id = %peer.device_id, "Outgoing handshake queue full, skipping");
+                                        continue;
+                                    }
+                                };
+
                                 info!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Peer discovered");
                                 inner.discovery.cache_discovered_peer(&peer);
                                 let inner_clone = Arc::clone(&inner);
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     if let Err(e) = inner_clone.handle_discovered_peer(peer).await {
                                         warn!("Failed to handle discovered peer: {}", e);
                                     }
@@ -259,11 +260,7 @@ impl Avenad {
                                             entry.insert(peer_state);
                                             info!(peer_id = %device_id, "Peer connected via incoming handshake");
                                         } else {
-                                            debug!(peer_id = %device_id, "Peer already connected, cleaning up duplicate");
-                                            drop(peers);
-                                            if let Err(e) = inner_clone.tunnel.remove_peer(&peer_state.wg_pubkey).await {
-                                                warn!(peer_id = %device_id, "Failed to remove duplicate peer: {}", e);
-                                            }
+                                            debug!(peer_id = %device_id, "Peer already connected, discarding duplicate handshake result");
                                         }
                                     }
                                     Err(e) => {
@@ -279,10 +276,6 @@ impl Avenad {
                 }
                 _ = dead_peer_interval.tick() => {
                     inner.check_dead_peers().await;
-                }
-                _ = cleanup_interval.tick() => {
-                    inner.nonce_cache.cleanup().await;
-                    inner.rate_limiter.cleanup().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutdown signal received");
@@ -326,9 +319,8 @@ impl AvenadInner {
         }
 
         {
-            let mut peers = self.peers.write().await;
-            if let Entry::Vacant(_) = peers.entry(peer.device_id) {
-            } else {
+            let peers = self.peers.read().await;
+            if peers.contains_key(&peer.device_id) {
                 debug!(peer_id = %peer.device_id, "Already connected to peer");
                 return Ok(());
             }
@@ -344,10 +336,7 @@ impl AvenadInner {
             entry.insert(peer_state);
             info!(peer_id = %peer.device_id, "Peer connected");
         } else {
-            debug!(peer_id = %peer.device_id, "Peer already connected by another task, cleaning up");
-            if let Err(e) = self.tunnel.remove_peer(&peer_state.wg_pubkey).await {
-                warn!(peer_id = %peer.device_id, "Failed to remove duplicate peer: {}", e);
-            }
+            debug!(peer_id = %peer.device_id, "Peer already connected, discarding duplicate handshake result");
         }
 
         Ok(())
@@ -647,40 +636,39 @@ fn load_or_generate_keypair(config: &AvenadConfig) -> Result<DeviceKeypair, Aven
     Ok(keypair)
 }
 
-fn assign_interface_address(interface_name: &str, addr: std::net::Ipv6Addr) -> Result<(), std::io::Error> {
-    use std::process::Command;
+#[cfg(target_os = "linux")]
+fn assign_interface_address(
+    interface_name: &str,
+    addr: std::net::Ipv6Addr,
+) -> Result<(), std::io::Error> {
+    use avena_overlay::wg::linux::netlink;
 
-    let addr_str = format!("{}/128", addr);
-    let output = Command::new("ip")
-        .args(["-6", "addr", "add", &addr_str, "dev", interface_name])
-        .output()?;
+    netlink::add_ipv6_address(interface_name, addr, 128).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("add address: {e}"))
+    })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("File exists") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to add address: {}", stderr),
-            ));
-        }
-    }
-
-    let output = Command::new("ip")
-        .args(["link", "set", interface_name, "up"])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to bring up interface: {}", stderr),
-        ));
-    }
+    netlink::set_link_up(interface_name).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("set link up: {e}"))
+    })?;
 
     Ok(())
 }
 
-fn add_peer_route(interface_name: &str, peer_addr: std::net::Ipv6Addr) -> Result<(), std::io::Error> {
+#[cfg(not(target_os = "linux"))]
+fn assign_interface_address(
+    _interface_name: &str,
+    _addr: std::net::Ipv6Addr,
+) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "requires Linux",
+    ))
+}
+
+fn add_peer_route(
+    interface_name: &str,
+    peer_addr: std::net::Ipv6Addr,
+) -> Result<(), std::io::Error> {
     use std::process::Command;
 
     let addr_str = format!("{}/128", peer_addr);

@@ -173,13 +173,21 @@ mod tests {
     }
 
     #[test]
-    fn test_ordering() {
+    fn test_ordering_is_consistent() {
         let key1 = SigningKey::from_bytes(&[1u8; 32]);
         let key2 = SigningKey::from_bytes(&[2u8; 32]);
-
         let id1 = DeviceId::from_public_key(&key1.verifying_key());
         let id2 = DeviceId::from_public_key(&key2.verifying_key());
 
-        assert!(id1 < id2 || id1 > id2 || id1 == id2);
+        assert_ne!(id1, id2, "Different keys should produce different IDs");
+
+        let key3 = SigningKey::from_bytes(&[3u8; 32]);
+        let id3 = DeviceId::from_public_key(&key3.verifying_key());
+
+        let mut ids = vec![id1, id2, id3];
+        ids.sort();
+        let mut sorted_ids = vec![id3, id1, id2];
+        sorted_ids.sort();
+        assert_eq!(ids, sorted_ids, "Sorting should be deterministic");
     }
 }

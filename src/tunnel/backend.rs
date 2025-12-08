@@ -99,6 +99,7 @@ pub trait TunnelBackend: Send + Sync {
     ) -> Result<(), TunnelError>;
     async fn peer_stats(&self, pubkey: &[u8; 32]) -> Result<PeerStats, TunnelError>;
     async fn listen_port(&self) -> Result<u16, TunnelError>;
+    async fn set_listen_port(&self, port: u16) -> Result<(), TunnelError>;
 }
 
 #[cfg(test)]

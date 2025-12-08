@@ -168,13 +168,11 @@ impl HandshakeMessage {
 
 /// WireGuard key material derived for a single peer connection.
 ///
-/// The private key is role-specific (initiator vs responder), while the PSK
-/// matches on both ends so traffic is protected even if peers share the same
-/// long-lived interface key across sessions.
+/// The PSK matches on both ends so traffic is protected even if peers share
+/// the same long-lived interface key across sessions.
 #[derive(Clone)]
 #[expect(missing_debug_implementations, reason = "contains secret key material")]
 pub struct SessionKeys {
-    pub wireguard_private: Zeroizing<[u8; 32]>,
     pub wireguard_psk: Zeroizing<[u8; 32]>,
 }
 
@@ -187,7 +185,6 @@ pub struct WireguardKeypair {
 }
 
 const SESSION_KEY_SALT: &[u8] = b"avena-session-keys-v1";
-const WG_PRIVATE_INFO: &[u8] = b"wireguard-private";
 const WG_PSK_INFO: &[u8] = b"wireguard-psk";
 const WG_DEVICE_KEY_SALT: &[u8] = b"avena-wireguard-device-key-v1";
 const WG_DEVICE_KEY_INFO: &[u8] = b"wireguard-interface";
@@ -215,34 +212,20 @@ pub fn derive_wireguard_keypair(device: &DeviceKeypair) -> WireguardKeypair {
     }
 }
 
-/// Derive per-connection WireGuard keys from the shared ephemeral secret.
-///
-/// The `initiator` flag picks a different HKDF info string so each side derives
-/// complementary private keys while still agreeing on the preshared key.
+/// Derive per-connection WireGuard PSK from the shared ephemeral secret.
 pub fn derive_session_keys(
     local_ephemeral: &EphemeralKeypair,
     peer_ephemeral: &X25519PublicKey,
-    initiator: bool,
+    _initiator: bool,
 ) -> SessionKeys {
     let shared_secret = local_ephemeral.diffie_hellman(peer_ephemeral);
-
     let hkdf = Hkdf::<Sha256>::new(Some(SESSION_KEY_SALT), &shared_secret);
-
-    let role_prefix = if initiator { b"initiator" } else { b"responder" };
-
-    let mut wg_private = [0u8; 32];
-    let mut private_info = Vec::with_capacity(role_prefix.len() + WG_PRIVATE_INFO.len());
-    private_info.extend_from_slice(role_prefix);
-    private_info.extend_from_slice(WG_PRIVATE_INFO);
-    hkdf.expand(&private_info, &mut wg_private)
-        .expect("32 bytes is valid for HKDF-SHA256");
 
     let mut wg_psk = [0u8; 32];
     hkdf.expand(WG_PSK_INFO, &mut wg_psk)
         .expect("32 bytes is valid for HKDF-SHA256");
 
     SessionKeys {
-        wireguard_private: Zeroizing::new(wg_private),
         wireguard_psk: Zeroizing::new(wg_psk),
     }
 }
@@ -312,10 +295,8 @@ mod tests {
         let bob_ephemeral = EphemeralKeypair::generate();
 
         let alice_keys = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key(), true);
-
         let alice_keys2 = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key(), true);
 
-        assert_eq!(*alice_keys.wireguard_private, *alice_keys2.wireguard_private);
         assert_eq!(*alice_keys.wireguard_psk, *alice_keys2.wireguard_psk);
     }
 
@@ -328,17 +309,6 @@ mod tests {
         let bob_keys = derive_session_keys(&bob_ephemeral, alice_ephemeral.public_key(), false);
 
         assert_eq!(*alice_keys.wireguard_psk, *bob_keys.wireguard_psk);
-    }
-
-    #[test]
-    fn test_session_keys_private_differs_by_role() {
-        let alice_ephemeral = EphemeralKeypair::generate();
-        let bob_ephemeral = EphemeralKeypair::generate();
-
-        let alice_keys = derive_session_keys(&alice_ephemeral, bob_ephemeral.public_key(), true);
-        let bob_keys = derive_session_keys(&bob_ephemeral, alice_ephemeral.public_key(), false);
-
-        assert_ne!(*alice_keys.wireguard_private, *bob_keys.wireguard_private);
     }
 
     #[test]
