@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 AVENAD="$PROJECT_ROOT/target/debug/avenad"
+AVENA_KEYGEN="$PROJECT_ROOT/target/debug/avena-keygen"
 TMPDIR=$(mktemp -d)
 
 cleanup() {
@@ -14,7 +15,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Building binaries ==="
-cargo build --bin avenad --manifest-path "$PROJECT_ROOT/Cargo.toml" --quiet
+cargo build --bin avenad --bin avena-keygen --manifest-path "$PROJECT_ROOT/Cargo.toml" --quiet
 
 if ! command -v wireguard-go &>/dev/null; then
     echo "ERROR: wireguard-go not found."
@@ -23,10 +24,22 @@ if ! command -v wireguard-go &>/dev/null; then
     exit 1
 fi
 
+echo "=== Generating certificates ==="
+"$AVENA_KEYGEN" generate "$TMPDIR/ca.key" >/dev/null
+"$AVENA_KEYGEN" cert init-ca "$TMPDIR/ca.key" "$TMPDIR/root.cert" >/dev/null
+"$AVENA_KEYGEN" generate "$TMPDIR/node1.key" >/dev/null
+"$AVENA_KEYGEN" cert issue "$TMPDIR/ca.key" "$TMPDIR/root.cert" "$TMPDIR/node1.key" "$TMPDIR/node1.chain" >/dev/null
+"$AVENA_KEYGEN" generate "$TMPDIR/node2.key" >/dev/null
+"$AVENA_KEYGEN" cert issue "$TMPDIR/ca.key" "$TMPDIR/root.cert" "$TMPDIR/node2.key" "$TMPDIR/node2.chain" >/dev/null
+echo "Generated CA and device certificates"
+
 cat > "$TMPDIR/node1.toml" << EOF
 interface_name = "wg-node1"
 tunnel_mode = "userspace"
 listen_port = 51820
+keypair_path = "$TMPDIR/node1.key"
+trusted_root_cert = "$TMPDIR/root.cert"
+device_cert_chain = "$TMPDIR/node1.chain"
 
 [network]
 prefix = "fd00:a0e0:a000::"
@@ -41,6 +54,9 @@ cat > "$TMPDIR/node2.toml" << EOF
 interface_name = "wg-node2"
 tunnel_mode = "userspace"
 listen_port = 51820
+keypair_path = "$TMPDIR/node2.key"
+trusted_root_cert = "$TMPDIR/root.cert"
+device_cert_chain = "$TMPDIR/node2.chain"
 
 [network]
 prefix = "fd00:a0e0:a000::"

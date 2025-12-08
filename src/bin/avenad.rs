@@ -1,8 +1,8 @@
 use avena_overlay::{
-    derive_session_keys, derive_wireguard_keypair, AvenadConfig, DeviceId, DeviceKeypair,
-    DiscoveredPeer, DiscoveryEvent, DiscoveryService, EphemeralKeypair, HandshakeMessage,
-    KernelBackend, LocalAnnouncement, NetworkConfig, PeerConfig, PeerState, TunnelBackend,
-    TunnelMode, UserspaceBackend,
+    derive_session_keys, derive_wireguard_keypair, AvenadConfig, CertValidator, CertificateChain,
+    DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent, DiscoveryService, EphemeralKeypair,
+    HandshakeMessage, KernelBackend, LocalAnnouncement, NetworkConfig, PeerConfig, PeerState,
+    TunnelBackend, TunnelMode, UserspaceBackend,
 };
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
@@ -107,6 +107,8 @@ struct AvenadInner {
     rate_limiter: RateLimiter,
     handshake_semaphore: Arc<Semaphore>,
     outgoing_semaphore: Arc<Semaphore>,
+    cert_validator: CertValidator,
+    device_chain: CertificateChain,
 }
 
 struct Avenad {
@@ -122,6 +124,9 @@ impl Avenad {
         let keypair = load_or_generate_keypair(&config)?;
         let device_id = keypair.device_id();
         info!(device_id = %device_id, "Initialized device identity");
+
+        let (cert_validator, device_chain) = config.load_crypto().map_err(AvenadError::CertConfig)?;
+        info!("Loaded certificate chain");
 
         let wg_keys = derive_wireguard_keypair(&keypair);
 
@@ -168,6 +173,8 @@ impl Avenad {
             rate_limiter: RateLimiter::new(Duration::from_secs(60)),
             handshake_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
             outgoing_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTGOING_HANDSHAKES)),
+            cert_validator,
+            device_chain,
         });
 
         Ok(Self {
@@ -365,6 +372,7 @@ impl AvenadInner {
             &local_ephemeral,
             &peer.device_id,
             self.wg_public,
+            &self.device_chain,
         );
 
         stream.write_all(HANDSHAKE_MAGIC).await?;
@@ -407,8 +415,8 @@ impl AvenadInner {
         let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;
 
         peer_msg
-            .verify(&peer_pubkey, &self.keypair.device_id())
-            .map_err(|e| AvenadError::Handshake(format!("signature verification failed: {}", e)))?;
+            .verify(&peer_pubkey, &self.keypair.device_id(), &self.cert_validator)
+            .map_err(|e| AvenadError::Handshake(format!("handshake verification failed: {}", e)))?;
 
         let peer_ephemeral = peer_msg.ephemeral_public_key();
         let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
@@ -470,8 +478,8 @@ impl AvenadInner {
         let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;
 
         peer_msg
-            .verify(&peer_pubkey, &self.keypair.device_id())
-            .map_err(|e| AvenadError::Handshake(format!("signature verification failed: {}", e)))?;
+            .verify(&peer_pubkey, &self.keypair.device_id(), &self.cert_validator)
+            .map_err(|e| AvenadError::Handshake(format!("handshake verification failed: {}", e)))?;
 
         if !self.nonce_cache.check_and_insert(peer_device_id, peer_msg.nonce).await {
             return Err(AvenadError::Handshake("replay detected".into()));
@@ -483,6 +491,7 @@ impl AvenadInner {
             &local_ephemeral,
             &peer_device_id,
             self.wg_public,
+            &self.device_chain,
         );
 
         stream.write_all(HANDSHAKE_MAGIC).await?;
@@ -702,6 +711,7 @@ fn get_interface_ip(_interface_name: &str) -> Option<IpAddr> {
 #[derive(Debug)]
 enum AvenadError {
     Config(String),
+    CertConfig(avena_overlay::ConfigError),
     Tunnel(avena_overlay::TunnelError),
     Discovery(avena_overlay::DiscoveryError),
     Io(std::io::Error),
@@ -714,6 +724,7 @@ impl std::fmt::Display for AvenadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AvenadError::Config(e) => write!(f, "config error: {}", e),
+            AvenadError::CertConfig(e) => write!(f, "certificate config error: {}", e),
             AvenadError::Tunnel(e) => write!(f, "tunnel error: {}", e),
             AvenadError::Discovery(e) => write!(f, "discovery error: {}", e),
             AvenadError::Io(e) => write!(f, "io error: {}", e),

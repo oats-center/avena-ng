@@ -30,4 +30,4 @@ pub use discovery::{
 };
 pub use identity::{derive_workload_keypair, DecodeError, DeviceId, DeviceKeypair};
 pub use tunnel::{KernelBackend, PeerConfig, PeerStats, TunnelBackend, TunnelError, UserspaceBackend};
-pub use daemon::{AvenadConfig, PeerState, TunnelMode};
+pub use daemon::{AvenadConfig, ConfigError, PeerState, TunnelMode};

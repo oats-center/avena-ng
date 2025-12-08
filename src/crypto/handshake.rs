@@ -7,6 +7,7 @@
 //! interface key to configure. Per-connection WireGuard PSKs are derived from
 //! the ephemeral Diffie-Hellman to keep traffic separation at the peer level.
 
+use crate::crypto::certs::{CertError, CertValidator, CertificateChain};
 use crate::identity::{DeviceId, DeviceKeypair};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -30,6 +31,8 @@ pub enum HandshakeError {
     Expired { timestamp_secs: u64, now_secs: u64 },
     #[error("message from the future: timestamp {timestamp_secs}s, now {now_secs}s")]
     FutureTimestamp { timestamp_secs: u64, now_secs: u64 },
+    #[error("certificate validation failed: {0}")]
+    CertificateInvalid(#[from] CertError),
 }
 
 /// Short-lived X25519 key used to derive session secrets during a handshake.
@@ -85,6 +88,8 @@ pub struct HandshakeMessage {
     /// Signature over (ephemeral_pubkey || nonce || timestamp || peer_id || wg_pubkey).
     #[serde_as(as = "Bytes")]
     pub signature: [u8; 64],
+    /// Certificate chain proving the sender is authorized by a trusted root.
+    pub cert_chain: CertificateChain,
 }
 
 impl HandshakeMessage {
@@ -94,6 +99,7 @@ impl HandshakeMessage {
         ephemeral: &EphemeralKeypair,
         peer_id: &DeviceId,
         wg_pubkey: [u8; 32],
+        cert_chain: &CertificateChain,
     ) -> Self {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
@@ -120,14 +126,16 @@ impl HandshakeMessage {
             timestamp_secs,
             wg_pubkey,
             signature: signature.to_bytes(),
+            cert_chain: cert_chain.clone(),
         }
     }
 
-    /// Verify the handshake signature and timestamp against the expected peer and local ID.
+    /// Verify the handshake signature, timestamp, and certificate chain.
     pub fn verify(
         &self,
         peer_pubkey: &VerifyingKey,
         local_id: &DeviceId,
+        cert_validator: &CertValidator,
     ) -> Result<(), HandshakeError> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -158,7 +166,12 @@ impl HandshakeMessage {
         let signature = Signature::from_bytes(&self.signature);
         peer_pubkey
             .verify(&message_to_verify, &signature)
-            .map_err(|_| HandshakeError::InvalidSignature)
+            .map_err(|_| HandshakeError::InvalidSignature)?;
+
+        let peer_device_id = DeviceId::from_public_key(peer_pubkey);
+        cert_validator.validate_chain_for_device(&self.cert_chain, &peer_device_id)?;
+
+        Ok(())
     }
 
     pub fn ephemeral_public_key(&self) -> X25519PublicKey {
@@ -232,6 +245,22 @@ pub fn derive_session_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::certs::Certificate;
+
+    fn create_test_ca() -> (DeviceKeypair, Certificate) {
+        let ca = DeviceKeypair::from_seed(&[1u8; 32]);
+        let cert = Certificate::new_self_signed(&ca, 365);
+        (ca, cert)
+    }
+
+    fn create_device_chain(
+        ca: &DeviceKeypair,
+        root_cert: &Certificate,
+        device: &DeviceKeypair,
+    ) -> CertificateChain {
+        let cert = Certificate::issue(ca, device.device_id(), device.public_key(), 365);
+        CertificateChain::with_intermediates(cert, vec![root_cert.clone()])
+    }
 
     #[test]
     fn test_ephemeral_keypair_generation() {
@@ -243,49 +272,136 @@ mod tests {
 
     #[test]
     fn test_handshake_message_create_and_verify() {
+        let (ca, root_cert) = create_test_ca();
+        let validator = CertValidator::new(root_cert.clone());
+
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
         let alice_wg = derive_wireguard_keypair(&alice_device);
+        let alice_chain = create_device_chain(&ca, &root_cert, &alice_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_id = bob_device.device_id();
 
-        let message =
-            HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id, alice_wg.public);
+        let message = HandshakeMessage::create(
+            &alice_device,
+            &alice_ephemeral,
+            &bob_id,
+            alice_wg.public,
+            &alice_chain,
+        );
 
-        assert!(message.verify(&alice_device.public_key(), &bob_id).is_ok());
+        assert!(message
+            .verify(&alice_device.public_key(), &bob_id, &validator)
+            .is_ok());
     }
 
     #[test]
     fn test_handshake_message_fails_wrong_peer() {
+        let (ca, root_cert) = create_test_ca();
+        let validator = CertValidator::new(root_cert.clone());
+
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
         let charlie_device = DeviceKeypair::generate();
         let alice_wg = derive_wireguard_keypair(&alice_device);
+        let alice_chain = create_device_chain(&ca, &root_cert, &alice_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_id = bob_device.device_id();
         let charlie_id = charlie_device.device_id();
 
-        let message =
-            HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id, alice_wg.public);
+        let message = HandshakeMessage::create(
+            &alice_device,
+            &alice_ephemeral,
+            &bob_id,
+            alice_wg.public,
+            &alice_chain,
+        );
 
-        assert!(message.verify(&alice_device.public_key(), &charlie_id).is_err());
+        assert!(message
+            .verify(&alice_device.public_key(), &charlie_id, &validator)
+            .is_err());
     }
 
     #[test]
     fn test_handshake_message_fails_wrong_signer() {
+        let (ca, root_cert) = create_test_ca();
+        let validator = CertValidator::new(root_cert.clone());
+
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
         let alice_wg = derive_wireguard_keypair(&alice_device);
+        let alice_chain = create_device_chain(&ca, &root_cert, &alice_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_id = bob_device.device_id();
 
-        let message =
-            HandshakeMessage::create(&alice_device, &alice_ephemeral, &bob_id, alice_wg.public);
+        let message = HandshakeMessage::create(
+            &alice_device,
+            &alice_ephemeral,
+            &bob_id,
+            alice_wg.public,
+            &alice_chain,
+        );
 
-        assert!(message.verify(&bob_device.public_key(), &bob_id).is_err());
+        assert!(message
+            .verify(&bob_device.public_key(), &bob_id, &validator)
+            .is_err());
+    }
+
+    #[test]
+    fn test_handshake_rejects_untrusted_cert() {
+        let (_ca, root_cert) = create_test_ca();
+        let validator = CertValidator::new(root_cert.clone());
+
+        let untrusted_ca = DeviceKeypair::generate();
+        let untrusted_root = Certificate::new_self_signed(&untrusted_ca, 365);
+
+        let alice_device = DeviceKeypair::generate();
+        let bob_device = DeviceKeypair::generate();
+        let alice_wg = derive_wireguard_keypair(&alice_device);
+        let alice_chain = create_device_chain(&untrusted_ca, &untrusted_root, &alice_device);
+
+        let alice_ephemeral = EphemeralKeypair::generate();
+        let bob_id = bob_device.device_id();
+
+        let message = HandshakeMessage::create(
+            &alice_device,
+            &alice_ephemeral,
+            &bob_id,
+            alice_wg.public,
+            &alice_chain,
+        );
+
+        let result = message.verify(&alice_device.public_key(), &bob_id, &validator);
+        assert!(matches!(result, Err(HandshakeError::CertificateInvalid(_))));
+    }
+
+    #[test]
+    fn test_handshake_rejects_device_id_mismatch() {
+        let (ca, root_cert) = create_test_ca();
+        let validator = CertValidator::new(root_cert.clone());
+
+        let alice_device = DeviceKeypair::generate();
+        let bob_device = DeviceKeypair::generate();
+        let charlie_device = DeviceKeypair::generate();
+        let alice_wg = derive_wireguard_keypair(&alice_device);
+        let charlie_chain = create_device_chain(&ca, &root_cert, &charlie_device);
+
+        let alice_ephemeral = EphemeralKeypair::generate();
+        let bob_id = bob_device.device_id();
+
+        let message = HandshakeMessage::create(
+            &alice_device,
+            &alice_ephemeral,
+            &bob_id,
+            alice_wg.public,
+            &charlie_chain,
+        );
+
+        let result = message.verify(&alice_device.public_key(), &bob_id, &validator);
+        assert!(matches!(result, Err(HandshakeError::CertificateInvalid(_))));
     }
 
     #[test]
@@ -332,12 +448,16 @@ mod tests {
 
     #[test]
     fn test_handshake_serialization() {
+        let (ca, root_cert) = create_test_ca();
+
         let device = DeviceKeypair::generate();
         let ephemeral = EphemeralKeypair::generate();
         let peer_id = DeviceKeypair::generate().device_id();
         let wg_keys = derive_wireguard_keypair(&device);
+        let chain = create_device_chain(&ca, &root_cert, &device);
 
-        let message = HandshakeMessage::create(&device, &ephemeral, &peer_id, wg_keys.public);
+        let message =
+            HandshakeMessage::create(&device, &ephemeral, &peer_id, wg_keys.public, &chain);
 
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: HandshakeMessage = serde_json::from_str(&json).unwrap();
@@ -350,10 +470,15 @@ mod tests {
 
     #[test]
     fn test_full_handshake_flow() {
+        let (ca, root_cert) = create_test_ca();
+        let validator = CertValidator::new(root_cert.clone());
+
         let alice_device = DeviceKeypair::generate();
         let bob_device = DeviceKeypair::generate();
         let alice_wg = derive_wireguard_keypair(&alice_device);
         let bob_wg = derive_wireguard_keypair(&bob_device);
+        let alice_chain = create_device_chain(&ca, &root_cert, &alice_device);
+        let bob_chain = create_device_chain(&ca, &root_cert, &bob_device);
 
         let alice_ephemeral = EphemeralKeypair::generate();
         let bob_ephemeral = EphemeralKeypair::generate();
@@ -363,25 +488,25 @@ mod tests {
             &alice_ephemeral,
             &bob_device.device_id(),
             alice_wg.public,
+            &alice_chain,
         );
         let bob_msg = HandshakeMessage::create(
             &bob_device,
             &bob_ephemeral,
             &alice_device.device_id(),
             bob_wg.public,
+            &bob_chain,
         );
 
-        assert!(alice_msg.verify(&alice_device.public_key(), &bob_device.device_id()).is_ok());
-        assert!(bob_msg.verify(&bob_device.public_key(), &alice_device.device_id()).is_ok());
+        assert!(alice_msg
+            .verify(&alice_device.public_key(), &bob_device.device_id(), &validator)
+            .is_ok());
+        assert!(bob_msg
+            .verify(&bob_device.public_key(), &alice_device.device_id(), &validator)
+            .is_ok());
 
-        let alice_keys = derive_session_keys(
-            &alice_ephemeral,
-            &bob_msg.ephemeral_public_key(),
-        );
-        let bob_keys = derive_session_keys(
-            &bob_ephemeral,
-            &alice_msg.ephemeral_public_key(),
-        );
+        let alice_keys = derive_session_keys(&alice_ephemeral, &bob_msg.ephemeral_public_key());
+        let bob_keys = derive_session_keys(&bob_ephemeral, &alice_msg.ephemeral_public_key());
 
         assert_eq!(*alice_keys.wireguard_psk, *bob_keys.wireguard_psk);
     }
