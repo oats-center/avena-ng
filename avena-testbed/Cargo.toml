@@ -1,0 +1,25 @@
+[package]
+name = "avena-testbed"
+version = "0.1.0"
+edition = "2021"
+description = "Test harness for simulating multi-node Avena overlay networks"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "avena-testbed"
+path = "src/bin/avena-testbed.rs"
+
+[dependencies]
+avena-overlay = { path = "../avena-overlay" }
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[lints]
+workspace = true

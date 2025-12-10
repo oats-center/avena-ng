@@ -1,0 +1,65 @@
+name = "star-gateway"
+description = "Star topology with central gateway and multiple leaf nodes"
+duration_secs = 60
+
+[[nodes]]
+id = "gateway"
+capabilities = ["relay", "gateway"]
+
+[[nodes]]
+id = "sensorA"
+capabilities = []
+
+[[nodes]]
+id = "sensorB"
+capabilities = []
+
+[[nodes]]
+id = "sensorC"
+capabilities = []
+
+[[links]]
+endpoints = ["gateway", "sensorA"]
+latency_ms = 5
+bandwidth_kbps = 100000
+loss_percent = 0.0
+
+[[links]]
+endpoints = ["gateway", "sensorB"]
+latency_ms = 10
+bandwidth_kbps = 50000
+loss_percent = 0.0
+
+[[links]]
+endpoints = ["gateway", "sensorC"]
+latency_ms = 20
+bandwidth_kbps = 25000
+loss_percent = 1.0
+
+[[assertions]]
+at_secs = 15.0
+condition = { type = "PeerCount", node = "gateway", count = 3 }
+
+[[assertions]]
+at_secs = 20.0
+condition = { type = "Ping", from = "sensorA", to = "sensorB", timeout_ms = 2000 }
+
+[[assertions]]
+at_secs = 25.0
+condition = { type = "Ping", from = "sensorA", to = "sensorC", timeout_ms = 3000 }
+
+[[events]]
+at_secs = 30.0
+action = { type = "DisconnectLink", link = "gateway-sensorC" }
+
+[[assertions]]
+at_secs = 35.0
+condition = { type = "PeerCount", node = "gateway", count = 2 }
+
+[[events]]
+at_secs = 40.0
+action = { type = "ConnectLink", link = "gateway-sensorC" }
+
+[[assertions]]
+at_secs = 50.0
+condition = { type = "PeerCount", node = "gateway", count = 3 }

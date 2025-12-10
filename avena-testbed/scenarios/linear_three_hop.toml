@@ -1,0 +1,39 @@
+name = "linear-three-hop"
+description = "Three nodes in a line (A-B-C) testing multi-hop routing"
+duration_secs = 45
+
+[[nodes]]
+id = "nodeA"
+capabilities = []
+
+[[nodes]]
+id = "nodeB"
+capabilities = ["relay"]
+
+[[nodes]]
+id = "nodeC"
+capabilities = []
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 100000
+loss_percent = 0.0
+
+[[links]]
+endpoints = ["nodeB", "nodeC"]
+latency_ms = 10
+bandwidth_kbps = 100000
+loss_percent = 0.0
+
+[[assertions]]
+at_secs = 10.0
+condition = { type = "NodesConnected", nodes = ["nodeA", "nodeB"] }
+
+[[assertions]]
+at_secs = 10.0
+condition = { type = "NodesConnected", nodes = ["nodeB", "nodeC"] }
+
+[[assertions]]
+at_secs = 20.0
+condition = { type = "Ping", from = "nodeA", to = "nodeC", timeout_ms = 2000 }

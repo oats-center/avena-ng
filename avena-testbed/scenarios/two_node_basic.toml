@@ -1,0 +1,26 @@
+name = "two-node-basic"
+description = "Simple two-node connectivity test"
+duration_secs = 30
+
+[[nodes]]
+id = "nodeA"
+capabilities = ["relay"]
+
+[[nodes]]
+id = "nodeB"
+capabilities = []
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 100000
+loss_percent = 0.0
+enabled = true
+
+[[assertions]]
+at_secs = 15.0
+condition = { type = "NodesConnected", nodes = ["nodeA", "nodeB"] }
+
+[[assertions]]
+at_secs = 20.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 1000 }

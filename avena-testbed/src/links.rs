@@ -1,0 +1,290 @@
+//! Link shaping using tc/netem.
+//!
+//! Manages link parameters (latency, bandwidth, loss) and enables/disables
+//! links by bringing veth interfaces up/down.
+
+use crate::scenario::LinkConfig;
+use crate::topology::TestTopology;
+use std::collections::HashMap;
+use thiserror::Error;
+use tokio::process::Command;
+
+#[derive(Error, Debug)]
+pub enum LinkError {
+    #[error("link not found: {0}")]
+    NotFound(String),
+
+    #[error("command failed: {cmd}: {message}")]
+    CommandFailed { cmd: String, message: String },
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkState {
+    pub link_id: String,
+    pub latency_ms: u32,
+    pub bandwidth_kbps: u32,
+    pub loss_percent: f32,
+    pub enabled: bool,
+    pub netns_a: String,
+    pub netns_b: String,
+    pub veth_a: String,
+    pub veth_b: String,
+}
+
+#[derive(Debug)]
+pub struct LinkManager {
+    links: HashMap<String, LinkState>,
+}
+
+impl LinkManager {
+    pub fn new() -> Self {
+        Self {
+            links: HashMap::new(),
+        }
+    }
+
+    pub fn initialize_from_topology(
+        &mut self,
+        topology: &TestTopology,
+        link_configs: &[LinkConfig],
+    ) {
+        for config in link_configs {
+            let link_id = format!("{}-{}", config.endpoints.0, config.endpoints.1);
+
+            if let Some(veth_pair) = topology.veth_pair(&link_id) {
+                let node_a = topology.node(&config.endpoints.0);
+                let node_b = topology.node(&config.endpoints.1);
+
+                if let (Some(a), Some(b)) = (node_a, node_b) {
+                    self.links.insert(
+                        link_id.clone(),
+                        LinkState {
+                            link_id,
+                            latency_ms: config.latency_ms,
+                            bandwidth_kbps: config.bandwidth_kbps,
+                            loss_percent: config.loss_percent,
+                            enabled: config.enabled,
+                            netns_a: a.netns.clone(),
+                            netns_b: b.netns.clone(),
+                            veth_a: veth_pair.veth_a.clone(),
+                            veth_b: veth_pair.veth_b.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn apply_initial_state(&self) -> Result<(), LinkError> {
+        for state in self.links.values() {
+            self.apply_netem(state).await?;
+            if !state.enabled {
+                self.set_link_enabled_internal(state, false).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn set_link_enabled(&mut self, link_id: &str, enabled: bool) -> Result<(), LinkError> {
+        let state = self
+            .links
+            .get(link_id)
+            .ok_or_else(|| LinkError::NotFound(link_id.to_string()))?
+            .clone();
+
+        self.set_link_enabled_internal(&state, enabled).await?;
+
+        if let Some(s) = self.links.get_mut(link_id) {
+            s.enabled = enabled;
+        }
+        Ok(())
+    }
+
+    pub async fn modify_link(
+        &mut self,
+        link_id: &str,
+        latency_ms: Option<u32>,
+        loss_percent: Option<f32>,
+    ) -> Result<(), LinkError> {
+        {
+            let state = self
+                .links
+                .get_mut(link_id)
+                .ok_or_else(|| LinkError::NotFound(link_id.to_string()))?;
+
+            if let Some(lat) = latency_ms {
+                state.latency_ms = lat;
+            }
+            if let Some(loss) = loss_percent {
+                state.loss_percent = loss;
+            }
+        }
+
+        let state = self.links.get(link_id).unwrap().clone();
+        self.update_netem(&state).await?;
+        Ok(())
+    }
+
+    pub fn link(&self, link_id: &str) -> Option<&LinkState> {
+        self.links.get(link_id)
+    }
+
+    pub fn link_id_from_ref(&self, link_ref: &str) -> Option<String> {
+        if self.links.contains_key(link_ref) {
+            return Some(link_ref.to_string());
+        }
+
+        let parts: Vec<&str> = link_ref.split('-').collect();
+        if parts.len() == 2 {
+            let reversed = format!("{}-{}", parts[1], parts[0]);
+            if self.links.contains_key(&reversed) {
+                return Some(reversed);
+            }
+        }
+
+        None
+    }
+
+    async fn apply_netem(&self, state: &LinkState) -> Result<(), LinkError> {
+        self.apply_netem_to_veth(&state.netns_a, &state.veth_a, state.latency_ms, state.loss_percent)
+            .await?;
+        self.apply_netem_to_veth(&state.netns_b, &state.veth_b, state.latency_ms, state.loss_percent)
+            .await?;
+        Ok(())
+    }
+
+    async fn apply_netem_to_veth(
+        &self,
+        netns: &str,
+        veth: &str,
+        latency_ms: u32,
+        loss_percent: f32,
+    ) -> Result<(), LinkError> {
+        let delay_arg = format!("{}ms", latency_ms);
+        let loss_arg = format!("{}%", loss_percent);
+
+        self.run_in_netns(
+            netns,
+            &[
+                "tc", "qdisc", "add", "dev", veth, "root", "netem", "delay", &delay_arg, "loss",
+                &loss_arg,
+            ],
+        )
+        .await
+    }
+
+    async fn update_netem(&self, state: &LinkState) -> Result<(), LinkError> {
+        self.update_netem_on_veth(&state.netns_a, &state.veth_a, state.latency_ms, state.loss_percent)
+            .await?;
+        self.update_netem_on_veth(&state.netns_b, &state.veth_b, state.latency_ms, state.loss_percent)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_netem_on_veth(
+        &self,
+        netns: &str,
+        veth: &str,
+        latency_ms: u32,
+        loss_percent: f32,
+    ) -> Result<(), LinkError> {
+        let delay_arg = format!("{}ms", latency_ms);
+        let loss_arg = format!("{}%", loss_percent);
+
+        self.run_in_netns(
+            netns,
+            &[
+                "tc", "qdisc", "change", "dev", veth, "root", "netem", "delay", &delay_arg, "loss",
+                &loss_arg,
+            ],
+        )
+        .await
+    }
+
+    async fn set_link_enabled_internal(
+        &self,
+        state: &LinkState,
+        enabled: bool,
+    ) -> Result<(), LinkError> {
+        let action = if enabled { "up" } else { "down" };
+
+        self.run_in_netns(
+            &state.netns_a,
+            &["ip", "link", "set", &state.veth_a, action],
+        )
+        .await?;
+        self.run_in_netns(
+            &state.netns_b,
+            &["ip", "link", "set", &state.veth_b, action],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn run_in_netns(&self, netns: &str, args: &[&str]) -> Result<(), LinkError> {
+        let mut cmd_args = vec!["netns", "exec", netns];
+        cmd_args.extend(args);
+
+        let output = Command::new("ip").args(&cmd_args).output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(LinkError::CommandFailed {
+                cmd: format!("ip {}", cmd_args.join(" ")),
+                message: stderr.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for LinkManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_link_manager_new() {
+        let manager = LinkManager::new();
+        assert!(manager.links.is_empty());
+    }
+
+    #[test]
+    fn test_link_id_from_ref() {
+        let mut manager = LinkManager::new();
+        manager.links.insert(
+            "nodeA-nodeB".to_string(),
+            LinkState {
+                link_id: "nodeA-nodeB".to_string(),
+                latency_ms: 10,
+                bandwidth_kbps: 1000,
+                loss_percent: 0.0,
+                enabled: true,
+                netns_a: "ns-a".to_string(),
+                netns_b: "ns-b".to_string(),
+                veth_a: "veth-a".to_string(),
+                veth_b: "veth-b".to_string(),
+            },
+        );
+
+        assert_eq!(
+            manager.link_id_from_ref("nodeA-nodeB"),
+            Some("nodeA-nodeB".to_string())
+        );
+        assert_eq!(
+            manager.link_id_from_ref("nodeB-nodeA"),
+            Some("nodeA-nodeB".to_string())
+        );
+        assert_eq!(manager.link_id_from_ref("unknown-link"), None);
+    }
+}

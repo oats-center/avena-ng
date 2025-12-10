@@ -1,0 +1,50 @@
+name = "mobile-relay-store-forward"
+description = "Tests DTN store-and-forward via mobile relay"
+duration_secs = 60
+
+[[nodes]]
+id = "gateway"
+capabilities = ["relay", "gateway"]
+
+[[nodes]]
+id = "sensor"
+capabilities = []
+
+[[nodes]]
+id = "tractor"
+capabilities = ["relay"]
+start_delay_secs = 5.0
+
+[[links]]
+endpoints = ["gateway", "tractor"]
+latency_ms = 10
+bandwidth_kbps = 100000
+loss_percent = 0.0
+enabled = false
+
+[[links]]
+endpoints = ["tractor", "sensor"]
+latency_ms = 5
+bandwidth_kbps = 50000
+loss_percent = 0.0
+enabled = false
+
+[[events]]
+at_secs = 10.0
+action = { type = "ConnectLink", link = "tractor-sensor" }
+
+[[events]]
+at_secs = 20.0
+action = { type = "DisconnectLink", link = "tractor-sensor" }
+
+[[events]]
+at_secs = 30.0
+action = { type = "ConnectLink", link = "gateway-tractor" }
+
+[[assertions]]
+at_secs = 15.0
+condition = { type = "NodesConnected", nodes = ["tractor", "sensor"] }
+
+[[assertions]]
+at_secs = 40.0
+condition = { type = "Ping", from = "gateway", to = "sensor", timeout_ms = 5000 }
