@@ -1,4 +1,6 @@
-use avena_overlay::{Certificate, CertificateChain, DeviceKeypair, NetworkConfig};
+use avena_overlay::{
+    create_self_signed_jwt, decode_jwt_unsafe, issue_jwt, DeviceKeypair, NetworkConfig,
+};
 use std::path::PathBuf;
 
 fn main() {
@@ -75,9 +77,9 @@ fn cmd_cert(args: &[String]) {
         Some("show") => cmd_cert_show(&args[1..]),
         _ => {
             eprintln!("Usage:");
-            eprintln!("  avena-keygen cert init-ca <keypair-file> <output-cert>");
-            eprintln!("  avena-keygen cert issue <issuer-key> <issuer-cert> <subject-key> <output-chain> [--days=N]");
-            eprintln!("  avena-keygen cert show <cert-or-chain-file>");
+            eprintln!("  avena-keygen cert init-ca <keypair-file> <output-jwt>");
+            eprintln!("  avena-keygen cert issue <issuer-key> <issuer-jwt> <subject-key> <output-cert> [--days=N]");
+            eprintln!("  avena-keygen cert show <jwt-file>");
             std::process::exit(1);
         }
     }
@@ -85,29 +87,28 @@ fn cmd_cert(args: &[String]) {
 
 fn cmd_cert_init_ca(args: &[String]) {
     if args.len() < 2 {
-        eprintln!("usage: avena-keygen cert init-ca <keypair-file> <output-cert>");
+        eprintln!("usage: avena-keygen cert init-ca <keypair-file> <output-jwt>");
         std::process::exit(1);
     }
 
     let keypair = load_keypair(&args[0]);
     let output = PathBuf::from(&args[1]);
 
-    let cert = Certificate::new_self_signed(&keypair, 3650);
-    let json = serde_json::to_string_pretty(&cert).expect("failed to serialize cert");
-    std::fs::write(&output, &json).expect("failed to write cert");
+    let jwt = create_self_signed_jwt(&keypair, 3650);
+    std::fs::write(&output, &jwt).expect("failed to write JWT");
 
-    eprintln!("Created root certificate: {}", output.display());
+    eprintln!("Created root certificate (JWT): {}", output.display());
     println!("device_id={}", keypair.device_id());
 }
 
 fn cmd_cert_issue(args: &[String]) {
     if args.len() < 4 {
-        eprintln!("usage: avena-keygen cert issue <issuer-key> <issuer-cert> <subject-key> <output-chain> [--days=N]");
+        eprintln!("usage: avena-keygen cert issue <issuer-key> <issuer-jwt> <subject-key> <output-cert> [--days=N]");
         std::process::exit(1);
     }
 
     let issuer_keypair = load_keypair(&args[0]);
-    let issuer_cert: Certificate = load_json(&args[1]);
+    let _issuer_jwt = load_jwt(&args[1]);
     let subject_keypair = load_keypair(&args[2]);
     let output = PathBuf::from(&args[3]);
 
@@ -117,58 +118,46 @@ fn cmd_cert_issue(args: &[String]) {
         .and_then(|d| d.parse().ok())
         .unwrap_or(365);
 
-    let subject_cert = Certificate::issue(
+    let subject_jwt = issue_jwt(
         &issuer_keypair,
         subject_keypair.device_id(),
         subject_keypair.public_key(),
         days,
     );
 
-    let chain = if issuer_cert.is_self_signed() {
-        CertificateChain::with_intermediates(subject_cert, vec![issuer_cert])
-    } else {
-        CertificateChain::new(subject_cert)
-    };
+    std::fs::write(&output, &subject_jwt).expect("failed to write cert");
 
-    let json = serde_json::to_string_pretty(&chain).expect("failed to serialize chain");
-    std::fs::write(&output, &json).expect("failed to write chain");
-
-    eprintln!("Issued certificate chain: {}", output.display());
+    eprintln!("Issued certificate: {}", output.display());
     println!("device_id={}", subject_keypair.device_id());
 }
 
 fn cmd_cert_show(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: avena-keygen cert show <cert-or-chain-file>");
+        eprintln!("usage: avena-keygen cert show <jwt-file>");
         std::process::exit(1);
     }
 
     let path = &args[0];
-    let bytes = std::fs::read(path).expect("failed to read file");
+    let content = std::fs::read_to_string(path).expect("failed to read file");
+    let trimmed = content.trim();
 
-    if let Ok(chain) = serde_json::from_slice::<CertificateChain>(&bytes) {
-        println!("Certificate Chain:");
-        println!("  Leaf:");
-        print_cert(&chain.leaf, "    ");
-        for (i, intermediate) in chain.intermediates.iter().enumerate() {
-            println!("  Intermediate {}:", i);
-            print_cert(intermediate, "    ");
-        }
-    } else if let Ok(cert) = serde_json::from_slice::<Certificate>(&bytes) {
-        println!("Certificate:");
-        print_cert(&cert, "  ");
-    } else {
-        eprintln!("Failed to parse as certificate or chain");
-        std::process::exit(1);
-    }
+    println!("Certificate (JWT):");
+    print_jwt(trimmed, "  ");
 }
 
-fn print_cert(cert: &Certificate, indent: &str) {
-    println!("{}device_id: {}", indent, cert.device_id);
-    println!("{}issuer_id: {}", indent, cert.issuer_id);
-    println!("{}not_before: {}", indent, cert.not_before);
-    println!("{}not_after: {}", indent, cert.not_after);
-    println!("{}self_signed: {}", indent, cert.is_self_signed());
+fn print_jwt(jwt: &str, indent: &str) {
+    match decode_jwt_unsafe(jwt) {
+        Ok(claims) => {
+            println!("{}sub (device_id): {}", indent, claims.sub);
+            println!("{}iss (issuer_id): {}", indent, claims.iss);
+            println!("{}iat: {}", indent, claims.not_before());
+            println!("{}exp: {}", indent, claims.not_after());
+            println!("{}self_signed: {}", indent, claims.is_self_signed());
+        }
+        Err(e) => {
+            println!("{}error decoding: {}", indent, e);
+        }
+    }
 }
 
 fn load_keypair(path: &str) -> DeviceKeypair {
@@ -182,9 +171,11 @@ fn load_keypair(path: &str) -> DeviceKeypair {
     DeviceKeypair::from_seed(&seed)
 }
 
-fn load_json<T: serde::de::DeserializeOwned>(path: &str) -> T {
-    let bytes = std::fs::read(path).expect("failed to read file");
-    serde_json::from_slice(&bytes).expect("failed to parse JSON")
+fn load_jwt(path: &str) -> String {
+    std::fs::read_to_string(path)
+        .expect("failed to read JWT file")
+        .trim()
+        .to_string()
 }
 
 fn print_usage() {
@@ -192,8 +183,8 @@ fn print_usage() {
     eprintln!("  avena-keygen generate [output-file]");
     eprintln!("  avena-keygen from-seed <64-char-hex>");
     eprintln!("  avena-keygen from-file <keypair-file>");
-    eprintln!("  avena-keygen cert init-ca <keypair-file> <output-cert>");
-    eprintln!("  avena-keygen cert issue <issuer-key> <issuer-cert> <subject-key> <output-chain> [--days=N]");
-    eprintln!("  avena-keygen cert show <cert-or-chain-file>");
+    eprintln!("  avena-keygen cert init-ca <keypair-file> <output-jwt>");
+    eprintln!("  avena-keygen cert issue <issuer-key> <issuer-jwt> <subject-key> <output-cert> [--days=N]");
+    eprintln!("  avena-keygen cert show <jwt-file>");
     std::process::exit(1);
 }

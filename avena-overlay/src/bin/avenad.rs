@@ -1,6 +1,6 @@
 use avena_overlay::{
-    derive_session_keys, derive_wireguard_keypair, AvenadConfig, CertValidator, CertificateChain,
-    DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent, DiscoveryService, EphemeralKeypair,
+    derive_session_keys, derive_wireguard_keypair, AvenadConfig, CertValidator, DeviceId,
+    DeviceKeypair, DiscoveredPeer, DiscoveryEvent, DiscoveryService, EphemeralKeypair,
     HandshakeMessage, KernelBackend, LocalAnnouncement, NetworkConfig, PeerConfig, PeerState,
     TunnelBackend, TunnelMode, UserspaceBackend,
 };
@@ -108,7 +108,7 @@ struct AvenadInner {
     handshake_semaphore: Arc<Semaphore>,
     outgoing_semaphore: Arc<Semaphore>,
     cert_validator: CertValidator,
-    device_chain: CertificateChain,
+    device_cert: String,
 }
 
 struct Avenad {
@@ -125,8 +125,8 @@ impl Avenad {
         let device_id = keypair.device_id();
         info!(device_id = %device_id, "Initialized device identity");
 
-        let (cert_validator, device_chain) = config.load_crypto().map_err(AvenadError::CertConfig)?;
-        info!("Loaded certificate chain");
+        let (cert_validator, device_cert) = config.load_crypto().map_err(AvenadError::CertConfig)?;
+        info!("Loaded device certificate");
 
         let wg_keys = derive_wireguard_keypair(&keypair);
 
@@ -174,7 +174,7 @@ impl Avenad {
             handshake_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
             outgoing_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTGOING_HANDSHAKES)),
             cert_validator,
-            device_chain,
+            device_cert,
         });
 
         Ok(Self {
@@ -372,7 +372,7 @@ impl AvenadInner {
             &local_ephemeral,
             &peer.device_id,
             self.wg_public,
-            &self.device_chain,
+            &self.device_cert,
         );
 
         stream.write_all(HANDSHAKE_MAGIC).await?;
@@ -491,7 +491,7 @@ impl AvenadInner {
             &local_ephemeral,
             &peer_device_id,
             self.wg_public,
-            &self.device_chain,
+            &self.device_cert,
         );
 
         stream.write_all(HANDSHAKE_MAGIC).await?;

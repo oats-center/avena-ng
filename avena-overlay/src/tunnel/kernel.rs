@@ -9,6 +9,7 @@ use crate::wg::{self, Host, Key, Peer as WgPeer};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Mutex;
+use tokio::task::block_in_place;
 
 #[derive(Debug)]
 pub struct KernelBackend {
@@ -47,85 +48,97 @@ impl Default for KernelBackend {
 #[async_trait]
 impl TunnelBackend for KernelBackend {
     async fn ensure_interface(&self, name: &str) -> Result<(), TunnelError> {
-        let mut wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let mut name_guard = self
-            .interface_name
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+        let name = name.to_string();
+        block_in_place(|| {
+            let mut wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let mut name_guard = self
+                .interface_name
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
 
-        if wg_guard.is_some() {
-            if name_guard.as_deref() == Some(name) {
-                return Ok(());
+            if wg_guard.is_some() {
+                if name_guard.as_deref() == Some(&name) {
+                    return Ok(());
+                }
+                return Err(TunnelError::InterfaceCreation(
+                    "interface already exists with different name".into(),
+                ));
             }
-            return Err(TunnelError::InterfaceCreation(
-                "interface already exists with different name".into(),
-            ));
-        }
 
-        let backend = wg::KernelBackend::new();
-        backend.create_interface(name).map_err(|e| match e {
-            wg::WgError::PermissionDenied(msg) => TunnelError::PermissionDenied(msg),
-            wg::WgError::InterfaceCreation(msg) => TunnelError::InterfaceCreation(msg),
-            other => TunnelError::InterfaceCreation(other.to_string()),
-        })?;
+            let backend = wg::KernelBackend::new();
+            backend.create_interface(&name).map_err(|e| match e {
+                wg::WgError::PermissionDenied(msg) => TunnelError::PermissionDenied(msg),
+                wg::WgError::InterfaceCreation(msg) => TunnelError::InterfaceCreation(msg),
+                other => TunnelError::InterfaceCreation(other.to_string()),
+            })?;
 
-        *wg_guard = Some(backend);
-        *name_guard = Some(name.to_string());
-        Ok(())
+            *wg_guard = Some(backend);
+            *name_guard = Some(name);
+            Ok(())
+        })
     }
 
     async fn set_private_key(&self, private_key: &[u8; 32]) -> Result<(), TunnelError> {
-        self.require_wg()?;
-        let wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let wg = wg_guard.as_ref().unwrap();
+        let private_key = *private_key;
+        block_in_place(|| {
+            self.require_wg()?;
+            let wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let wg = wg_guard.as_ref().unwrap();
 
-        let current_host = wg.read_host()
-            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+            let current_host = wg.read_host()
+                .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
 
-        let mut host = Host::default();
-        host.private_key = Some(Key::new(*private_key));
-        host.listen_port = current_host.listen_port;
+            let mut host = Host::default();
+            host.private_key = Some(Key::new(private_key));
+            host.listen_port = current_host.listen_port;
 
-        wg.write_host(&host)
-            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+            wg.write_host(&host)
+                .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn add_peer(&self, config: &PeerConfig) -> Result<(), TunnelError> {
-        self.require_wg()?;
-        let wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let wg = wg_guard.as_ref().unwrap();
+        let config = config.clone();
+        block_in_place(|| {
+            self.require_wg()?;
+            let wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let wg = wg_guard.as_ref().unwrap();
 
-        let peer = peer_config_to_wg_peer(config);
-        wg.configure_peer(&peer)
-            .map_err(|e| TunnelError::PeerOperation(e.to_string()))?;
+            let peer = peer_config_to_wg_peer(&config);
+            wg.configure_peer(&peer)
+                .map_err(|e| TunnelError::PeerOperation(e.to_string()))?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn remove_peer(&self, pubkey: &[u8; 32]) -> Result<(), TunnelError> {
-        self.require_wg()?;
-        let wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let wg = wg_guard.as_ref().unwrap();
+        let pubkey = *pubkey;
+        block_in_place(|| {
+            self.require_wg()?;
+            let wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let wg = wg_guard.as_ref().unwrap();
 
-        let key = Key::new(*pubkey);
-        wg.remove_peer(&key)
-            .map_err(|e| TunnelError::PeerOperation(e.to_string()))?;
+            let key = Key::new(pubkey);
+            wg.remove_peer(&key)
+                .map_err(|e| TunnelError::PeerOperation(e.to_string()))?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn update_endpoint(
@@ -133,73 +146,83 @@ impl TunnelBackend for KernelBackend {
         pubkey: &[u8; 32],
         endpoint: SocketAddr,
     ) -> Result<(), TunnelError> {
-        self.require_wg()?;
-        let wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let wg = wg_guard.as_ref().unwrap();
+        let pubkey = *pubkey;
+        block_in_place(|| {
+            self.require_wg()?;
+            let wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let wg = wg_guard.as_ref().unwrap();
 
-        let key = Key::new(*pubkey);
-        let mut peer = WgPeer::new(key);
-        peer.endpoint = Some(endpoint);
+            let key = Key::new(pubkey);
+            let mut peer = WgPeer::new(key);
+            peer.endpoint = Some(endpoint);
 
-        wg.configure_peer(&peer)
-            .map_err(|e| TunnelError::PeerOperation(e.to_string()))?;
+            wg.configure_peer(&peer)
+                .map_err(|e| TunnelError::PeerOperation(e.to_string()))?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn peer_stats(&self, pubkey: &[u8; 32]) -> Result<PeerStats, TunnelError> {
-        self.require_wg()?;
-        let wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let wg = wg_guard.as_ref().unwrap();
+        let pubkey = *pubkey;
+        block_in_place(|| {
+            self.require_wg()?;
+            let wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let wg = wg_guard.as_ref().unwrap();
 
-        let key = Key::new(*pubkey);
-        let stats = wg.peer_stats(&key).map_err(|e| match e {
-            wg::WgError::PeerNotFound => TunnelError::PeerNotFound,
-            other => TunnelError::Wireguard(other.to_string()),
-        })?;
+            let key = Key::new(pubkey);
+            let stats = wg.peer_stats(&key).map_err(|e| match e {
+                wg::WgError::PeerNotFound => TunnelError::PeerNotFound,
+                other => TunnelError::Wireguard(other.to_string()),
+            })?;
 
-        Ok(PeerStats {
-            last_handshake: stats.last_handshake,
-            rx_bytes: stats.rx_bytes,
-            tx_bytes: stats.tx_bytes,
+            Ok(PeerStats {
+                last_handshake: stats.last_handshake,
+                rx_bytes: stats.rx_bytes,
+                tx_bytes: stats.tx_bytes,
+            })
         })
     }
 
     async fn listen_port(&self) -> Result<u16, TunnelError> {
-        self.require_wg()?;
-        let wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let wg = wg_guard.as_ref().unwrap();
+        block_in_place(|| {
+            self.require_wg()?;
+            let wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let wg = wg_guard.as_ref().unwrap();
 
-        wg.listen_port()
-            .map_err(|e| TunnelError::Wireguard(e.to_string()))
+            wg.listen_port()
+                .map_err(|e| TunnelError::Wireguard(e.to_string()))
+        })
     }
 
     async fn set_listen_port(&self, port: u16) -> Result<(), TunnelError> {
-        self.require_wg()?;
-        let wg_guard = self
-            .wg
-            .lock()
-            .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
-        let wg = wg_guard.as_ref().unwrap();
+        block_in_place(|| {
+            self.require_wg()?;
+            let wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let wg = wg_guard.as_ref().unwrap();
 
-        let current = wg
-            .read_host()
-            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
-        let mut host = Host::default();
-        host.listen_port = port;
-        host.private_key = current.private_key;
-        wg.write_host(&host)
-            .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
-        Ok(())
+            let current = wg
+                .read_host()
+                .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+            let mut host = Host::default();
+            host.listen_port = port;
+            host.private_key = current.private_key;
+            wg.write_host(&host)
+                .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+            Ok(())
+        })
     }
 }
 
@@ -227,7 +250,7 @@ mod tests {
         assert!(matches!(result, Err(TunnelError::InterfaceNotFound(_))));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn add_peer_fails_without_interface() {
         let backend = KernelBackend::new();
         let config = PeerConfig::new([1u8; 32]);
@@ -235,14 +258,14 @@ mod tests {
         assert!(matches!(result, Err(TunnelError::InterfaceNotFound(_))));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn remove_peer_fails_without_interface() {
         let backend = KernelBackend::new();
         let result = backend.remove_peer(&[1u8; 32]).await;
         assert!(matches!(result, Err(TunnelError::InterfaceNotFound(_))));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn update_endpoint_fails_without_interface() {
         let backend = KernelBackend::new();
         let endpoint: SocketAddr = "[::1]:51820".parse().unwrap();
@@ -250,14 +273,14 @@ mod tests {
         assert!(matches!(result, Err(TunnelError::InterfaceNotFound(_))));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn peer_stats_fails_without_interface() {
         let backend = KernelBackend::new();
         let result = backend.peer_stats(&[1u8; 32]).await;
         assert!(matches!(result, Err(TunnelError::InterfaceNotFound(_))));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn listen_port_fails_without_interface() {
         let backend = KernelBackend::new();
         let result = backend.listen_port().await;

@@ -3,5 +3,5 @@
 mod config;
 mod peer_state;
 
-pub use config::{AvenadConfig, ConfigError, TunnelMode};
+pub use config::{AvenadConfig, ConfigError, DiscoveryConfig, TunnelMode};
 pub use peer_state::PeerState;

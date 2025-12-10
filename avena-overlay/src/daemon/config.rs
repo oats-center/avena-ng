@@ -3,7 +3,7 @@
 //! Settings include network prefix, discovery backends, interface name, and
 //! backend selection (kernel vs userspace).
 
-use crate::crypto::{CertError, CertValidator, Certificate, CertificateChain};
+use crate::crypto::{CertError, CertValidator};
 use crate::discovery::StaticPeerConfig;
 use crate::NetworkConfig;
 use serde::{Deserialize, Serialize};
@@ -49,11 +49,11 @@ pub struct AvenadConfig {
     /// Optional path to persist the device keypair seed.
     pub keypair_path: Option<PathBuf>,
 
-    /// Path to trusted root certificate (JSON format).
+    /// Path to trusted root certificate (JWT file, single token).
     pub trusted_root_cert: PathBuf,
 
-    /// Path to device certificate chain (JSON format).
-    pub device_cert_chain: PathBuf,
+    /// Path to device certificate (JWT file, single token).
+    pub device_cert: PathBuf,
 
     #[serde(default)]
     /// Peer discovery configuration (mDNS/static peers).
@@ -113,7 +113,7 @@ impl Default for AvenadConfig {
             listen_address: None,
             keypair_path: None,
             trusted_root_cert: PathBuf::from("/etc/avena/root.cert"),
-            device_cert_chain: PathBuf::from("/etc/avena/device.chain"),
+            device_cert: PathBuf::from("/etc/avena/device.cert"),
             discovery: DiscoveryConfig::default(),
             persistent_keepalive: default_keepalive(),
             dead_peer_timeout_secs: default_dead_peer_timeout(),
@@ -127,21 +127,23 @@ impl AvenadConfig {
         toml::from_str(&contents).map_err(ConfigError::Parse)
     }
 
-    pub fn load_crypto(&self) -> Result<(CertValidator, CertificateChain), ConfigError> {
-        let root_bytes = std::fs::read(&self.trusted_root_cert).map_err(ConfigError::Io)?;
-        let root_cert: Certificate =
-            serde_json::from_slice(&root_bytes).map_err(ConfigError::Json)?;
+    pub fn load_crypto(&self) -> Result<(CertValidator, String), ConfigError> {
+        let root_jwt = std::fs::read_to_string(&self.trusted_root_cert)
+            .map_err(ConfigError::Io)?
+            .trim()
+            .to_string();
 
-        let chain_bytes = std::fs::read(&self.device_cert_chain).map_err(ConfigError::Io)?;
-        let device_chain: CertificateChain =
-            serde_json::from_slice(&chain_bytes).map_err(ConfigError::Json)?;
+        let device_cert = std::fs::read_to_string(&self.device_cert)
+            .map_err(ConfigError::Io)?
+            .trim()
+            .to_string();
 
-        let validator = CertValidator::new(root_cert);
+        let validator = CertValidator::new(&root_jwt).map_err(ConfigError::Cert)?;
         validator
-            .validate_chain(&device_chain)
+            .validate_cert(&device_cert)
             .map_err(ConfigError::Cert)?;
 
-        Ok((validator, device_chain))
+        Ok((validator, device_cert))
     }
 
     pub fn to_discovery_config(&self) -> crate::discovery::DiscoveryConfig {
@@ -188,10 +190,7 @@ mod tests {
             config.trusted_root_cert,
             PathBuf::from("/etc/avena/root.cert")
         );
-        assert_eq!(
-            config.device_cert_chain,
-            PathBuf::from("/etc/avena/device.chain")
-        );
+        assert_eq!(config.device_cert, PathBuf::from("/etc/avena/device.cert"));
     }
 
     #[test]
@@ -199,7 +198,7 @@ mod tests {
         let toml = r#"
             interface_name = "wg-avena"
             trusted_root_cert = "/tmp/root.cert"
-            device_cert_chain = "/tmp/device.chain"
+            device_cert = "/tmp/device.cert"
         "#;
         let config: AvenadConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.interface_name, "wg-avena");
@@ -213,7 +212,7 @@ mod tests {
             tunnel_mode = "userspace"
             listen_port = 51821
             trusted_root_cert = "/etc/avena/root.cert"
-            device_cert_chain = "/etc/avena/device.chain"
+            device_cert = "/etc/avena/device.cert"
 
             [network]
             prefix = "fd00:1234:5678::"

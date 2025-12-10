@@ -19,9 +19,9 @@ pub mod wg;
 
 pub use address::{NetworkConfig, NetworkConfigError};
 pub use crypto::{
-    derive_session_keys, derive_wireguard_keypair, wireguard_pubkey, CertError, Certificate,
-    CertificateChain, CertValidator, EphemeralKeypair, HandshakeError, HandshakeMessage,
-    SessionKeys, WireguardKeypair,
+    create_self_signed_jwt, decode_jwt_unsafe, derive_session_keys, derive_wireguard_keypair,
+    issue_jwt, wireguard_pubkey, CertClaims, CertError, CertValidator, EphemeralKeypair,
+    HandshakeError, HandshakeMessage, SessionKeys, WireguardKeypair,
 };
 pub use discovery::{
     Capability, DiscoveredPeer, DiscoveryConfig, DiscoveryError, DiscoveryEvent,
@@ -30,4 +30,4 @@ pub use discovery::{
 };
 pub use identity::{derive_workload_keypair, DecodeError, DeviceId, DeviceKeypair};
 pub use tunnel::{KernelBackend, PeerConfig, PeerStats, TunnelBackend, TunnelError, UserspaceBackend};
-pub use daemon::{AvenadConfig, ConfigError, PeerState, TunnelMode};
+pub use daemon::{AvenadConfig, ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, PeerState, TunnelMode};

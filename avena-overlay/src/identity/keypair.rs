@@ -1,4 +1,5 @@
 use crate::identity::device_id::DeviceId;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
@@ -44,6 +45,13 @@ impl DeviceKeypair {
         Self::from_seed(bytes)
     }
 
+    pub fn to_pkcs8_der(&self) -> Vec<u8> {
+        self.signing_key
+            .to_pkcs8_der()
+            .expect("PKCS#8 encoding should not fail")
+            .as_bytes()
+            .to_vec()
+    }
 }
 
 
