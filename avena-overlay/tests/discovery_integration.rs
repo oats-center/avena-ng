@@ -21,7 +21,7 @@ async fn static_peer_resolution() {
 
     let config = DiscoveryConfig {
         enable_mdns: false,
-        mdns_interface: None,
+        mdns_interfaces: Vec::new(),
         static_peers: vec![
             StaticPeerConfig::new("127.0.0.1:51820")
                 .with_device_id(device1)
@@ -52,7 +52,7 @@ async fn discovery_service_event_channel() {
 
     let config = DiscoveryConfig {
         enable_mdns: false,
-        mdns_interface: None,
+        mdns_interfaces: Vec::new(),
         static_peers: vec![],
     };
 
@@ -89,7 +89,7 @@ async fn discovery_service_event_channel() {
 async fn mdns_service_creation() {
     let config = DiscoveryConfig {
         enable_mdns: true,
-        mdns_interface: None,
+        mdns_interfaces: Vec::new(),
         static_peers: vec![],
     };
 
@@ -101,7 +101,7 @@ async fn mdns_service_creation() {
 async fn mdns_disabled_service() {
     let config = DiscoveryConfig {
         enable_mdns: false,
-        mdns_interface: None,
+        mdns_interfaces: Vec::new(),
         static_peers: vec![],
     };
 
@@ -116,13 +116,13 @@ async fn mdns_advertise_and_browse() {
 
     let config1 = DiscoveryConfig {
         enable_mdns: true,
-        mdns_interface: None,
+        mdns_interfaces: Vec::new(),
         static_peers: vec![],
     };
 
     let config2 = DiscoveryConfig {
         enable_mdns: true,
-        mdns_interface: None,
+        mdns_interfaces: Vec::new(),
         static_peers: vec![],
     };
 
@@ -142,6 +142,7 @@ async fn mdns_advertise_and_browse() {
         device_id: keypair1.device_id(),
         wg_endpoint: "192.168.1.100:51820".parse().unwrap(),
         capabilities: caps,
+        interface_suffix: None,
     };
 
     service1

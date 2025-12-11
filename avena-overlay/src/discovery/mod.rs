@@ -111,13 +111,14 @@ pub struct LocalAnnouncement {
     pub device_id: DeviceId,
     pub wg_endpoint: SocketAddr,
     pub capabilities: HashSet<Capability>,
+    pub interface_suffix: Option<u8>,
 }
 
 /// Runtime configuration for discovery backends.
 #[derive(Debug)]
 pub struct DiscoveryConfig {
     pub enable_mdns: bool,
-    pub mdns_interface: Option<String>,
+    pub mdns_interfaces: Vec<String>,
     pub static_peers: Vec<StaticPeerConfig>,
 }
 
@@ -125,7 +126,7 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             enable_mdns: true,
-            mdns_interface: None,
+            mdns_interfaces: Vec::new(),
             static_peers: Vec::new(),
         }
     }
@@ -145,7 +146,7 @@ impl DiscoveryService {
         let (tx, _) = broadcast::channel(64);
 
         let mdns = if config.enable_mdns {
-            Some(MdnsDiscovery::new(config.mdns_interface.as_deref())?)
+            Some(MdnsDiscovery::new(&config.mdns_interfaces)?)
         } else {
             None
         };

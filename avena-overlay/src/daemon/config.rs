@@ -75,12 +75,28 @@ pub struct DiscoveryConfig {
     /// Enable mDNS advertising/browsing when true.
     pub enable_mdns: bool,
 
-    /// Network interface to bind mDNS to (defaults to system pick).
+    /// Network interface to bind mDNS to (deprecated, use mdns_interfaces).
     pub mdns_interface: Option<String>,
+
+    #[serde(default)]
+    /// Network interfaces to bind mDNS to (empty = system default).
+    pub mdns_interfaces: Vec<String>,
 
     #[serde(default)]
     /// Statically configured peer endpoints.
     pub static_peers: Vec<StaticPeerConfig>,
+}
+
+impl DiscoveryConfig {
+    pub fn effective_mdns_interfaces(&self) -> Vec<String> {
+        if !self.mdns_interfaces.is_empty() {
+            self.mdns_interfaces.clone()
+        } else if let Some(ref iface) = self.mdns_interface {
+            vec![iface.clone()]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 fn default_interface_name() -> String {
@@ -149,7 +165,7 @@ impl AvenadConfig {
     pub fn to_discovery_config(&self) -> crate::discovery::DiscoveryConfig {
         crate::discovery::DiscoveryConfig {
             enable_mdns: self.discovery.enable_mdns,
-            mdns_interface: self.discovery.mdns_interface.clone(),
+            mdns_interfaces: self.discovery.effective_mdns_interfaces(),
             static_peers: self.discovery.static_peers.clone(),
         }
     }

@@ -299,22 +299,36 @@ impl Avenad {
 impl AvenadInner {
     async fn announce_presence(&self) -> Result<(), AvenadError> {
         let wg_port = self.tunnel.listen_port().await.unwrap_or(self.config.listen_port);
+        let interfaces = self.config.discovery.effective_mdns_interfaces();
 
-        let ip = if let Some(ref iface) = self.config.discovery.mdns_interface {
-            get_interface_ip(iface).unwrap_or_else(|| {
-                warn!(interface = %iface, "Could not get IP for interface, using unspecified");
-                IpAddr::from([0u8; 4])
-            })
+        if interfaces.is_empty() {
+            let announcement = LocalAnnouncement {
+                device_id: self.keypair.device_id(),
+                wg_endpoint: SocketAddr::new(IpAddr::from([0u8; 4]), wg_port),
+                capabilities: std::collections::HashSet::new(),
+                interface_suffix: None,
+            };
+            self.discovery.announce(&announcement).await?;
         } else {
-            IpAddr::from([0u8; 4])
-        };
+            for (idx, iface) in interfaces.iter().enumerate() {
+                let ip = match get_interface_ip(iface) {
+                    Some(ip) => ip,
+                    None => {
+                        warn!(interface = %iface, "Could not get IP for interface, skipping");
+                        continue;
+                    }
+                };
 
-        let announcement = LocalAnnouncement {
-            device_id: self.keypair.device_id(),
-            wg_endpoint: SocketAddr::new(ip, wg_port),
-            capabilities: std::collections::HashSet::new(),
-        };
-        self.discovery.announce(&announcement).await?;
+                let announcement = LocalAnnouncement {
+                    device_id: self.keypair.device_id(),
+                    wg_endpoint: SocketAddr::new(ip, wg_port),
+                    capabilities: std::collections::HashSet::new(),
+                    interface_suffix: Some(idx as u8),
+                };
+                info!(interface = %iface, endpoint = %announcement.wg_endpoint, "Announcing on interface");
+                self.discovery.announce(&announcement).await?;
+            }
+        }
         Ok(())
     }
 

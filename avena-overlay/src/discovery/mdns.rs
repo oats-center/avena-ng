@@ -24,22 +24,30 @@ pub struct MdnsDiscovery {
 }
 
 impl MdnsDiscovery {
-    pub fn new(interface: Option<&str>) -> Result<Self, DiscoveryError> {
+    pub fn new(interfaces: &[String]) -> Result<Self, DiscoveryError> {
         let daemon = ServiceDaemon::new()
             .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
 
-        if let Some(if_name) = interface {
+        for if_name in interfaces {
             daemon
                 .enable_interface(if_name)
                 .map_err(|e| DiscoveryError::Mdns(format!("failed to bind to interface {}: {}", if_name, e)))?;
-            debug!(interface = if_name, "mDNS bound to specific interface");
+            debug!(interface = if_name, "mDNS bound to interface");
+        }
+
+        if interfaces.is_empty() {
+            debug!("mDNS using system default interfaces");
         }
 
         Ok(Self { daemon })
     }
 
     pub async fn advertise(&self, announcement: &LocalAnnouncement) -> Result<(), DiscoveryError> {
-        let instance_name = announcement.device_id.to_base32();
+        let base_name = announcement.device_id.to_base32();
+        let instance_name = match announcement.interface_suffix {
+            Some(suffix) => format!("{}-{}", base_name, suffix),
+            None => base_name.clone(),
+        };
         let hostname = format!("{}.local.", instance_name);
 
         let mut properties = vec![
@@ -75,6 +83,7 @@ impl MdnsDiscovery {
         debug!(
             device_id = %announcement.device_id,
             endpoint = %announcement.wg_endpoint,
+            instance_name = %instance_name,
             "mDNS service registered"
         );
 
