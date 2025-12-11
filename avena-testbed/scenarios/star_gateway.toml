@@ -1,6 +1,6 @@
-name = "star-gateway"
-description = "Star topology with central gateway and multiple leaf nodes"
-duration_secs = 60
+name = "star-gateway-hybrid"
+description = "Hybrid topology: gateway with sensors on shared WiFi (bridge) + separate link to tractor"
+duration_secs = 45
 
 [[nodes]]
 id = "gateway"
@@ -18,48 +18,68 @@ capabilities = []
 id = "sensorC"
 capabilities = []
 
-[[links]]
-endpoints = ["gateway", "sensorA"]
+[[nodes]]
+id = "tractor"
+capabilities = []
+
+# Sensors and gateway share a WiFi network (bridge = shared broadcast domain)
+# On a bridge, all 4 nodes can discover each other directly
+[[bridges]]
+id = "farm-wifi"
+nodes = ["gateway", "sensorA", "sensorB", "sensorC"]
 latency_ms = 5
 bandwidth_kbps = 100000
 loss_percent = 0.0
 
+# Tractor has separate point-to-point link to gateway (different interface)
 [[links]]
-endpoints = ["gateway", "sensorB"]
-latency_ms = 10
-bandwidth_kbps = 50000
-loss_percent = 0.0
+endpoints = ["gateway", "tractor"]
+latency_ms = 50
+bandwidth_kbps = 10000
+loss_percent = 2.0
 
-[[links]]
-endpoints = ["gateway", "sensorC"]
-latency_ms = 20
-bandwidth_kbps = 25000
-loss_percent = 1.0
-
+# Gateway should see all 4 peers (3 sensors via bridge + tractor via link)
 [[assertions]]
 at_secs = 15.0
-condition = { type = "PeerCount", node = "gateway", count = 3 }
+condition = { type = "PeerCount", node = "gateway", count = 4 }
 
+# Sensors on bridge see gateway + 2 other sensors = 3 peers each
+[[assertions]]
+at_secs = 16.0
+condition = { type = "PeerCount", node = "sensorA", count = 3 }
+
+# Tractor on point-to-point link sees only gateway
+[[assertions]]
+at_secs = 17.0
+condition = { type = "PeerCount", node = "tractor", count = 1 }
+
+# Direct pings from gateway to each node
 [[assertions]]
 at_secs = 20.0
-condition = { type = "Ping", from = "sensorA", to = "sensorB", timeout_ms = 2000 }
+condition = { type = "Ping", from = "gateway", to = "sensorA", timeout_ms = 2000 }
 
 [[assertions]]
-at_secs = 25.0
-condition = { type = "Ping", from = "sensorA", to = "sensorC", timeout_ms = 3000 }
+at_secs = 22.0
+condition = { type = "Ping", from = "gateway", to = "sensorB", timeout_ms = 2000 }
 
-[[events]]
+[[assertions]]
+at_secs = 24.0
+condition = { type = "Ping", from = "gateway", to = "sensorC", timeout_ms = 2000 }
+
+[[assertions]]
+at_secs = 26.0
+condition = { type = "Ping", from = "gateway", to = "tractor", timeout_ms = 3000 }
+
+# Reverse pings to verify bidirectional connectivity
+[[assertions]]
 at_secs = 30.0
-action = { type = "DisconnectLink", link = "gateway-sensorC" }
+condition = { type = "Ping", from = "sensorA", to = "gateway", timeout_ms = 2000 }
 
+[[assertions]]
+at_secs = 32.0
+condition = { type = "Ping", from = "tractor", to = "gateway", timeout_ms = 3000 }
+
+# Sensor-to-sensor ping across bridge (direct, no routing needed)
 [[assertions]]
 at_secs = 35.0
-condition = { type = "PeerCount", node = "gateway", count = 2 }
-
-[[events]]
-at_secs = 40.0
-action = { type = "ConnectLink", link = "gateway-sensorC" }
-
-[[assertions]]
-at_secs = 50.0
-condition = { type = "PeerCount", node = "gateway", count = 3 }
+condition = { type = "Ping", from = "sensorA", to = "sensorB", timeout_ms = 2000 }

@@ -1,17 +1,14 @@
-//! Network namespace management for testbed nodes.
+//! Network namespace management for testbed nodes using unshare.
 //!
-//! Creates isolated network namespaces for each node, connects them with veth
-//! pairs, and manages avenad process lifecycle within each namespace.
+//! Uses unshare to create isolated network+mount namespaces for each node,
+//! connects them with veth pairs, and manages avenad process lifecycle.
 
 use crate::pki::{NodePaths, TestPki};
 use crate::scenario::{NodeConfig, Scenario};
-use avena_overlay::{
-    AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, StaticPeerConfig, TunnelMode,
-};
-use std::collections::{HashMap, HashSet};
+use avena_overlay::{AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, TunnelMode};
+use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
-use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::{Child, Command};
 
@@ -43,9 +40,16 @@ pub struct VethPair {
 }
 
 #[derive(Debug)]
+pub struct BridgeInstance {
+    pub id: String,
+    pub bridge_name: String,
+    pub veth_pairs: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
 pub struct NodeInstance {
     pub id: String,
-    pub netns: String,
+    pub pid: Option<u32>,
     pub overlay_ip: Ipv6Addr,
     pub config_path: PathBuf,
     pub avenad_process: Option<Child>,
@@ -55,7 +59,7 @@ pub struct NodeInstance {
 pub struct TestTopology {
     nodes: HashMap<String, NodeInstance>,
     veth_pairs: Vec<VethPair>,
-    namespace_prefix: String,
+    bridges: Vec<BridgeInstance>,
 }
 
 impl std::fmt::Debug for TestTopology {
@@ -63,18 +67,17 @@ impl std::fmt::Debug for TestTopology {
         f.debug_struct("TestTopology")
             .field("nodes", &self.nodes.keys().collect::<Vec<_>>())
             .field("veth_pairs", &self.veth_pairs)
-            .field("namespace_prefix", &self.namespace_prefix)
+            .field("bridges", &self.bridges)
             .finish()
     }
 }
 
 impl TestTopology {
     pub fn new() -> Self {
-        let id = std::process::id();
         Self {
             nodes: HashMap::new(),
             veth_pairs: Vec::new(),
-            namespace_prefix: format!("avena-test-{id}"),
+            bridges: Vec::new(),
         }
     }
 
@@ -83,9 +86,6 @@ impl TestTopology {
         let mut subnet_counter = 1u8;
 
         for node_config in &scenario.nodes {
-            let netns = format!("{}-{}", self.namespace_prefix, node_config.id);
-            self.create_namespace(&netns).await?;
-
             let keypair = pki
                 .node_keypair(&node_config.id)
                 .ok_or_else(|| TopologyError::NodeNotFound(node_config.id.clone()))?;
@@ -95,7 +95,7 @@ impl TestTopology {
                 node_config.id.clone(),
                 NodeInstance {
                     id: node_config.id.clone(),
-                    netns,
+                    pid: None,
                     overlay_ip,
                     config_path: PathBuf::new(),
                     avenad_process: None,
@@ -113,29 +113,8 @@ impl TestTopology {
 
             self.create_veth_pair(&veth_a, &veth_b).await?;
 
-            let netns_a = self
-                .nodes
-                .get(node_a)
-                .ok_or_else(|| TopologyError::NodeNotFound(node_a.clone()))?
-                .netns
-                .clone();
-            let netns_b = self
-                .nodes
-                .get(node_b)
-                .ok_or_else(|| TopologyError::NodeNotFound(node_b.clone()))?
-                .netns
-                .clone();
-
-            self.move_veth_to_namespace(&veth_a, &netns_a).await?;
-            self.move_veth_to_namespace(&veth_b, &netns_b).await?;
-
             let ip_a = std::net::Ipv4Addr::new(10, subnet_counter, 0, 1);
             let ip_b = std::net::Ipv4Addr::new(10, subnet_counter, 0, 2);
-
-            self.configure_veth_in_namespace(&netns_a, &veth_a, ip_a)
-                .await?;
-            self.configure_veth_in_namespace(&netns_b, &veth_b, ip_b)
-                .await?;
 
             if let Some(node) = self.nodes.get_mut(node_a) {
                 node.underlay_ips.push((veth_a.clone(), ip_a));
@@ -155,6 +134,49 @@ impl TestTopology {
             subnet_counter = subnet_counter.wrapping_add(1);
         }
 
+        for bridge_config in &scenario.bridges {
+            self.setup_bridge(bridge_config, &mut subnet_counter).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn setup_bridge(
+        &mut self,
+        config: &crate::scenario::BridgeConfig,
+        subnet_counter: &mut u8,
+    ) -> Result<(), TopologyError> {
+        let bridge_name = format!("br-{}", config.id);
+        let subnet = *subnet_counter;
+        *subnet_counter = subnet_counter.wrapping_add(1);
+
+        self.run_cmd("ip", &["link", "add", &bridge_name, "type", "bridge"]).await?;
+        self.run_cmd("ip", &["link", "set", &bridge_name, "up"]).await?;
+
+        let mut veth_pairs = Vec::new();
+
+        for (i, node_id) in config.nodes.iter().enumerate() {
+            let veth_br = format!("vb{}n{}", subnet, i);
+            let veth_ns = format!("vn{}b{}", subnet, i);
+
+            self.create_veth_pair(&veth_br, &veth_ns).await?;
+            self.run_cmd("ip", &["link", "set", &veth_br, "master", &bridge_name]).await?;
+            self.run_cmd("ip", &["link", "set", &veth_br, "up"]).await?;
+
+            let ip = std::net::Ipv4Addr::new(10, subnet, 0, (i + 1) as u8);
+            if let Some(node) = self.nodes.get_mut(node_id) {
+                node.underlay_ips.push((veth_ns.clone(), ip));
+            }
+
+            veth_pairs.push((veth_br, veth_ns));
+        }
+
+        self.bridges.push(BridgeInstance {
+            id: config.id.clone(),
+            bridge_name,
+            veth_pairs,
+        });
+
         Ok(())
     }
 
@@ -162,33 +184,52 @@ impl TestTopology {
         &mut self,
         pki: &TestPki,
         scenario: &Scenario,
+        log_dir: &std::path::Path,
     ) -> Result<(), TopologyError> {
         for node_config in &scenario.nodes {
             let node_paths = pki
                 .write_node_files(&node_config.id)
                 .map_err(|e| TopologyError::Io(std::io::Error::other(e.to_string())))?;
 
-            let (config, netns) = {
+            let config = {
                 let node = self
                     .nodes
                     .get(&node_config.id)
                     .ok_or_else(|| TopologyError::NodeNotFound(node_config.id.clone()))?;
-                let config =
-                    self.generate_node_config(node_config, &node_paths, node, scenario)?;
-                (config, node.netns.clone())
+                self.generate_node_config(node_config, &node_paths, node)?
             };
 
             let config_path = pki.temp_dir().join(format!("{}.toml", node_config.id));
             let config_str = toml::to_string_pretty(&config)?;
             std::fs::write(&config_path, &config_str)?;
 
-            let child = self.spawn_avenad_in_namespace(&netns, &config_path)?;
+            tracing::debug!(node = %node_config.id, config = %config_path.display(), "spawning avenad");
+
+            let veth_config: Vec<_> = {
+                let node = self.nodes.get(&node_config.id).unwrap();
+                node.underlay_ips
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (veth, ip))| (veth.clone(), *ip, (i + 1) as u8))
+                    .collect()
+            };
+
+            let (child, inner_pid) = self.spawn_node_in_namespace(
+                &node_config.id,
+                &config_path,
+                log_dir,
+                &veth_config,
+                pki.temp_dir(),
+            ).await?;
+
+            tracing::debug!(node = %node_config.id, pid = inner_pid, "avenad spawned");
 
             let node = self
                 .nodes
                 .get_mut(&node_config.id)
                 .ok_or_else(|| TopologyError::NodeNotFound(node_config.id.clone()))?;
             node.config_path = config_path;
+            node.pid = Some(inner_pid);
             node.avenad_process = Some(child);
         }
 
@@ -202,12 +243,20 @@ impl TestTopology {
             }
         }
 
-        for node in self.nodes.values() {
-            let _ = self.delete_namespace(&node.netns).await;
+        for veth in &self.veth_pairs {
+            let _ = self.run_cmd("ip", &["link", "del", &veth.veth_a]).await;
+        }
+
+        for bridge in &self.bridges {
+            for (veth_br, _) in &bridge.veth_pairs {
+                let _ = self.run_cmd("ip", &["link", "del", veth_br]).await;
+            }
+            let _ = self.run_cmd("ip", &["link", "del", &bridge.bridge_name]).await;
         }
 
         self.nodes.clear();
         self.veth_pairs.clear();
+        self.bridges.clear();
 
         Ok(())
     }
@@ -221,6 +270,7 @@ impl TestTopology {
         if let Some(ref mut process) = node.avenad_process {
             process.kill().await?;
             node.avenad_process = None;
+            node.pid = None;
         }
         Ok(())
     }
@@ -235,7 +285,7 @@ impl TestTopology {
             return Ok(());
         }
 
-        let _child = self.spawn_avenad_in_namespace(&node.netns, &node.config_path)?;
+        tracing::warn!(node = %node_id, "start_node after stop not fully implemented with unshare");
         Ok(())
     }
 
@@ -249,8 +299,15 @@ impl TestTopology {
             .get(node_id)
             .ok_or_else(|| TopologyError::NodeNotFound(node_id.to_string()))?;
 
-        let output = Command::new("ip")
-            .args(["netns", "exec", &node.netns])
+        let pid = node.pid.ok_or_else(|| {
+            TopologyError::CommandFailed {
+                cmd: cmd.join(" "),
+                message: "node has no running process".into(),
+            }
+        })?;
+
+        let output = Command::new("nsenter")
+            .args(["-t", &pid.to_string(), "-n", "-m"])
             .args(cmd)
             .output()
             .await?;
@@ -262,18 +319,33 @@ impl TestTopology {
         self.nodes.get(id)
     }
 
+    pub fn node_mut(&mut self, id: &str) -> Option<&mut NodeInstance> {
+        self.nodes.get_mut(id)
+    }
+
     pub fn veth_pair(&self, link_id: &str) -> Option<&VethPair> {
         self.veth_pairs.iter().find(|v| v.link_id == link_id)
+    }
+
+    pub fn bridge(&self, id: &str) -> Option<&BridgeInstance> {
+        self.bridges.iter().find(|b| b.id == id)
+    }
+
+    pub fn bridges(&self) -> &[BridgeInstance] {
+        &self.bridges
     }
 
     fn generate_node_config(
         &self,
         node_config: &NodeConfig,
         node_paths: &NodePaths,
-        _node: &NodeInstance,
-        scenario: &Scenario,
+        node: &NodeInstance,
     ) -> Result<AvenadConfig, TopologyError> {
-        let static_peers = self.build_static_peers(&node_config.id, scenario);
+        let mdns_interfaces: Vec<String> = node
+            .underlay_ips
+            .iter()
+            .map(|(veth, _)| veth.clone())
+            .collect();
 
         Ok(AvenadConfig {
             interface_name: format!("wg-{}", node_config.id),
@@ -285,108 +357,100 @@ impl TestTopology {
             trusted_root_cert: node_paths.root_cert_path.clone(),
             device_cert: node_paths.cert_path.clone(),
             discovery: DaemonDiscoveryConfig {
-                enable_mdns: false,
+                enable_mdns: true,
                 mdns_interface: None,
-                static_peers,
+                mdns_interfaces,
+                static_peers: Vec::new(),
             },
             persistent_keepalive: 5,
             dead_peer_timeout_secs: 30,
         })
     }
 
-    fn build_static_peers(&self, node_id: &str, scenario: &Scenario) -> Vec<StaticPeerConfig> {
-        let mut peers = Vec::new();
-
-        for link in &scenario.links {
-            let (a, b) = &link.endpoints;
-            let peer_id = if a == node_id {
-                b
-            } else if b == node_id {
-                a
-            } else {
-                continue;
-            };
-
-            if let Some(peer_node) = self.nodes.get(peer_id) {
-                for (_, ip) in &peer_node.underlay_ips {
-                    peers.push(StaticPeerConfig {
-                        device_id: None,
-                        endpoint: format!("{}:51820", ip),
-                        capabilities: HashSet::new(),
-                    });
-                }
-            }
-        }
-
-        peers
-    }
-
-    async fn create_namespace(&self, name: &str) -> Result<(), TopologyError> {
-        self.run_cmd("ip", &["netns", "add", name]).await?;
-        self.run_cmd("ip", &["netns", "exec", name, "ip", "link", "set", "lo", "up"])
-            .await?;
-        Ok(())
-    }
-
-    async fn delete_namespace(&self, name: &str) -> Result<(), TopologyError> {
-        self.run_cmd("ip", &["netns", "del", name]).await
-    }
-
     async fn create_veth_pair(&self, veth_a: &str, veth_b: &str) -> Result<(), TopologyError> {
+        let _ = self.run_cmd("ip", &["link", "del", veth_a]).await;
         self.run_cmd(
             "ip",
-            &[
-                "link", "add", veth_a, "type", "veth", "peer", "name", veth_b,
-            ],
+            &["link", "add", veth_a, "type", "veth", "peer", "name", veth_b],
         )
         .await
     }
 
-    async fn move_veth_to_namespace(&self, veth: &str, netns: &str) -> Result<(), TopologyError> {
-        self.run_cmd("ip", &["link", "set", veth, "netns", netns])
-            .await
-    }
-
-    async fn configure_veth_in_namespace(
+    async fn spawn_node_in_namespace(
         &self,
-        netns: &str,
-        veth: &str,
-        ip: std::net::Ipv4Addr,
-    ) -> Result<(), TopologyError> {
-        let addr = format!("{}/24", ip);
-        self.run_cmd(
-            "ip",
-            &["netns", "exec", netns, "ip", "addr", "add", &addr, "dev", veth],
-        )
-        .await?;
-        self.run_cmd(
-            "ip",
-            &["netns", "exec", netns, "ip", "link", "set", veth, "up"],
-        )
-        .await?;
-        Ok(())
-    }
-
-    fn spawn_avenad_in_namespace(
-        &self,
-        netns: &str,
+        node_id: &str,
         config_path: &PathBuf,
-    ) -> Result<Child, TopologyError> {
+        log_dir: &std::path::Path,
+        veth_config: &[(String, std::net::Ipv4Addr, u8)],
+        temp_dir: &std::path::Path,
+    ) -> Result<(Child, u32), TopologyError> {
         let avenad_path = std::env::current_exe()?
             .parent()
             .expect("exe should have parent")
             .join("avenad");
 
-        let child = Command::new("ip")
-            .args(["netns", "exec", netns])
-            .arg(&avenad_path)
-            .arg("-c")
-            .arg(config_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let stdout_path = log_dir.join(format!("{}.stdout.log", node_id));
+        let stderr_path = log_dir.join(format!("{}.stderr.log", node_id));
+
+        let stdout_file = std::fs::File::create(&stdout_path)?;
+        let stderr_file = std::fs::File::create(&stderr_path)?;
+
+        let pid_file = temp_dir.join(format!("{}.pid", node_id));
+        let ready_file = temp_dir.join(format!("{}.ready", node_id));
+
+        let mut setup_script = String::from("set -e\n");
+        setup_script.push_str(&format!("echo $$ > {}\n", pid_file.display()));
+        setup_script.push_str(&format!("while [ ! -f {} ]; do sleep 0.05; done\n", ready_file.display()));
+        setup_script.push_str("mount -t tmpfs tmpfs /var/run\n");
+        setup_script.push_str("mkdir -p /var/run/wireguard\n");
+        setup_script.push_str("ip link set lo up\n");
+
+        for (veth, ip, ipv6_suffix) in veth_config {
+            setup_script.push_str(&format!(
+                "ip addr add {}/24 dev {}\n\
+                 ip -6 addr add fe80::{}/64 dev {}\n\
+                 ip link set {} up\n\
+                 ip link set {} multicast on\n",
+                ip, veth, ipv6_suffix, veth, veth, veth
+            ));
+        }
+
+        setup_script.push_str(&format!("exec {} {}\n", avenad_path.display(), config_path.display()));
+
+        tracing::debug!(node = %node_id, stdout = %stdout_path.display(), stderr = %stderr_path.display(), "avenad logs");
+
+        let child = Command::new("unshare")
+            .args(["--kill-child", "-rmn", "bash", "-c", &setup_script])
+            .stdout(stdout_file)
+            .stderr(stderr_file)
             .spawn()?;
 
-        Ok(child)
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let inner_pid = std::fs::read_to_string(&pid_file)
+            .map_err(|e| TopologyError::Io(e))?
+            .trim()
+            .to_string();
+
+        for (veth, _, _) in veth_config {
+            self.run_cmd("ip", &["link", "set", veth, "netns", &inner_pid]).await?;
+        }
+
+        std::fs::write(&ready_file, "ready")?;
+
+        let inner_pid_u32: u32 = inner_pid.parse().map_err(|_| {
+            TopologyError::CommandFailed {
+                cmd: "parse pid".into(),
+                message: format!("invalid pid: {}", inner_pid),
+            }
+        })?;
+
+        Ok((child, inner_pid_u32))
     }
 
     async fn run_cmd(&self, cmd: &str, args: &[&str]) -> Result<(), TopologyError> {
@@ -419,6 +483,5 @@ mod tests {
         let topo = TestTopology::new();
         assert!(topo.nodes.is_empty());
         assert!(topo.veth_pairs.is_empty());
-        assert!(topo.namespace_prefix.starts_with("avena-test-"));
     }
 }

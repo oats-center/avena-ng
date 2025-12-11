@@ -4,9 +4,11 @@
 //! assertions at specified times during scenario execution.
 
 use crate::links::{LinkError, LinkManager};
-use crate::metrics::MetricsLogger;
-use crate::scenario::{AssertCondition, Assertion, Event, EventAction};
+use crate::metrics::{LogParser, MetricsLogger, AvenadEventType};
+use crate::scenario::{AssertCondition, Assertion, Event, EventAction, RequiredEventType};
 use crate::topology::{TestTopology, TopologyError};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -39,10 +41,65 @@ pub struct TestResult {
     pub duration_secs: f64,
 }
 
+#[derive(Debug, Default)]
+struct EventTracker {
+    connection_counts: HashMap<String, usize>,
+    log_positions: HashMap<String, u64>,
+}
+
+impl EventTracker {
+    fn update_from_logs(&mut self, node_ids: &[String], log_dir: &PathBuf) {
+        let mut parser = LogParser::new();
+
+        for node_id in node_ids {
+            let log_path = log_dir.join(format!("{}.stdout.log", node_id));
+            let pos = self.log_positions.entry(node_id.clone()).or_insert(0);
+
+            let content = match std::fs::read_to_string(&log_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let new_content = if (*pos as usize) < content.len() {
+                &content[*pos as usize..]
+            } else {
+                continue;
+            };
+
+            *pos = content.len() as u64;
+
+            let events = parser.parse_log_content(node_id, new_content);
+            for event in events {
+                if matches!(event.event_type, AvenadEventType::PeerConnected { .. }) {
+                    *self.connection_counts.entry(node_id.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    fn check_requirements(&self, assertion: &Assertion) -> bool {
+        let required = assertion.condition.required_events();
+
+        for req in required {
+            let count = self.connection_counts.get(&req.node).copied().unwrap_or(0);
+            match req.event_type {
+                RequiredEventType::PeerConnected => {
+                    if count < req.count {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 pub struct EventExecutor {
     topology: Arc<Mutex<TestTopology>>,
     links: Arc<Mutex<LinkManager>>,
     metrics: Arc<MetricsLogger>,
+    log_dir: PathBuf,
+    node_ids: Vec<String>,
 }
 
 impl std::fmt::Debug for EventExecutor {
@@ -56,11 +113,15 @@ impl EventExecutor {
         topology: Arc<Mutex<TestTopology>>,
         links: Arc<Mutex<LinkManager>>,
         metrics: Arc<MetricsLogger>,
+        log_dir: PathBuf,
+        node_ids: Vec<String>,
     ) -> Self {
         Self {
             topology,
             links,
             metrics,
+            log_dir,
+            node_ids,
         }
     }
 
@@ -72,11 +133,15 @@ impl EventExecutor {
     ) -> Result<TestResult, EventError> {
         let start = Instant::now();
         let mut event_iter = events.iter().peekable();
-        let mut assert_iter = assertions.iter().peekable();
+
+        let mut pending_assertions: Vec<&Assertion> = assertions.iter().collect();
+        let mut ready_assertions: Vec<&Assertion> = Vec::new();
 
         let mut events_executed = 0;
         let mut assertions_run = 0;
         let mut assertions_passed = 0;
+
+        let mut tracker = EventTracker::default();
 
         loop {
             let elapsed = start.elapsed().as_secs_f64();
@@ -94,16 +159,34 @@ impl EventExecutor {
                 events_executed += 1;
             }
 
-            while assert_iter
-                .peek()
-                .is_some_and(|a| a.at_secs <= elapsed)
-            {
-                let assertion = assert_iter.next().unwrap();
+            tracker.update_from_logs(&self.node_ids, &self.log_dir);
+
+            let mut still_pending = Vec::new();
+            for assertion in pending_assertions.drain(..) {
+                if tracker.check_requirements(assertion) {
+                    ready_assertions.push(assertion);
+                } else if elapsed >= assertion.at_secs {
+                    ready_assertions.push(assertion);
+                } else {
+                    still_pending.push(assertion);
+                }
+            }
+            pending_assertions = still_pending;
+
+            ready_assertions.sort_by(|a, b| a.at_secs.partial_cmp(&b.at_secs).unwrap());
+
+            for assertion in ready_assertions.drain(..) {
                 assertions_run += 1;
                 match self.check_assertion(assertion).await {
                     Ok(()) => {
                         assertions_passed += 1;
                         self.metrics.log_assertion_result(assertion, true);
+                        tracing::debug!(
+                            condition = ?assertion.condition,
+                            elapsed_secs = elapsed,
+                            deadline_secs = assertion.at_secs,
+                            "assertion passed early"
+                        );
                     }
                     Err(e) => {
                         self.metrics.log_assertion_result(assertion, false);
@@ -112,14 +195,11 @@ impl EventExecutor {
                 }
             }
 
-            if event_iter.peek().is_none() && assert_iter.peek().is_none() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if start.elapsed().as_secs_f64() >= duration_secs as f64 {
-                    break;
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            if event_iter.peek().is_none() && pending_assertions.is_empty() {
+                break;
             }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         Ok(TestResult {
@@ -189,6 +269,23 @@ impl EventExecutor {
     async fn check_nodes_connected(&self, nodes: &[String], at_secs: f64) -> Result<(), EventError> {
         let topology = self.topology.lock().await;
 
+        if nodes.len() >= 2 {
+            let from = &nodes[0];
+            if let (Some(_from_node), Some(to_node)) = (topology.node(from), topology.node(&nodes[1])) {
+                if let Some((_, underlay_ip)) = to_node.underlay_ips.first() {
+                    let output = topology
+                        .exec_in_node(from, &["ping", "-c", "1", "-W", "1", &underlay_ip.to_string()])
+                        .await?;
+                    tracing::debug!(
+                        from = %from,
+                        to_underlay = %underlay_ip,
+                        success = output.status.success(),
+                        "underlay connectivity check"
+                    );
+                }
+            }
+        }
+
         for i in 0..nodes.len() {
             for j in (i + 1)..nodes.len() {
                 let from = &nodes[i];
@@ -199,11 +296,22 @@ impl EventExecutor {
                     .ok_or_else(|| TopologyError::NodeNotFound(to.clone()))?;
                 let overlay_ip = to_node.overlay_ip;
 
+                let ip_str = overlay_ip.to_string();
                 let output = topology
-                    .exec_in_node(from, &["ping", "-c", "1", "-W", "2", &overlay_ip.to_string()])
+                    .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", "2", &ip_str])
                     .await?;
 
                 if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    tracing::debug!(
+                        from = %from,
+                        to = %to,
+                        overlay_ip = %ip_str,
+                        stderr = %stderr,
+                        stdout = %stdout,
+                        "ping failed"
+                    );
                     return Err(EventError::AssertionFailed {
                         at_secs,
                         message: format!("nodes {from} and {to} are not connected"),
@@ -231,8 +339,9 @@ impl EventExecutor {
         let timeout_secs = (timeout_ms as f64 / 1000.0).ceil() as u32;
         let timeout_arg = timeout_secs.max(1).to_string();
 
+        let ip_str = overlay_ip.to_string();
         let output = topology
-            .exec_in_node(from, &["ping", "-c", "1", "-W", &timeout_arg, &overlay_ip.to_string()])
+            .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", &timeout_arg, &ip_str])
             .await?;
 
         if !output.status.success() {

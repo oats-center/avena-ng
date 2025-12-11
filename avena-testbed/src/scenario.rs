@@ -18,11 +18,30 @@ pub struct Scenario {
     pub description: Option<String>,
     pub duration_secs: u64,
     pub nodes: Vec<NodeConfig>,
+    #[serde(default)]
     pub links: Vec<LinkConfig>,
+    #[serde(default)]
+    pub bridges: Vec<BridgeConfig>,
     #[serde(default)]
     pub events: Vec<Event>,
     #[serde(default)]
     pub assertions: Vec<Assertion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BridgeConfig {
+    pub id: String,
+    pub nodes: Vec<String>,
+    #[serde(default)]
+    pub latency_ms: u32,
+    #[serde(default = "default_bridge_bandwidth")]
+    pub bandwidth_kbps: u32,
+    #[serde(default)]
+    pub loss_percent: f32,
+}
+
+fn default_bridge_bandwidth() -> u32 {
+    1_000_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +101,53 @@ pub enum AssertCondition {
     PeerCount { node: String, count: usize },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequiredEvent {
+    pub node: String,
+    pub event_type: RequiredEventType,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RequiredEventType {
+    PeerConnected,
+}
+
+impl AssertCondition {
+    pub fn required_events(&self) -> Vec<RequiredEvent> {
+        match self {
+            AssertCondition::PeerCount { node, count } => {
+                vec![RequiredEvent {
+                    node: node.clone(),
+                    event_type: RequiredEventType::PeerConnected,
+                    count: *count,
+                }]
+            }
+            AssertCondition::Ping { from, to, .. } => {
+                vec![
+                    RequiredEvent {
+                        node: from.clone(),
+                        event_type: RequiredEventType::PeerConnected,
+                        count: 1,
+                    },
+                    RequiredEvent {
+                        node: to.clone(),
+                        event_type: RequiredEventType::PeerConnected,
+                        count: 1,
+                    },
+                ]
+            }
+            AssertCondition::NodesConnected { nodes } => {
+                nodes.iter().map(|node| RequiredEvent {
+                    node: node.clone(),
+                    event_type: RequiredEventType::PeerConnected,
+                    count: 1,
+                }).collect()
+            }
+        }
+    }
+}
+
 impl Scenario {
     pub fn load(path: &Path) -> Result<Self, ScenarioError> {
         let content = std::fs::read_to_string(path)?;
@@ -117,6 +183,17 @@ impl Scenario {
                     "link references unknown node: {}",
                     link.endpoints.1
                 )));
+            }
+        }
+
+        for bridge in &self.bridges {
+            for node in &bridge.nodes {
+                if !node_ids.contains(node) {
+                    return Err(ScenarioError::Validation(format!(
+                        "bridge '{}' references unknown node: {}",
+                        bridge.id, node
+                    )));
+                }
             }
         }
 

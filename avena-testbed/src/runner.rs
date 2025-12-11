@@ -5,7 +5,7 @@
 
 use crate::events::{EventError, EventExecutor, TestResult};
 use crate::links::LinkManager;
-use crate::metrics::MetricsLogger;
+use crate::metrics::{LogParser, MetricsLogger};
 use crate::pki::TestPki;
 use crate::scenario::Scenario;
 use crate::topology::TestTopology;
@@ -73,33 +73,73 @@ impl TestRunner {
         scenario: &Scenario,
         output_path: &Path,
     ) -> Result<TestResult, RunnerError> {
+        tracing::debug!("creating metrics logger at {:?}", output_path);
         let metrics = Arc::new(MetricsLogger::new(output_path)?);
         metrics.log_scenario_started(&scenario.name);
 
+        tracing::debug!("generating PKI");
         let pki = TestPki::generate(&scenario.nodes)?;
 
+        tracing::debug!("setting up topology");
         let mut topology = TestTopology::new();
         topology.setup(scenario, &pki).await?;
 
+        let log_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
+        topology.start_nodes(&pki, scenario, log_dir).await?;
+
         let mut links = LinkManager::new();
-        links.initialize_from_topology(&topology, &scenario.links);
+        links.initialize_from_topology(&topology, &scenario.links, &scenario.bridges);
         links.apply_initial_state().await?;
 
-        topology.start_nodes(&pki, scenario).await?;
+        for node in &scenario.nodes {
+            let config_path = pki.temp_dir().join(format!("{}.toml", node.id));
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                tracing::debug!(node = %node.id, config = %content, "generated config");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         for node in &scenario.nodes {
-            if let Some(instance) = topology.node(&node.id) {
+            if let Some(instance) = topology.node_mut(&node.id) {
                 metrics.log_node_started(&node.id, &instance.overlay_ip);
+
+                if let Some(ref mut proc) = instance.avenad_process {
+                    match proc.try_wait() {
+                        Ok(Some(status)) => {
+                            let log_path = log_dir.join(format!("{}.stdout.log", node.id));
+                            tracing::error!(
+                                node = %node.id,
+                                status = ?status,
+                                log = %log_path.display(),
+                                "avenad exited prematurely - check log file"
+                            );
+                        }
+                        Ok(None) => {
+                            tracing::info!(
+                                node = %node.id,
+                                overlay_ip = %instance.overlay_ip,
+                                "node running"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(node = %node.id, error = %e, "failed to check process");
+                        }
+                    }
+                }
             }
         }
 
         let topology = Arc::new(Mutex::new(topology));
         let links = Arc::new(Mutex::new(links));
 
+        let node_ids: Vec<String> = scenario.nodes.iter().map(|n| n.id.clone()).collect();
         let executor = EventExecutor::new(
             Arc::clone(&topology),
             Arc::clone(&links),
             Arc::clone(&metrics),
+            log_dir.to_path_buf(),
+            node_ids,
         );
 
         let result = executor
@@ -113,6 +153,33 @@ impl TestRunner {
         }
 
         let result = result?;
+
+        let mut log_parser = LogParser::new();
+        let mut all_events = Vec::new();
+
+        for node in &scenario.nodes {
+            let log_path = log_dir.join(format!("{}.stdout.log", node.id));
+            let events = log_parser.parse_log_file(&node.id, &log_path);
+            all_events.extend(events);
+        }
+
+        all_events.sort_by_key(|e| e.timestamp);
+
+        if let Some(first_event) = all_events.first() {
+            let scenario_start = first_event.timestamp;
+            metrics.log_parsed_events(&all_events, scenario_start);
+
+            let aggregated_metrics = log_parser.compute_metrics(&all_events);
+            metrics.log_metrics_summary(&aggregated_metrics);
+
+            tracing::info!(
+                discoveries = aggregated_metrics.discovery_count,
+                connections = aggregated_metrics.connection_count,
+                avg_handshake_ms = ?aggregated_metrics.avg_handshake_ms(),
+                "avenad metrics"
+            );
+        }
+
         metrics.log_scenario_completed(result.passed, result.duration_secs);
         metrics.flush();
 
