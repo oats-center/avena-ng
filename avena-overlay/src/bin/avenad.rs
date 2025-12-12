@@ -3,6 +3,7 @@ use avena_overlay::{
     DeviceKeypair, DiscoveredPeer, DiscoveryEvent, DiscoveryService, EphemeralKeypair,
     HandshakeMessage, KernelBackend, LocalAnnouncement, NetworkConfig, PeerConfig, PeerState,
     TunnelBackend, TunnelMode, UserspaceBackend,
+    routing::BabeldController,
 };
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
@@ -109,6 +110,7 @@ struct AvenadInner {
     outgoing_semaphore: Arc<Semaphore>,
     cert_validator: CertValidator,
     device_cert: String,
+    routing: Mutex<Option<BabeldController>>,
 }
 
 struct Avenad {
@@ -161,6 +163,24 @@ impl Avenad {
         let handshake_listener = TcpListener::bind(listen_addr).await?;
         info!(addr = %listen_addr, "Handshake listener bound");
 
+        // Start babeld if enabled
+        let routing = if config.routing.enable_babel {
+            let mut controller = BabeldController::new(config.routing.babel.clone());
+            match controller.start(&[&config.interface_name]).await {
+                Ok(()) => {
+                    info!("Started babeld for dynamic routing");
+                    Some(controller)
+                }
+                Err(e) => {
+                    warn!("Failed to start babeld: {}. Dynamic routing disabled.", e);
+                    None
+                }
+            }
+        } else {
+            info!("Babel routing disabled in config");
+            None
+        };
+
         let inner = Arc::new(AvenadInner {
             config,
             keypair,
@@ -175,6 +195,7 @@ impl Avenad {
             outgoing_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTGOING_HANDSHAKES)),
             cert_validator,
             device_cert,
+            routing: Mutex::new(routing),
         });
 
         Ok(Self {
@@ -437,15 +458,25 @@ impl AvenadInner {
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer.device_id);
 
+        // Use ::/0 for multi-hop routing when babel is enabled, otherwise /128
+        let allowed_ips = if self.config.routing.enable_babel {
+            vec!["::/0".parse::<IpNet>().expect("::/0 is always valid")]
+        } else {
+            vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")]
+        };
+
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
-            .with_allowed_ips(vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")])
+            .with_allowed_ips(allowed_ips)
             .with_endpoint(peer.endpoint)
             .with_keepalive(self.config.persistent_keepalive);
 
         self.tunnel.add_peer(&peer_config).await?;
 
-        add_peer_route(&self.config.interface_name, peer_overlay_ip)?;
+        // When babel is enabled, it manages routes; otherwise add static route
+        if !self.config.routing.enable_babel {
+            add_peer_route(&self.config.interface_name, peer_overlay_ip)?;
+        }
 
         Ok(PeerState::new(peer.device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
             .with_endpoint(peer.endpoint))
@@ -530,15 +561,25 @@ impl AvenadInner {
                 SocketAddr::new(addr.ip(), addr.port() - 1)
             });
 
+        // Use ::/0 for multi-hop routing when babel is enabled, otherwise /128
+        let allowed_ips = if self.config.routing.enable_babel {
+            vec!["::/0".parse::<IpNet>().expect("::/0 is always valid")]
+        } else {
+            vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")]
+        };
+
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
-            .with_allowed_ips(vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")])
+            .with_allowed_ips(allowed_ips)
             .with_endpoint(peer_wg_endpoint)
             .with_keepalive(self.config.persistent_keepalive);
 
         self.tunnel.add_peer(&peer_config).await?;
 
-        add_peer_route(&self.config.interface_name, peer_overlay_ip)?;
+        // When babel is enabled, it manages routes; otherwise add static route
+        if !self.config.routing.enable_babel {
+            add_peer_route(&self.config.interface_name, peer_overlay_ip)?;
+        }
 
         Ok(PeerState::new(peer_device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
             .with_endpoint(peer_wg_endpoint))
@@ -587,6 +628,16 @@ impl AvenadInner {
 
     async fn shutdown(&self) {
         info!("Shutting down avenad...");
+
+        // Stop babeld first
+        let mut routing = self.routing.lock().await;
+        if let Some(ref mut controller) = *routing {
+            if let Err(e) = controller.stop().await {
+                warn!("Failed to stop babeld: {}", e);
+            }
+        }
+        *routing = None;
+
         let peers = self.peers.read().await;
         for (id, peer) in peers.iter() {
             if let Err(e) = self.tunnel.remove_peer(&peer.wg_pubkey).await {

@@ -8,6 +8,7 @@ use crate::links::LinkManager;
 use crate::metrics::{LogParser, MetricsLogger};
 use crate::pki::TestPki;
 use crate::scenario::Scenario;
+use crate::status::Status;
 use crate::topology::TestTopology;
 use std::path::Path;
 use std::sync::Arc;
@@ -73,17 +74,26 @@ impl TestRunner {
         scenario: &Scenario,
         output_path: &Path,
     ) -> Result<TestResult, RunnerError> {
+        let status = Status::new();
+
+        status.message(&format!("Running scenario: {}", scenario.name));
+
         tracing::debug!("creating metrics logger at {:?}", output_path);
         let metrics = Arc::new(MetricsLogger::new(output_path)?);
         metrics.log_scenario_started(&scenario.name);
 
+        let phase = status.phase("Generating PKI");
         tracing::debug!("generating PKI");
         let pki = TestPki::generate(&scenario.nodes)?;
+        phase.done();
 
+        let phase = status.phase("Setting up network topology");
         tracing::debug!("setting up topology");
         let mut topology = TestTopology::new();
         topology.setup(scenario, &pki).await?;
+        phase.done();
 
+        let phase = status.phase(&format!("Starting {} nodes", scenario.nodes.len()));
         let log_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
         topology.start_nodes(&pki, scenario, log_dir).await?;
 
@@ -100,6 +110,7 @@ impl TestRunner {
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+        let mut running_count = 0;
         for node in &scenario.nodes {
             if let Some(instance) = topology.node_mut(&node.id) {
                 metrics.log_node_started(&node.id, &instance.overlay_ip);
@@ -116,6 +127,7 @@ impl TestRunner {
                             );
                         }
                         Ok(None) => {
+                            running_count += 1;
                             tracing::info!(
                                 node = %node.id,
                                 overlay_ip = %instance.overlay_ip,
@@ -129,6 +141,7 @@ impl TestRunner {
                 }
             }
         }
+        phase.done_with(&format!("{running_count} running"));
 
         let topology = Arc::new(Mutex::new(topology));
         let links = Arc::new(Mutex::new(links));
@@ -142,14 +155,23 @@ impl TestRunner {
             node_ids,
         );
 
+        let phase = status.phase(&format!(
+            "Running timeline ({}s, {} events, {} assertions)",
+            scenario.duration_secs,
+            scenario.events.len(),
+            scenario.assertions.len()
+        ));
         let result = executor
             .run_timeline(&scenario.events, &scenario.assertions, scenario.duration_secs)
             .await;
+        phase.done();
 
         let mut topo = topology.lock().await;
 
         if !self.keep_namespaces {
+            let phase = status.phase("Cleaning up");
             topo.teardown().await?;
+            phase.done();
         }
 
         let result = result?;

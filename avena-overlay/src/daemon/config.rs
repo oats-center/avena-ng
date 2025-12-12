@@ -5,6 +5,7 @@
 
 use crate::crypto::{CertError, CertValidator};
 use crate::discovery::StaticPeerConfig;
+use crate::routing::BabeldConfig;
 use crate::NetworkConfig;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -66,6 +67,35 @@ pub struct AvenadConfig {
     #[serde(default = "default_dead_peer_timeout")]
     /// How long before an inactive peer is removed.
     pub dead_peer_timeout_secs: u64,
+
+    #[serde(default)]
+    /// Routing protocol configuration (babeld).
+    pub routing: RoutingConfig,
+}
+
+/// Routing protocol configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    #[serde(default = "default_routing_enabled")]
+    /// Enable babeld for dynamic mesh routing.
+    pub enable_babel: bool,
+
+    #[serde(default)]
+    /// Babeld-specific configuration.
+    pub babel: BabeldConfig,
+}
+
+fn default_routing_enabled() -> bool {
+    true
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            enable_babel: default_routing_enabled(),
+            babel: BabeldConfig::default(),
+        }
+    }
 }
 
 /// Discovery-specific configuration embedded in `AvenadConfig`.
@@ -133,6 +163,7 @@ impl Default for AvenadConfig {
             discovery: DiscoveryConfig::default(),
             persistent_keepalive: default_keepalive(),
             dead_peer_timeout_secs: default_dead_peer_timeout(),
+            routing: RoutingConfig::default(),
         }
     }
 }

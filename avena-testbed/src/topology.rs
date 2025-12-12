@@ -5,7 +5,7 @@
 
 use crate::pki::{NodePaths, TestPki};
 use crate::scenario::{NodeConfig, Scenario};
-use avena_overlay::{AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, TunnelMode};
+use avena_overlay::{AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, RoutingConfig, TunnelMode};
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
@@ -364,6 +364,7 @@ impl TestTopology {
             },
             persistent_keepalive: 5,
             dead_peer_timeout_secs: 30,
+            routing: RoutingConfig::default(),
         })
     }
 
@@ -403,6 +404,7 @@ impl TestTopology {
         setup_script.push_str(&format!("while [ ! -f {} ]; do sleep 0.05; done\n", ready_file.display()));
         setup_script.push_str("mount -t tmpfs tmpfs /var/run\n");
         setup_script.push_str("mkdir -p /var/run/wireguard\n");
+        setup_script.push_str("mkdir -p /run/avena\n");
         setup_script.push_str("ip link set lo up\n");
 
         for (veth, ip, ipv6_suffix) in veth_config {

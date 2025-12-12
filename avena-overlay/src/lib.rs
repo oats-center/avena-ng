@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod daemon;
 pub mod discovery;
 pub mod identity;
+pub mod routing;
 pub mod tunnel;
 pub mod wg;
 
@@ -30,4 +31,4 @@ pub use discovery::{
 };
 pub use identity::{derive_workload_keypair, DecodeError, DeviceId, DeviceKeypair};
 pub use tunnel::{KernelBackend, PeerConfig, PeerStats, TunnelBackend, TunnelError, UserspaceBackend};
-pub use daemon::{AvenadConfig, ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, PeerState, TunnelMode};
+pub use daemon::{AvenadConfig, ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, PeerState, RoutingConfig, TunnelMode};

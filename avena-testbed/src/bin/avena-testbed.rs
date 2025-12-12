@@ -8,6 +8,10 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "avena-testbed")]
 #[command(about = "Avena overlay network test harness")]
 struct Cli {
+    /// Enable verbose output (shows tracing logs)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -60,7 +64,7 @@ fn is_in_user_namespace() -> bool {
         .unwrap_or(false)
 }
 
-fn reexec_in_namespace(scenario: &PathBuf, output: &PathBuf, keep_namespaces: bool) -> ExitCode {
+fn reexec_in_namespace(scenario: &PathBuf, output: &PathBuf, keep_namespaces: bool, verbose: bool) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -88,6 +92,9 @@ fn reexec_in_namespace(scenario: &PathBuf, output: &PathBuf, keep_namespaces: bo
     if keep_namespaces {
         cmd.arg("--keep-namespaces");
     }
+    if verbose {
+        cmd.arg("--verbose");
+    }
 
     for (key, value) in std::env::vars() {
         if key.starts_with("RUST_") {
@@ -112,11 +119,16 @@ fn reexec_in_namespace(scenario: &PathBuf, output: &PathBuf, keep_namespaces: bo
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    if cli.verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("avena=debug,avena_testbed=debug")),
+            )
+            .init();
+    }
 
     match cli.command {
         Commands::Run {
@@ -129,7 +141,7 @@ async fn main() -> ExitCode {
             // Root doesn't need user namespace - it already has permissions
             let is_root = unsafe { libc::geteuid() } == 0;
             if !in_namespace && !is_in_user_namespace() && !is_root {
-                return reexec_in_namespace(&scenario, &output, keep_namespaces);
+                return reexec_in_namespace(&scenario, &output, keep_namespaces, cli.verbose);
             }
 
             let runner = TestRunner::new().keep_namespaces(keep_namespaces);

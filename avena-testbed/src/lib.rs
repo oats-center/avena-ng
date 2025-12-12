@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod pki;
 pub mod runner;
 pub mod scenario;
+pub mod status;
 pub mod topology;
 
 pub use events::{EventError, EventExecutor, TestResult};
@@ -15,4 +16,5 @@ pub use scenario::{
     AssertCondition, Assertion, Event, EventAction, LinkConfig, NodeConfig, Scenario,
     ScenarioError,
 };
+pub use status::Status;
 pub use topology::{NodeInstance, TestTopology, TopologyError, VethPair};
