@@ -34,12 +34,12 @@ at_secs = 10.0
 action = { type = "ConnectLink", link = "tractor-sensor" }
 
 [[events]]
-at_secs = 20.0
-action = { type = "DisconnectLink", link = "tractor-sensor" }
-
-[[events]]
 at_secs = 30.0
 action = { type = "ConnectLink", link = "gateway-tractor" }
+
+[[events]]
+at_secs = 50.0
+action = { type = "DisconnectLink", link = "tractor-sensor" }
 
 [[assertions]]
 at_secs = 15.0
