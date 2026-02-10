@@ -5,7 +5,7 @@
 
 use crate::pki::{NodePaths, TestPki};
 use crate::scenario::{NodeConfig, Scenario};
-use avena_overlay::{AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, RoutingConfig, TunnelMode};
+use avena_overlay::{AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, RoutingConfig, StaticPeerConfig, TunnelMode};
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
@@ -196,7 +196,8 @@ impl TestTopology {
                     .nodes
                     .get(&node_config.id)
                     .ok_or_else(|| TopologyError::NodeNotFound(node_config.id.clone()))?;
-                self.generate_node_config(node_config, &node_paths, node)?
+                let static_peers = self.static_peers_for_node(&node_config.id, pki)?;
+                self.generate_node_config(node_config, &node_paths, node, static_peers)?
             };
 
             let config_path = pki.temp_dir().join(format!("{}.toml", node_config.id));
@@ -368,6 +369,7 @@ impl TestTopology {
         node_config: &NodeConfig,
         node_paths: &NodePaths,
         node: &NodeInstance,
+        static_peers: Vec<StaticPeerConfig>,
     ) -> Result<AvenadConfig, TopologyError> {
         let mdns_interfaces: Vec<String> = node
             .underlay_ips
@@ -388,12 +390,52 @@ impl TestTopology {
                 enable_mdns: true,
                 mdns_interface: None,
                 mdns_interfaces,
-                static_peers: Vec::new(),
+                static_peers,
             },
             persistent_keepalive: 5,
             dead_peer_timeout_secs: 30,
             routing: RoutingConfig::default(),
         })
+    }
+
+    fn static_peers_for_node(
+        &self,
+        node_id: &str,
+        pki: &TestPki,
+    ) -> Result<Vec<StaticPeerConfig>, TopologyError> {
+        let mut peers = Vec::new();
+
+        for link in &self.veth_pairs {
+            let (peer_node_id, peer_iface) = if link.node_a == node_id {
+                (&link.node_b, &link.veth_b)
+            } else if link.node_b == node_id {
+                (&link.node_a, &link.veth_a)
+            } else {
+                continue;
+            };
+
+            let peer_node = self
+                .nodes
+                .get(peer_node_id)
+                .ok_or_else(|| TopologyError::NodeNotFound(peer_node_id.clone()))?;
+            let peer_underlay_ip = peer_node
+                .underlay_ips
+                .iter()
+                .find(|(iface, _)| iface == peer_iface)
+                .map(|(_, ip)| *ip)
+                .ok_or_else(|| TopologyError::CommandFailed {
+                    cmd: format!("resolve static peer underlay for {}", peer_node_id),
+                    message: format!("missing underlay ip for interface {}", peer_iface),
+                })?;
+
+            let peer_keypair = pki
+                .node_keypair(peer_node_id)
+                .ok_or_else(|| TopologyError::NodeNotFound(peer_node_id.clone()))?;
+            let endpoint = format!("{}:{}", peer_underlay_ip, 51820u16);
+            peers.push(StaticPeerConfig::new(endpoint).with_device_id(peer_keypair.device_id()));
+        }
+
+        Ok(peers)
     }
 
     async fn create_veth_pair(&self, veth_a: &str, veth_b: &str) -> Result<(), TopologyError> {

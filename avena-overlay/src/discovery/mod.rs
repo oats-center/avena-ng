@@ -218,6 +218,14 @@ impl DiscoveryService {
             guard.insert(peer.device_id, peer.clone());
         }
     }
+
+    /// Snapshot of currently cached peers.
+    pub fn cached_peers(&self) -> Vec<DiscoveredPeer> {
+        self.discovered_peers
+            .read()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

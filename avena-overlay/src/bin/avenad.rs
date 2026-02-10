@@ -30,6 +30,8 @@ const MAX_HANDSHAKES_PER_IP: u32 = 5;
 const MAX_NONCE_CACHE_SIZE: usize = 10_000;
 const MAX_RATE_LIMITER_SIZE: usize = 10_000;
 const MAX_CONCURRENT_OUTGOING_HANDSHAKES: usize = 16;
+const PRESENCE_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
+const DISCOVERED_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 struct NonceCache {
     entries: Mutex<LruCache<(DeviceId, [u8; 32]), Instant>>,
@@ -213,6 +215,7 @@ impl Avenad {
 
         for peer in inner.discovery.resolve_static_peers().await {
             info!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Resolved static peer");
+            inner.discovery.cache_discovered_peer(&peer);
             let inner_clone = Arc::clone(&inner);
             tokio::spawn(async move {
                 if let Err(e) = inner_clone.handle_discovered_peer(peer).await {
@@ -225,6 +228,18 @@ impl Avenad {
 
         let mut dead_peer_interval = tokio::time::interval(Duration::from_secs(inner.config.dead_peer_timeout_secs));
         dead_peer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut overlay_route_interval = tokio::time::interval(Duration::from_secs(2));
+        overlay_route_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut reannounce_interval = tokio::time::interval(PRESENCE_REANNOUNCE_INTERVAL);
+        reannounce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reannounce_interval.tick().await;
+
+        let mut discovered_peer_retry_interval =
+            tokio::time::interval(DISCOVERED_PEER_RETRY_INTERVAL);
+        discovered_peer_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        discovered_peer_retry_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -284,11 +299,20 @@ impl Avenad {
                                     Ok(peer_state) => {
                                         let device_id = peer_state.device_id;
                                         let mut peers = inner_clone.peers.write().await;
+                                        let mut inserted = false;
                                         if let Entry::Vacant(entry) = peers.entry(device_id) {
                                             entry.insert(peer_state);
+                                            inserted = true;
                                             info!(peer_id = %device_id, "Peer connected via incoming handshake");
                                         } else {
                                             debug!(peer_id = %device_id, "Peer already connected, discarding duplicate handshake result");
+                                        }
+                                        drop(peers);
+
+                                        if inserted {
+                                            if let Err(e) = inner_clone.reconcile_peer_allowed_ips().await {
+                                                warn!(peer_id = %device_id, "Failed to reconcile peer allowed-ips after incoming handshake: {}", e);
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -304,6 +328,17 @@ impl Avenad {
                 }
                 _ = dead_peer_interval.tick() => {
                     inner.check_dead_peers().await;
+                }
+                _ = overlay_route_interval.tick() => {
+                    inner.maintain_overlay_prefix_route().await;
+                }
+                _ = reannounce_interval.tick() => {
+                    if let Err(e) = inner.announce_presence().await {
+                        warn!("failed to re-announce presence: {}", e);
+                    }
+                }
+                _ = discovered_peer_retry_interval.tick() => {
+                    inner.retry_discovered_peers().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutdown signal received");
@@ -374,11 +409,18 @@ impl AvenadInner {
         let peer_state = self.perform_outgoing_handshake(handshake_addr, &peer).await?;
 
         let mut peers = self.peers.write().await;
+        let mut inserted = false;
         if let Entry::Vacant(entry) = peers.entry(peer.device_id) {
             entry.insert(peer_state);
+            inserted = true;
             info!(peer_id = %peer.device_id, "Peer connected");
         } else {
             debug!(peer_id = %peer.device_id, "Peer already connected, discarding duplicate handshake result");
+        }
+        drop(peers);
+
+        if inserted {
+            self.reconcile_peer_allowed_ips().await?;
         }
 
         Ok(())
@@ -458,7 +500,7 @@ impl AvenadInner {
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer.device_id);
 
-        let allowed_ips = peer_allowed_ips(peer_overlay_ip, self.config.routing.enable_babel);
+        let allowed_ips = direct_peer_allowed_ips(peer_overlay_ip);
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
@@ -556,7 +598,7 @@ impl AvenadInner {
                 SocketAddr::new(addr.ip(), addr.port() - 1)
             });
 
-        let allowed_ips = peer_allowed_ips(peer_overlay_ip, self.config.routing.enable_babel);
+        let allowed_ips = direct_peer_allowed_ips(peer_overlay_ip);
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
@@ -580,6 +622,109 @@ impl AvenadInner {
         if let Some(peer) = peers.remove(device_id) {
             if let Err(e) = self.tunnel.remove_peer(&peer.wg_pubkey).await {
                 warn!(peer_id = %device_id, "Failed to remove peer from tunnel: {}", e);
+            }
+        }
+        drop(peers);
+
+        if let Err(e) = self.reconcile_peer_allowed_ips().await {
+            warn!(peer_id = %device_id, "Failed to reconcile peer allowed-ips after peer removal: {}", e);
+        }
+    }
+
+    async fn reconcile_peer_allowed_ips(&self) -> Result<(), AvenadError> {
+        if !self.config.routing.enable_babel {
+            return Ok(());
+        }
+
+        let (peer_count, peers) = {
+            let peers = self.peers.read().await;
+            let peer_count = peers.len();
+            let snapshot = peers
+                .values()
+                .map(|peer| (peer.device_id, peer.wg_pubkey, peer.overlay_ip, peer.endpoint))
+                .collect::<Vec<_>>();
+            (peer_count, snapshot)
+        };
+
+        info!(peer_count, "Reconciling peer allowed-ips");
+
+        if peer_count == 1 {
+            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network) {
+                if e.kind() != std::io::ErrorKind::Unsupported {
+                    return Err(e.into());
+                }
+            } else {
+                info!(
+                    interface = %self.config.interface_name,
+                    prefix = %format!("{}/{}", self.network.prefix, self.network.prefix_len),
+                    "Ensured overlay prefix route"
+                );
+            }
+        }
+
+        for (device_id, wg_pubkey, overlay_ip, endpoint) in peers {
+            let allowed_ips = peer_allowed_ips(
+                overlay_ip,
+                self.config.routing.enable_babel,
+                peer_count,
+                &self.network,
+            );
+
+            let mut peer_config = PeerConfig::new(wg_pubkey)
+                .with_allowed_ips(allowed_ips)
+                .with_keepalive(self.config.persistent_keepalive);
+            if let Some(endpoint) = endpoint {
+                peer_config = peer_config.with_endpoint(endpoint);
+            }
+
+            self.tunnel.add_peer(&peer_config).await?;
+            debug!(
+                peer_id = %device_id,
+                peer_count,
+                "reconciled peer allowed-ips for babel routing"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn maintain_overlay_prefix_route(&self) {
+        if !self.config.routing.enable_babel {
+            return;
+        }
+
+        let peer_count = self.peers.read().await.len();
+        if peer_count == 1 {
+            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network) {
+                if e.kind() != std::io::ErrorKind::Unsupported {
+                    warn!(
+                        interface = %self.config.interface_name,
+                        "failed to maintain overlay prefix route: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    async fn retry_discovered_peers(&self) {
+        let cached_peers = self.discovery.cached_peers();
+        if cached_peers.is_empty() {
+            return;
+        }
+
+        for peer in cached_peers {
+            if peer.device_id == self.keypair.device_id() {
+                continue;
+            }
+
+            let already_connected = self.peers.read().await.contains_key(&peer.device_id);
+            if already_connected {
+                continue;
+            }
+
+            if let Err(e) = self.handle_discovered_peer(peer.clone()).await {
+                debug!(peer_id = %peer.device_id, "retrying discovered peer failed: {}", e);
             }
         }
     }
@@ -764,12 +909,50 @@ fn ensure_direct_peer_route(
     }
 }
 
-fn peer_allowed_ips(peer_overlay_ip: std::net::Ipv6Addr, babel_enabled: bool) -> Vec<IpNet> {
-    if babel_enabled {
-        // Keep peer-specific routes for now. Broad ::/0 allowed-ips breaks underlay reachability
-        // in userspace mode; route-aware expansion is tracked separately.
-    }
+#[cfg(target_os = "linux")]
+fn ensure_overlay_prefix_route(
+    interface_name: &str,
+    network: &NetworkConfig,
+) -> Result<(), std::io::Error> {
+    use avena_overlay::wg::linux::netlink;
+
+    netlink::add_ipv6_route(interface_name, network.prefix, network.prefix_len).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("add overlay prefix route: {e}"))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_overlay_prefix_route(
+    _interface_name: &str,
+    _network: &NetworkConfig,
+) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "requires Linux",
+    ))
+}
+
+fn direct_peer_allowed_ips(peer_overlay_ip: std::net::Ipv6Addr) -> Vec<IpNet> {
     vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")]
+}
+
+fn peer_allowed_ips(
+    peer_overlay_ip: std::net::Ipv6Addr,
+    babel_enabled: bool,
+    active_peer_count: usize,
+    network: &NetworkConfig,
+) -> Vec<IpNet> {
+    let mut allowed = direct_peer_allowed_ips(peer_overlay_ip);
+
+    if babel_enabled && active_peer_count <= 1 {
+        if let Ok(prefix) = IpNet::new(network.prefix.into(), network.prefix_len) {
+            if !allowed.contains(&prefix) {
+                allowed.push(prefix);
+            }
+        }
+    }
+
+    allowed
 }
 
 #[cfg(target_os = "linux")]
@@ -841,16 +1024,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peer_allowed_ips_are_host_routes_when_babel_enabled() {
+    fn peer_allowed_ips_include_overlay_prefix_when_babel_and_single_peer() {
         let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
-        let allowed_ips = peer_allowed_ips(overlay_ip, true);
-        assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
+        let network = NetworkConfig::default();
+        let allowed_ips = peer_allowed_ips(overlay_ip, true, 1, &network);
+
+        assert_eq!(allowed_ips.len(), 2);
+        assert!(allowed_ips.contains(&"fd00:a0e0:a000::1/128".parse().unwrap()));
+        assert!(allowed_ips.contains(&"fd00:a0e0:a000::/48".parse().unwrap()));
     }
 
     #[test]
     fn peer_allowed_ips_are_host_routes_when_babel_disabled() {
         let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
-        let allowed_ips = peer_allowed_ips(overlay_ip, false);
+        let network = NetworkConfig::default();
+        let allowed_ips = peer_allowed_ips(overlay_ip, false, 1, &network);
+        assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
+    }
+
+    #[test]
+    fn peer_allowed_ips_are_host_routes_when_babel_and_multiple_peers() {
+        let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
+        let network = NetworkConfig::default();
+        let allowed_ips = peer_allowed_ips(overlay_ip, true, 2, &network);
         assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
     }
 }
