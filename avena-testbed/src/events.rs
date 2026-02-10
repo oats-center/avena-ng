@@ -390,6 +390,35 @@ impl EventExecutor {
         .await?;
 
         if !connected {
+            let route_output = {
+                let topology = self.topology.lock().await;
+                topology.exec_in_node(from, &["ip", "-6", "route"]).await.ok()
+            };
+            if let Some(output) = route_output {
+                tracing::debug!(
+                    from = %from,
+                    route_stdout = %String::from_utf8_lossy(&output.stdout),
+                    route_stderr = %String::from_utf8_lossy(&output.stderr),
+                    "route table snapshot on ping failure"
+                );
+            }
+
+            let wg_output = {
+                let topology = self.topology.lock().await;
+                topology
+                    .exec_in_node(from, &["wg", "show", &format!("wg-{from}")])
+                    .await
+                    .ok()
+            };
+            if let Some(output) = wg_output {
+                tracing::debug!(
+                    from = %from,
+                    wg_stdout = %String::from_utf8_lossy(&output.stdout),
+                    wg_stderr = %String::from_utf8_lossy(&output.stderr),
+                    "wireguard snapshot on ping failure"
+                );
+            }
+
             return Err(EventError::AssertionFailed {
                 at_secs,
                 message: format!(
