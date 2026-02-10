@@ -5,8 +5,9 @@
 
 use crate::links::{LinkError, LinkManager};
 use crate::metrics::{LogParser, MetricsLogger, AvenadEventType};
-use crate::scenario::{AssertCondition, Assertion, Event, EventAction, RequiredEventType};
+use crate::scenario::{AssertCondition, Assertion, Event, EventAction};
 use crate::topology::{TestTopology, TopologyError};
+use std::future::Future;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +48,9 @@ struct EventTracker {
     log_positions: HashMap<String, u64>,
 }
 
+const ASSERTION_PING_ATTEMPTS: usize = 5;
+const ASSERTION_PING_RETRY_DELAY: Duration = Duration::from_millis(300);
+
 impl EventTracker {
     fn update_from_logs(&mut self, node_ids: &[String], log_dir: &PathBuf) {
         let mut parser = LogParser::new();
@@ -77,21 +81,6 @@ impl EventTracker {
         }
     }
 
-    fn check_requirements(&self, assertion: &Assertion) -> bool {
-        let required = assertion.condition.required_events();
-
-        for req in required {
-            let count = self.connection_counts.get(&req.node).copied().unwrap_or(0);
-            match req.event_type {
-                RequiredEventType::PeerConnected => {
-                    if count < req.count {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
 }
 
 pub struct EventExecutor {
@@ -163,9 +152,7 @@ impl EventExecutor {
 
             let mut still_pending = Vec::new();
             for assertion in pending_assertions.drain(..) {
-                if tracker.check_requirements(assertion) {
-                    ready_assertions.push(assertion);
-                } else if elapsed >= assertion.at_secs {
+                if should_run_assertion(assertion, elapsed, &tracker) {
                     ready_assertions.push(assertion);
                 } else {
                     still_pending.push(assertion);
@@ -185,7 +172,7 @@ impl EventExecutor {
                             condition = ?assertion.condition,
                             elapsed_secs = elapsed,
                             deadline_secs = assertion.at_secs,
-                            "assertion passed early"
+                            "assertion passed"
                         );
                     }
                     Err(e) => {
@@ -267,22 +254,29 @@ impl EventExecutor {
     }
 
     async fn check_nodes_connected(&self, nodes: &[String], at_secs: f64) -> Result<(), EventError> {
-        let topology = self.topology.lock().await;
-
         if nodes.len() >= 2 {
             let from = &nodes[0];
-            if let (Some(_from_node), Some(to_node)) = (topology.node(from), topology.node(&nodes[1])) {
-                if let Some((_, underlay_ip)) = to_node.underlay_ips.first() {
-                    let output = topology
-                        .exec_in_node(from, &["ping", "-c", "1", "-W", "1", &underlay_ip.to_string()])
-                        .await?;
-                    tracing::debug!(
-                        from = %from,
-                        to_underlay = %underlay_ip,
-                        success = output.status.success(),
-                        "underlay connectivity check"
-                    );
-                }
+            let underlay_ip = {
+                let topology = self.topology.lock().await;
+                topology
+                    .node(&nodes[1])
+                    .and_then(|to_node| to_node.underlay_ips.first().map(|(_, underlay_ip)| *underlay_ip))
+            };
+
+            if let Some(underlay_ip) = underlay_ip {
+                let underlay_ip_str = underlay_ip.to_string();
+                let output = {
+                    let topology = self.topology.lock().await;
+                    topology
+                        .exec_in_node(from, &["ping", "-c", "1", "-W", "1", &underlay_ip_str])
+                        .await?
+                };
+                tracing::debug!(
+                    from = %from,
+                    to_underlay = %underlay_ip,
+                    success = output.status.success(),
+                    "underlay connectivity check"
+                );
             }
         }
 
@@ -291,30 +285,52 @@ impl EventExecutor {
                 let from = &nodes[i];
                 let to = &nodes[j];
 
-                let to_node = topology
-                    .node(to)
-                    .ok_or_else(|| TopologyError::NodeNotFound(to.clone()))?;
-                let overlay_ip = to_node.overlay_ip;
+                let overlay_ip = {
+                    let topology = self.topology.lock().await;
+                    let to_node = topology
+                        .node(to)
+                        .ok_or_else(|| TopologyError::NodeNotFound(to.clone()))?;
+                    to_node.overlay_ip
+                };
 
                 let ip_str = overlay_ip.to_string();
-                let output = topology
-                    .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", "2", &ip_str])
-                    .await?;
+                let connected = retry_until_success::<_, _, EventError>(
+                    ASSERTION_PING_ATTEMPTS,
+                    ASSERTION_PING_RETRY_DELAY,
+                    |attempt| {
+                        let ip_str = ip_str.clone();
+                        async move {
+                            let output = {
+                                let topology = self.topology.lock().await;
+                                topology
+                                    .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", "2", &ip_str])
+                                    .await?
+                            };
 
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    tracing::debug!(
-                        from = %from,
-                        to = %to,
-                        overlay_ip = %ip_str,
-                        stderr = %stderr,
-                        stdout = %stdout,
-                        "ping failed"
-                    );
+                            if !output.status.success() {
+                                tracing::debug!(
+                                    from = %from,
+                                    to = %to,
+                                    overlay_ip = %ip_str,
+                                    attempt = attempt + 1,
+                                    stderr = %String::from_utf8_lossy(&output.stderr),
+                                    stdout = %String::from_utf8_lossy(&output.stdout),
+                                    "ping probe failed"
+                                );
+                            }
+
+                            Ok(output.status.success())
+                        }
+                    },
+                )
+                .await?;
+
+                if !connected {
                     return Err(EventError::AssertionFailed {
                         at_secs,
-                        message: format!("nodes {from} and {to} are not connected"),
+                        message: format!(
+                            "nodes {from} and {to} are not connected after {ASSERTION_PING_ATTEMPTS} probes"
+                        ),
                     });
                 }
             }
@@ -329,25 +345,56 @@ impl EventExecutor {
         timeout_ms: u32,
         at_secs: f64,
     ) -> Result<(), EventError> {
-        let topology = self.topology.lock().await;
-
-        let to_node = topology
-            .node(to)
-            .ok_or_else(|| TopologyError::NodeNotFound(to.to_string()))?;
-        let overlay_ip = to_node.overlay_ip;
+        let overlay_ip = {
+            let topology = self.topology.lock().await;
+            let to_node = topology
+                .node(to)
+                .ok_or_else(|| TopologyError::NodeNotFound(to.to_string()))?;
+            to_node.overlay_ip
+        };
 
         let timeout_secs = (timeout_ms as f64 / 1000.0).ceil() as u32;
         let timeout_arg = timeout_secs.max(1).to_string();
 
         let ip_str = overlay_ip.to_string();
-        let output = topology
-            .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", &timeout_arg, &ip_str])
-            .await?;
+        let connected = retry_until_success::<_, _, EventError>(
+            ASSERTION_PING_ATTEMPTS,
+            ASSERTION_PING_RETRY_DELAY,
+            |attempt| {
+                let timeout_arg = timeout_arg.clone();
+                let ip_str = ip_str.clone();
+                async move {
+                    let output = {
+                        let topology = self.topology.lock().await;
+                        topology
+                            .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", &timeout_arg, &ip_str])
+                            .await?
+                    };
 
-        if !output.status.success() {
+                    if !output.status.success() {
+                        tracing::debug!(
+                            from = %from,
+                            to = %to,
+                            overlay_ip = %ip_str,
+                            attempt = attempt + 1,
+                            stderr = %String::from_utf8_lossy(&output.stderr),
+                            stdout = %String::from_utf8_lossy(&output.stdout),
+                            "explicit ping probe failed"
+                        );
+                    }
+
+                    Ok(output.status.success())
+                }
+            },
+        )
+        .await?;
+
+        if !connected {
             return Err(EventError::AssertionFailed {
                 at_secs,
-                message: format!("ping from {from} to {to} failed"),
+                message: format!(
+                    "ping from {from} to {to} failed after {ASSERTION_PING_ATTEMPTS} probes"
+                ),
             });
         }
         Ok(())
@@ -382,9 +429,40 @@ impl EventExecutor {
     }
 }
 
+fn should_run_assertion(assertion: &Assertion, elapsed_secs: f64, _tracker: &EventTracker) -> bool {
+    elapsed_secs >= assertion.at_secs
+}
+
+async fn retry_until_success<F, Fut, E>(
+    attempts: usize,
+    delay: Duration,
+    mut operation: F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<bool, E>>,
+{
+    if attempts == 0 {
+        return Ok(false);
+    }
+
+    for attempt in 0..attempts {
+        if operation(attempt).await? {
+            return Ok(true);
+        }
+
+        if attempt + 1 < attempts {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenario::AssertCondition;
 
     #[test]
     fn test_result_default() {
@@ -397,5 +475,74 @@ mod tests {
         };
         assert!(result.passed);
         assert_eq!(result.assertions_run, result.assertions_passed);
+    }
+
+    #[test]
+    fn assertion_not_ready_before_scheduled_time_even_when_requirements_met() {
+        let assertion = Assertion {
+            at_secs: 15.0,
+            condition: AssertCondition::NodesConnected {
+                nodes: vec!["nodeA".to_string(), "nodeB".to_string()],
+            },
+        };
+
+        let mut tracker = EventTracker::default();
+        tracker.connection_counts.insert("nodeA".to_string(), 1);
+        tracker.connection_counts.insert("nodeB".to_string(), 1);
+
+        assert!(!should_run_assertion(&assertion, 2.0, &tracker));
+    }
+
+    #[test]
+    fn assertion_ready_once_scheduled_time_is_reached() {
+        let assertion = Assertion {
+            at_secs: 15.0,
+            condition: AssertCondition::Ping {
+                from: "nodeA".to_string(),
+                to: "nodeB".to_string(),
+                timeout_ms: 1000,
+            },
+        };
+
+        let tracker = EventTracker::default();
+
+        assert!(should_run_assertion(&assertion, 15.0, &tracker));
+        assert!(should_run_assertion(&assertion, 20.0, &tracker));
+    }
+
+    #[tokio::test]
+    async fn retry_until_success_handles_transient_failures() {
+        use std::cell::Cell;
+
+        let remaining_failures = Cell::new(2usize);
+
+        let ok = retry_until_success(4, Duration::ZERO, |_| {
+            let should_succeed = remaining_failures.get() == 0;
+            if !should_succeed {
+                remaining_failures.set(remaining_failures.get() - 1);
+            }
+            std::future::ready(Ok::<bool, ()>(should_succeed))
+        })
+        .await
+        .unwrap();
+
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn retry_until_success_stops_after_attempt_budget() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0usize);
+
+        let ok = retry_until_success(3, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok::<bool, ()>(false))
+        })
+        .await
+        .unwrap();
+
+        assert!(!ok);
+        assert_eq!(calls.get(), 3);
     }
 }

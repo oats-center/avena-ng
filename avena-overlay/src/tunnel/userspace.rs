@@ -89,12 +89,8 @@ impl TunnelBackend for UserspaceBackend {
                 .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
             let wg = wg_guard.as_ref().unwrap();
 
-            let current_host = wg.read_host()
-                .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
-
             let mut host = Host::default();
             host.private_key = Some(Key::new(private_key));
-            host.listen_port = current_host.listen_port;
 
             wg.write_host(&host)
                 .map_err(|e| TunnelError::Wireguard(e.to_string()))?;

@@ -143,8 +143,8 @@ impl Avenad {
         info!(mode = ?config.tunnel_mode, "Tunnel backend created");
 
         tunnel.ensure_interface(&config.interface_name).await?;
-        tunnel.set_listen_port(config.listen_port).await?;
         tunnel.set_private_key(&*wg_keys.private).await?;
+        tunnel.set_listen_port(config.listen_port).await?;
 
         assign_interface_address(&config.interface_name, overlay_ip)?;
         info!(interface = %config.interface_name, addr = %overlay_ip, "Assigned overlay address to interface");
@@ -458,12 +458,7 @@ impl AvenadInner {
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer.device_id);
 
-        // Use ::/0 for multi-hop routing when babel is enabled, otherwise /128
-        let allowed_ips = if self.config.routing.enable_babel {
-            vec!["::/0".parse::<IpNet>().expect("::/0 is always valid")]
-        } else {
-            vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")]
-        };
+        let allowed_ips = peer_allowed_ips(peer_overlay_ip, self.config.routing.enable_babel);
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
@@ -473,10 +468,10 @@ impl AvenadInner {
 
         self.tunnel.add_peer(&peer_config).await?;
 
-        // When babel is enabled, it manages routes; otherwise add static route
-        if !self.config.routing.enable_babel {
-            add_peer_route(&self.config.interface_name, peer_overlay_ip)?;
-        }
+        // Always install a direct /128 route for the connected peer.
+        // Babel handles multi-hop routes, but direct peer routes are needed
+        // immediately after handshake so overlay probes are routable.
+        ensure_direct_peer_route(&self.config.interface_name, peer_overlay_ip)?;
 
         Ok(PeerState::new(peer.device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
             .with_endpoint(peer.endpoint))
@@ -561,12 +556,7 @@ impl AvenadInner {
                 SocketAddr::new(addr.ip(), addr.port() - 1)
             });
 
-        // Use ::/0 for multi-hop routing when babel is enabled, otherwise /128
-        let allowed_ips = if self.config.routing.enable_babel {
-            vec!["::/0".parse::<IpNet>().expect("::/0 is always valid")]
-        } else {
-            vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")]
-        };
+        let allowed_ips = peer_allowed_ips(peer_overlay_ip, self.config.routing.enable_babel);
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
@@ -576,10 +566,10 @@ impl AvenadInner {
 
         self.tunnel.add_peer(&peer_config).await?;
 
-        // When babel is enabled, it manages routes; otherwise add static route
-        if !self.config.routing.enable_babel {
-            add_peer_route(&self.config.interface_name, peer_overlay_ip)?;
-        }
+        // Always install a direct /128 route for the connected peer.
+        // Babel handles multi-hop routes, but direct peer routes are needed
+        // immediately after handshake so overlay probes are routable.
+        ensure_direct_peer_route(&self.config.interface_name, peer_overlay_ip)?;
 
         Ok(PeerState::new(peer_device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
             .with_endpoint(peer_wg_endpoint))
@@ -762,6 +752,26 @@ fn add_peer_route(
     ))
 }
 
+fn ensure_direct_peer_route(
+    interface_name: &str,
+    peer_addr: std::net::Ipv6Addr,
+) -> Result<(), std::io::Error> {
+    match add_peer_route(interface_name, peer_addr) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn peer_allowed_ips(peer_overlay_ip: std::net::Ipv6Addr, babel_enabled: bool) -> Vec<IpNet> {
+    if babel_enabled {
+        // Keep peer-specific routes for now. Broad ::/0 allowed-ips breaks underlay reachability
+        // in userspace mode; route-aware expansion is tracked separately.
+    }
+    vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")]
+}
+
 #[cfg(target_os = "linux")]
 fn get_interface_ip(interface_name: &str) -> Option<IpAddr> {
     use avena_overlay::wg::linux::netlink;
@@ -823,6 +833,25 @@ impl From<std::io::Error> for AvenadError {
 impl From<serde_json::Error> for AvenadError {
     fn from(e: serde_json::Error) -> Self {
         AvenadError::Json(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_allowed_ips_are_host_routes_when_babel_enabled() {
+        let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
+        let allowed_ips = peer_allowed_ips(overlay_ip, true);
+        assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
+    }
+
+    #[test]
+    fn peer_allowed_ips_are_host_routes_when_babel_disabled() {
+        let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
+        let allowed_ips = peer_allowed_ips(overlay_ip, false);
+        assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
     }
 }
 

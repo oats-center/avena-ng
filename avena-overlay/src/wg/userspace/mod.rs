@@ -9,7 +9,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -21,26 +21,33 @@ use crate::wg::uapi::parse_errno;
 pub use socket::socket_path;
 
 const WIREGUARD_GO_EXECUTABLE: &str = "wireguard-go";
+const SOCKET_POLL_ATTEMPTS: usize = 250;
+const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const UAPI_RETRY_ATTEMPTS: usize = 250;
+const UAPI_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub struct UserspaceBackend {
     ifname: Mutex<Option<String>>,
+    process: Mutex<Option<Child>>,
 }
 
 impl UserspaceBackend {
     pub fn new() -> Self {
         Self {
             ifname: Mutex::new(None),
+            process: Mutex::new(None),
         }
     }
 
     fn ifname(&self) -> Result<String, WgError> {
-        let guard = self.ifname.lock().map_err(|e| {
-            WgError::InterfaceNotFound(format!("lock poisoned: {}", e))
-        })?;
-        guard.clone().ok_or_else(|| {
-            WgError::InterfaceNotFound("interface not initialized".into())
-        })
+        let guard = self
+            .ifname
+            .lock()
+            .map_err(|e| WgError::InterfaceNotFound(format!("lock poisoned: {}", e)))?;
+        guard
+            .clone()
+            .ok_or_else(|| WgError::InterfaceNotFound("interface not initialized".into()))
     }
 
     fn connect(&self) -> Result<socket::WgSocket, WgError> {
@@ -55,43 +62,82 @@ impl UserspaceBackend {
     }
 
     pub fn create_interface(&self, name: &str) -> Result<(), WgError> {
-        let mut guard = self.ifname.lock().map_err(|e| {
-            WgError::InterfaceCreation(format!("lock poisoned: {}", e))
-        })?;
+        let mut ifname_guard = self
+            .ifname
+            .lock()
+            .map_err(|e| WgError::InterfaceCreation(format!("lock poisoned: {}", e)))?;
+        let mut process_guard = self
+            .process
+            .lock()
+            .map_err(|e| WgError::InterfaceCreation(format!("lock poisoned: {}", e)))?;
 
-        if let Some(ref existing) = *guard {
+        if let Some(ref existing) = *ifname_guard {
             if existing == name {
-                return Ok(());
+                if let Some(process) = process_guard.as_mut() {
+                    match process.try_wait() {
+                        Ok(None) => return Ok(()),
+                        Ok(Some(_)) => {
+                            *process_guard = None;
+                            *ifname_guard = None;
+                        }
+                        Err(e) => {
+                            return Err(WgError::ProcessError(format!(
+                                "failed to query wireguard-go process: {}",
+                                e
+                            )));
+                        }
+                    }
+                } else {
+                    *ifname_guard = None;
+                }
+            } else {
+                return Err(WgError::InterfaceCreation(
+                    "interface already exists with different name".into(),
+                ));
             }
-            return Err(WgError::InterfaceCreation(
-                "interface already exists with different name".into(),
-            ));
         }
 
-        let output = Command::new(WIREGUARD_GO_EXECUTABLE)
-            .arg(name)
-            .output()
+        let mut process = wireguard_go_command(name)
+            .spawn()
             .map_err(|e| WgError::ProcessError(format!("failed to run wireguard-go: {}", e)))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WgError::InterfaceCreation(format!(
-                "wireguard-go failed: {}",
-                stderr
-            )));
-        }
+        // wireguard-go may print an informational banner about kernel WireGuard
+        // availability. Treat process exit status + UAPI socket readiness as the
+        // source of truth for userspace backend health.
 
         let sock_path = socket_path(name);
-        for _ in 0..50 {
-            if sock_path.exists() {
-                *guard = Some(name.to_string());
+        for attempt in 0..SOCKET_POLL_ATTEMPTS {
+            match process.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(WgError::InterfaceCreation(format!(
+                        "wireguard-go exited during startup with status {}",
+                        status
+                    )));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(WgError::ProcessError(format!(
+                        "failed to query wireguard-go process: {}",
+                        e
+                    )));
+                }
+            }
+
+            if sock_path.exists() && socket::WgSocket::connect(name).is_ok() {
+                *ifname_guard = Some(name.to_string());
+                *process_guard = Some(process);
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(20));
+
+            if attempt + 1 < SOCKET_POLL_ATTEMPTS {
+                thread::sleep(SOCKET_POLL_INTERVAL);
+            }
         }
 
+        let _ = process.kill();
+        let _ = process.wait();
         Err(WgError::InterfaceCreation(format!(
-            "wireguard-go started but socket {} not created",
+            "wireguard-go socket {} did not become ready",
             sock_path.display()
         )))
     }
@@ -114,67 +160,89 @@ impl UserspaceBackend {
             }
         }
 
-        let mut guard = self.ifname.lock().map_err(|e| {
-            WgError::InterfaceNotFound(format!("lock poisoned: {}", e))
-        })?;
+        let mut process_guard = self
+            .process
+            .lock()
+            .map_err(|e| WgError::InterfaceNotFound(format!("lock poisoned: {}", e)))?;
+        if let Some(process) = process_guard.as_mut() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+        *process_guard = None;
+
+        let mut guard = self
+            .ifname
+            .lock()
+            .map_err(|e| WgError::InterfaceNotFound(format!("lock poisoned: {}", e)))?;
         *guard = None;
 
         Ok(())
     }
 
     pub fn read_host(&self) -> Result<Host, WgError> {
-        let mut socket = self.connect()?;
-        socket.send(b"get=1\n\n")?;
-        Host::parse_uapi(socket.into_reader())
+        with_retry(|| {
+            let mut socket = self.connect()?;
+            socket.send(b"get=1\n\n")?;
+            Host::parse_uapi(socket.into_reader())
+        })
     }
 
     pub fn write_host(&self, host: &Host) -> Result<(), WgError> {
-        let mut socket = self.connect()?;
-        socket.send(b"set=1\n")?;
-        socket.send(host.as_uapi().as_bytes())?;
-        socket.send(b"\n")?;
+        with_retry(|| {
+            let mut socket = self.connect()?;
+            socket.send(b"set=1\n")?;
+            socket.send(host.as_uapi().as_bytes())?;
+            socket.send(b"\n")?;
 
-        let errno = parse_errno(socket.into_reader());
-        if errno == 0 {
-            Ok(())
-        } else {
-            Err(WgError::UapiError(format!("write failed with errno={}", errno)))
-        }
+            let errno = parse_errno(socket.into_reader());
+            if errno == 0 {
+                Ok(())
+            } else {
+                Err(WgError::UapiError(format!(
+                    "write failed with errno={}",
+                    errno
+                )))
+            }
+        })
     }
 
     pub fn configure_peer(&self, peer: &Peer) -> Result<(), WgError> {
-        let mut socket = self.connect()?;
-        socket.send(b"set=1\n")?;
-        socket.send(peer.as_uapi_update().as_bytes())?;
-        socket.send(b"\n")?;
+        with_retry(|| {
+            let mut socket = self.connect()?;
+            socket.send(b"set=1\n")?;
+            socket.send(peer.as_uapi_update().as_bytes())?;
+            socket.send(b"\n")?;
 
-        let errno = parse_errno(socket.into_reader());
-        if errno == 0 {
-            Ok(())
-        } else {
-            Err(WgError::UapiError(format!(
-                "configure_peer failed with errno={}",
-                errno
-            )))
-        }
+            let errno = parse_errno(socket.into_reader());
+            if errno == 0 {
+                Ok(())
+            } else {
+                Err(WgError::UapiError(format!(
+                    "configure_peer failed with errno={}",
+                    errno
+                )))
+            }
+        })
     }
 
     pub fn remove_peer(&self, pubkey: &Key) -> Result<(), WgError> {
         let peer = Peer::new(pubkey.clone());
-        let mut socket = self.connect()?;
-        socket.send(b"set=1\n")?;
-        socket.send(peer.as_uapi_remove().as_bytes())?;
-        socket.send(b"\n")?;
+        with_retry(|| {
+            let mut socket = self.connect()?;
+            socket.send(b"set=1\n")?;
+            socket.send(peer.as_uapi_remove().as_bytes())?;
+            socket.send(b"\n")?;
 
-        let errno = parse_errno(socket.into_reader());
-        if errno == 0 {
-            Ok(())
-        } else {
-            Err(WgError::UapiError(format!(
-                "remove_peer failed with errno={}",
-                errno
-            )))
-        }
+            let errno = parse_errno(socket.into_reader());
+            if errno == 0 {
+                Ok(())
+            } else {
+                Err(WgError::UapiError(format!(
+                    "remove_peer failed with errno={}",
+                    errno
+                )))
+            }
+        })
     }
 
     pub fn peer_stats(&self, pubkey: &Key) -> Result<PeerStats, WgError> {
@@ -192,6 +260,57 @@ impl UserspaceBackend {
     pub fn listen_port(&self) -> Result<u16, WgError> {
         let host = self.read_host()?;
         Ok(host.listen_port)
+    }
+}
+
+fn wireguard_go_command(name: &str) -> Command {
+    let mut cmd = Command::new(WIREGUARD_GO_EXECUTABLE);
+    cmd.arg("-f");
+    cmd.arg(name);
+    cmd.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
+    cmd
+}
+
+fn with_retry<T, F>(mut operation: F) -> Result<T, WgError>
+where
+    F: FnMut() -> Result<T, WgError>,
+{
+    let mut last_err = None;
+
+    for _ in 0..UAPI_RETRY_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_transient_wireguard_error(&err) => {
+                last_err = Some(err);
+                thread::sleep(UAPI_RETRY_INTERVAL);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| WgError::SocketError("operation retries exhausted".into())))
+}
+
+fn is_transient_wireguard_error(err: &WgError) -> bool {
+    match err {
+        WgError::Io(io_err) => matches!(
+            io_err.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::Interrupted
+                | ErrorKind::WouldBlock
+                | ErrorKind::NotFound
+        ),
+        WgError::SocketError(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("connection reset")
+                || message.contains("connection refused")
+                || message.contains("timed out")
+        }
+        WgError::InterfaceNotFound(_) => true,
+        _ => false,
     }
 }
 
@@ -251,5 +370,73 @@ mod tests {
         let backend = UserspaceBackend::new();
         let result = backend.listen_port();
         assert!(matches!(result, Err(WgError::InterfaceNotFound(_))));
+    }
+
+    #[test]
+    fn transient_error_detection_matches_connection_reset() {
+        let err = WgError::Io(std::io::Error::from(ErrorKind::ConnectionReset));
+        assert!(is_transient_wireguard_error(&err));
+    }
+
+    #[test]
+    fn transient_error_detection_ignores_uapi_error() {
+        let err = WgError::UapiError("bad config".into());
+        assert!(!is_transient_wireguard_error(&err));
+    }
+
+    #[test]
+    fn transient_error_detection_matches_interface_not_found() {
+        let err = WgError::InterfaceNotFound("socket missing".into());
+        assert!(is_transient_wireguard_error(&err));
+    }
+
+    #[test]
+    fn with_retry_retries_transient_errors_until_success() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0usize);
+        let result = with_retry(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(WgError::SocketError("Connection reset by peer".into()))
+            } else {
+                Ok(42usize)
+            }
+        })
+        .expect("transient failures should be retried");
+
+        assert_eq!(result, 42);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn with_retry_stops_on_non_transient_error() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0usize);
+        let result = with_retry::<usize, _>(|| {
+            calls.set(calls.get() + 1);
+            Err(WgError::UapiError("bad request".into()))
+        });
+
+        assert!(matches!(result, Err(WgError::UapiError(_))));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn wireguard_command_sets_userspace_preference_env_and_foreground_mode() {
+        let cmd = wireguard_go_command("wg-test");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let env = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD")
+            .and_then(|(_, value)| value)
+            .expect("userspace preference env should be set");
+
+        assert_eq!(args, vec!["-f", "wg-test"]);
+        assert_eq!(env, "1");
     }
 }

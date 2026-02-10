@@ -238,6 +238,20 @@ impl TestTopology {
 
     pub async fn teardown(&mut self) -> Result<(), TopologyError> {
         for node in self.nodes.values_mut() {
+            if let Some(pid) = node.pid {
+                let _ = Command::new("nsenter")
+                    .args([
+                        "-t",
+                        &pid.to_string(),
+                        "-n",
+                        "-m",
+                        "pkill",
+                        "-f",
+                        "wireguard-go -f",
+                    ])
+                    .output()
+                    .await;
+            }
             if let Some(ref mut process) = node.avenad_process {
                 let _ = process.kill().await;
             }
@@ -268,6 +282,20 @@ impl TestTopology {
             .ok_or_else(|| TopologyError::NodeNotFound(node_id.to_string()))?;
 
         if let Some(ref mut process) = node.avenad_process {
+            if let Some(pid) = node.pid {
+                let _ = Command::new("nsenter")
+                    .args([
+                        "-t",
+                        &pid.to_string(),
+                        "-n",
+                        "-m",
+                        "pkill",
+                        "-f",
+                        "wireguard-go -f",
+                    ])
+                    .output()
+                    .await;
+            }
             process.kill().await?;
             node.avenad_process = None;
             node.pid = None;
@@ -349,7 +377,7 @@ impl TestTopology {
 
         Ok(AvenadConfig {
             interface_name: format!("wg-{}", node_config.id),
-            tunnel_mode: TunnelMode::Userspace,
+            tunnel_mode: default_tunnel_mode_for_testbed(),
             network: NetworkConfig::default(),
             listen_port: 51820,
             listen_address: None,
@@ -470,6 +498,16 @@ impl TestTopology {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn default_tunnel_mode_for_testbed() -> TunnelMode {
+    TunnelMode::Userspace
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_tunnel_mode_for_testbed() -> TunnelMode {
+    TunnelMode::Userspace
+}
+
 impl Default for TestTopology {
     fn default() -> Self {
         Self::new()
@@ -485,5 +523,17 @@ mod tests {
         let topo = TestTopology::new();
         assert!(topo.nodes.is_empty());
         assert!(topo.veth_pairs.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_default_tunnel_mode_linux() {
+        assert!(matches!(default_tunnel_mode_for_testbed(), TunnelMode::Userspace));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_default_tunnel_mode_non_linux() {
+        assert!(matches!(default_tunnel_mode_for_testbed(), TunnelMode::Userspace));
     }
 }

@@ -12,8 +12,12 @@ use crate::status::Status;
 use crate::topology::TestTopology;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+const NODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const NODE_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Error, Debug)]
 pub enum RunnerError {
@@ -34,6 +38,9 @@ pub enum RunnerError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("node startup failed: {0}")]
+    NodeStartup(String),
 }
 
 pub struct TestRunner {
@@ -108,40 +115,36 @@ impl TestRunner {
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
         let mut running_count = 0;
+        let mut not_ready_nodes = Vec::new();
         for node in &scenario.nodes {
-            if let Some(instance) = topology.node_mut(&node.id) {
-                metrics.log_node_started(&node.id, &instance.overlay_ip);
-
-                if let Some(ref mut proc) = instance.avenad_process {
-                    match proc.try_wait() {
-                        Ok(Some(status)) => {
-                            let log_path = log_dir.join(format!("{}.stdout.log", node.id));
-                            tracing::error!(
-                                node = %node.id,
-                                status = ?status,
-                                log = %log_path.display(),
-                                "avenad exited prematurely - check log file"
-                            );
-                        }
-                        Ok(None) => {
-                            running_count += 1;
-                            tracing::info!(
-                                node = %node.id,
-                                overlay_ip = %instance.overlay_ip,
-                                "node running"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(node = %node.id, error = %e, "failed to check process");
-                        }
-                    }
+            if wait_for_node_ready(&mut topology, &node.id, log_dir).await? {
+                if let Some(instance) = topology.node_mut(&node.id) {
+                    metrics.log_node_started(&node.id, &instance.overlay_ip);
+                    running_count += 1;
+                    tracing::info!(
+                        node = %node.id,
+                        overlay_ip = %instance.overlay_ip,
+                        "node running"
+                    );
                 }
+            } else {
+                not_ready_nodes.push(node.id.clone());
             }
         }
         phase.done_with(&format!("{running_count} running"));
+
+        if !not_ready_nodes.is_empty() {
+            if !self.keep_namespaces {
+                let phase = status.phase("Cleaning up");
+                topology.teardown().await?;
+                phase.done();
+            }
+            return Err(RunnerError::NodeStartup(format!(
+                "not ready: {}",
+                not_ready_nodes.join(", ")
+            )));
+        }
 
         let topology = Arc::new(Mutex::new(topology));
         let links = Arc::new(Mutex::new(links));
@@ -209,6 +212,79 @@ impl TestRunner {
     }
 }
 
+async fn wait_for_node_ready(
+    topology: &mut TestTopology,
+    node_id: &str,
+    log_dir: &Path,
+) -> Result<bool, RunnerError> {
+    let log_path = log_dir.join(format!("{}.stdout.log", node_id));
+    let deadline = Instant::now() + NODE_STARTUP_TIMEOUT;
+
+    loop {
+        let process_exited = {
+            let Some(instance) = topology.node_mut(node_id) else {
+                return Ok(false);
+            };
+
+            let Some(proc) = instance.avenad_process.as_mut() else {
+                return Ok(false);
+            };
+
+            match proc.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::error!(
+                        node = %node_id,
+                        status = ?status,
+                        log = %log_path.display(),
+                        "avenad exited before startup readiness"
+                    );
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => return Err(RunnerError::Io(e)),
+            }
+        };
+
+        let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if node_startup_failed(&log_contents) {
+            tracing::error!(
+                node = %node_id,
+                log = %log_path.display(),
+                "avenad reported startup failure"
+            );
+            return Ok(false);
+        }
+        if node_startup_ready(&log_contents) {
+            return Ok(true);
+        }
+        if process_exited {
+            return Ok(false);
+        }
+
+        if Instant::now() >= deadline {
+            tracing::error!(
+                node = %node_id,
+                log = %log_path.display(),
+                timeout_secs = NODE_STARTUP_TIMEOUT.as_secs(),
+                "timed out waiting for node startup readiness"
+            );
+            return Ok(false);
+        }
+
+        tokio::time::sleep(NODE_STARTUP_POLL_INTERVAL).await;
+    }
+}
+
+fn node_startup_ready(log: &str) -> bool {
+    log.contains("Discovery service initialized")
+        || log.contains("Handshake listener bound")
+        || log.contains("Avenad running. Press Ctrl+C to stop.")
+}
+
+fn node_startup_failed(log: &str) -> bool {
+    log.contains("Failed to initialize avenad")
+}
+
 impl Default for TestRunner {
     fn default() -> Self {
         Self::new()
@@ -223,5 +299,26 @@ mod tests {
     fn test_runner_builder() {
         let runner = TestRunner::new().keep_namespaces(true);
         assert!(runner.keep_namespaces);
+    }
+
+    #[test]
+    fn node_startup_ready_detects_success_markers() {
+        let log = "INFO avenad: Loaded configuration\nINFO avenad: Discovery service initialized\n";
+        assert!(node_startup_ready(log));
+
+        let log = "INFO avenad: Handshake listener bound\n";
+        assert!(node_startup_ready(log));
+    }
+
+    #[test]
+    fn node_startup_ready_ignores_early_non_ready_logs() {
+        let log = "INFO avenad: Loaded configuration\nINFO avenad: Tunnel backend created\n";
+        assert!(!node_startup_ready(log));
+    }
+
+    #[test]
+    fn node_startup_failed_detects_init_failure_marker() {
+        let log = "ERROR avenad: Failed to initialize avenad: tunnel error\n";
+        assert!(node_startup_failed(log));
     }
 }
