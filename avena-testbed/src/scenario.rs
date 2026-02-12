@@ -76,15 +76,23 @@ pub struct Event {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum EventAction {
-    DisconnectLink { link: String },
-    ConnectLink { link: String },
+    DisconnectLink {
+        link: String,
+    },
+    ConnectLink {
+        link: String,
+    },
     ModifyLink {
         link: String,
         latency_ms: Option<u32>,
         loss_percent: Option<f32>,
     },
-    StopNode { node: String },
-    StartNode { node: String },
+    StopNode {
+        node: String,
+    },
+    StartNode {
+        node: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,9 +104,18 @@ pub struct Assertion {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum AssertCondition {
-    NodesConnected { nodes: Vec<String> },
-    Ping { from: String, to: String, timeout_ms: u32 },
-    PeerCount { node: String, count: usize },
+    NodesConnected {
+        nodes: Vec<String>,
+    },
+    Ping {
+        from: String,
+        to: String,
+        timeout_ms: u32,
+    },
+    PeerCount {
+        node: String,
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -137,13 +154,14 @@ impl AssertCondition {
                     },
                 ]
             }
-            AssertCondition::NodesConnected { nodes } => {
-                nodes.iter().map(|node| RequiredEvent {
+            AssertCondition::NodesConnected { nodes } => nodes
+                .iter()
+                .map(|node| RequiredEvent {
                     node: node.clone(),
                     event_type: RequiredEventType::PeerConnected,
                     count: 1,
-                }).collect()
-            }
+                })
+                .collect(),
         }
     }
 }
@@ -162,7 +180,9 @@ impl Scenario {
 
     fn validate(&self) -> Result<(), ScenarioError> {
         if self.nodes.is_empty() {
-            return Err(ScenarioError::Validation("at least one node required".into()));
+            return Err(ScenarioError::Validation(
+                "at least one node required".into(),
+            ));
         }
 
         let node_ids: std::collections::HashSet<_> = self.nodes.iter().map(|n| &n.id).collect();

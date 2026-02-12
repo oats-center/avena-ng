@@ -178,9 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_peers_without_device_id_not_included() {
-        let peers = StaticPeers::from_config(vec![
-            StaticPeerConfig::new("127.0.0.1:51820"),
-        ]);
+        let peers = StaticPeers::from_config(vec![StaticPeerConfig::new("127.0.0.1:51820")]);
 
         let discovered = peers.resolve().await;
         assert_eq!(discovered.len(), 0);

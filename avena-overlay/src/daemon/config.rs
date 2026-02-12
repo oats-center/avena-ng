@@ -76,30 +76,21 @@ pub struct AvenadConfig {
 /// Routing protocol configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoutingConfig {
-    #[serde(default = "default_routing_enabled")]
-    /// Enable babeld for dynamic mesh routing.
-    pub enable_babel: bool,
-
     #[serde(default)]
     /// Babeld-specific configuration.
     pub babel: BabeldConfig,
 }
 
-fn default_routing_enabled() -> bool {
-    true
-}
-
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            enable_babel: default_routing_enabled(),
             babel: BabeldConfig::default(),
         }
     }
 }
 
 /// Discovery-specific configuration embedded in `AvenadConfig`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveryConfig {
     #[serde(default = "default_mdns_enabled")]
     /// Enable mDNS advertising/browsing when true.
@@ -115,6 +106,14 @@ pub struct DiscoveryConfig {
     #[serde(default)]
     /// Statically configured peer endpoints.
     pub static_peers: Vec<StaticPeerConfig>,
+
+    #[serde(default = "default_presence_reannounce_interval_ms")]
+    /// How often to re-announce local presence for discovery.
+    pub presence_reannounce_interval_ms: u64,
+
+    #[serde(default = "default_peer_retry_interval_ms")]
+    /// How often to retry connecting cached discovered peers.
+    pub peer_retry_interval_ms: u64,
 }
 
 impl DiscoveryConfig {
@@ -125,6 +124,19 @@ impl DiscoveryConfig {
             vec![iface.clone()]
         } else {
             Vec::new()
+        }
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enable_mdns: default_mdns_enabled(),
+            mdns_interface: None,
+            mdns_interfaces: Vec::new(),
+            static_peers: Vec::new(),
+            presence_reannounce_interval_ms: default_presence_reannounce_interval_ms(),
+            peer_retry_interval_ms: default_peer_retry_interval_ms(),
         }
     }
 }
@@ -147,6 +159,14 @@ fn default_dead_peer_timeout() -> u64 {
 
 fn default_mdns_enabled() -> bool {
     true
+}
+
+fn default_presence_reannounce_interval_ms() -> u64 {
+    1000
+}
+
+fn default_peer_retry_interval_ms() -> u64 {
+    250
 }
 
 impl Default for AvenadConfig {
@@ -233,6 +253,8 @@ mod tests {
         assert_eq!(config.interface_name, "avena0");
         assert_eq!(config.listen_port, 51820);
         assert_eq!(config.persistent_keepalive, 25);
+        assert_eq!(config.discovery.presence_reannounce_interval_ms, 1000);
+        assert_eq!(config.discovery.peer_retry_interval_ms, 250);
         assert_eq!(
             config.trusted_root_cert,
             PathBuf::from("/etc/avena/root.cert")
@@ -276,5 +298,7 @@ mod tests {
         assert_eq!(config.listen_port, 51821);
         assert!(!config.discovery.enable_mdns);
         assert_eq!(config.discovery.static_peers.len(), 1);
+        assert_eq!(config.discovery.presence_reannounce_interval_ms, 1000);
+        assert_eq!(config.discovery.peer_retry_interval_ms, 250);
     }
 }

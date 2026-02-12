@@ -13,8 +13,7 @@ pub use metrics::{MetricEvent, MetricsLogger};
 pub use pki::{NodePaths, PkiError, TestPki};
 pub use runner::{RunnerError, TestRunner};
 pub use scenario::{
-    AssertCondition, Assertion, Event, EventAction, LinkConfig, NodeConfig, Scenario,
-    ScenarioError,
+    AssertCondition, Assertion, Event, EventAction, LinkConfig, NodeConfig, Scenario, ScenarioError,
 };
 pub use status::Status;
 pub use topology::{NodeInstance, TestTopology, TopologyError, VethPair};

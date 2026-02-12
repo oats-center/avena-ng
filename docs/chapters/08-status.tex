@@ -1,0 +1,162 @@
+% Chapter 8: Status and Future
+% Contains: Testing, Implementation Status, Decisions, Open Questions, Future Work
+
+% ============================================================
+\section{Testing Strategy}
+% ============================================================
+
+\textbf{Unit tests:} HLC, selectors, certificates, CRDT merge operations, cost computation.
+
+\textbf{Integration tests:} Multi-device with ephemeral NATS, simulated network.
+
+\textbf{Emulation tests:} ns-3 with real code---systemd-nspawn or lightweight VMs (Firecracker); real avenad, Wireguard, babeld; simulated WiFi propagation, LoRa, mobility. Measurements include convergence time, CRDT merge correctness, routing optimality, and cost tradeoffs.
+
+\textbf{Physical validation:} Deploy on agricultural and V2X hardware, compare to emulation predictions.
+
+% ============================================================
+\section{Implementation Status}
+% ============================================================
+
+The following table summarizes the implementation status of Avena components in the \texttt{avena-overlay} crate.
+
+\begin{longtable}{@{}p{4cm}p{6.5cm}p{2.5cm}@{}}
+\toprule
+\textbf{Component} & \textbf{Details} & \textbf{Status} \\
+\midrule
+\endhead
+Device Identity & Ed25519 keypairs, DeviceId (SHA-256 $\rightarrow$ 16 bytes), Base32 encoding & Complete \\
+Address Derivation & IPv6 ULA /48, deterministic device and workload addresses & Complete \\
+Handshake Protocol & TCP-based with magic/version/length framing, JSON payload & Complete \\
+WireGuard Key Derivation & HKDF-SHA256 for interface keys and session PSKs & Complete \\
+Certificate Validation & JWT (EdDSA), chain validation up to depth 10, expiry checking & Complete \\
+mDNS Discovery & Service type \texttt{\_avena.\_udp.local.}, TXT records for capabilities & Complete \\
+Static Peer Config & TOML configuration, DNS resolution & Complete \\
+Kernel WireGuard & Linux netlink interface (\texttt{netlink-packet-wireguard}) & Complete \\
+Userspace WireGuard & \texttt{wireguard-go} subprocess, Unix socket UAPI & Complete \\
+Tunnel Backend Trait & Abstraction over kernel/userspace implementations & Complete \\
+avenad Daemon & TCP handshake server, discovery integration, peer management & Complete \\
+Rate Limiting & Per-IP limits, concurrent handshake limits, nonce replay cache & Complete \\
+Dead Peer Detection & Configurable timeout based on WireGuard handshake timestamps & Complete \\
+\midrule
+Babel Routing & \texttt{babeld} controller integration in avenad; full unicast tunnel-mode policy and production hardening still pending & Partial \\
+Underlay Manager & Netlink monitoring for physical interface changes & Not started \\
+Multi-path WireGuard & Per-(peer, underlay) interface creation & Not started \\
+LoRa Discovery & Low-rate presence beacons and gossip & Not started \\
+Gossip Protocol & CRDT state synchronization & Not started \\
+NATS Messaging & Pub/sub API, interest management & Not started \\
+Workload Management & Container orchestration, Quadlet integration & Not started \\
+Sidecar & Addressable-mode workload networking & Not started \\
+Cost-Aware Routing & Multi-dimensional cost function, priority-based delivery & Not started \\
+Geo-Spatial Features & Position tracking, geo-bounded interests & Not started \\
+\bottomrule
+\end{longtable}
+
+\subsection{Recent Layer 1 Hardening Snapshot (2026-02)}
+
+Recent implementation work improved Layer 1 stability in userspace and testbed-driven validation:
+
+\begin{itemize}[nosep]
+    \item Userspace WireGuard lifecycle hardening (foreground process handling, startup readiness checks, UAPI retry behavior).
+    \item Testbed startup/readiness gating and assertion scheduling/retry hardening.
+    \item Discovery resilience improvements through periodic re-announcement and discovered-peer retry behavior.
+    \item Scenario-gate improvements across \texttt{two\_node\_basic}, \texttt{linear\_three\_hop}, \texttt{star\_gateway}, and \texttt{mobile\_relay}.
+\end{itemize}
+
+At the time of writing, the following temporary implementation deltas remain relative to the target design in Chapter~2:
+
+\begin{itemize}[nosep]
+    \item \textbf{Babel startup behavior:} current code can continue with degraded behavior when \texttt{babeld} startup fails, while the design target states Babel is mandatory.
+    \item \textbf{AllowedIPs policy:} current code uses an adaptive host-route strategy instead of universal \texttt{::/0} on all peer interfaces.
+    \item \textbf{Interface model:} true per-(peer, underlay) WireGuard interface realization is not yet complete.
+\end{itemize}
+
+% ============================================================
+\section{Resolved Design Decisions}
+% ============================================================
+
+\begin{longtable}{@{}p{4cm}p{9cm}@{}}
+\toprule
+\textbf{Component} & \textbf{Decision} \\
+\midrule
+\endhead
+Routing & Babel (RFC 8966) via \texttt{babeld} daemon for IP layer. Babel is mandatory; failure to start is fatal. Cost-aware routing at message layer. \\
+Gossip & Fully replicated global state using CRDTs. All devices see all gossip state. \\
+Consistency model & CRDT-based merge with HLC timestamps. No coordination required. \\
+Message routing & Relay policy filters application messages, not gossip state. \\
+Cost function & Multi-dimensional (priority, dollar, energy, latency, node state). All weights configurable. Battery bounded to strictly positive. \\
+Revocation & Short-lived certificates (months) + gossip revocation lists. \\
+Health events & avenad reports liveness, broadcasts via gossip. Workload specs take priority. \\
+Retention & TTL-based (6--12 months default). GC events broadcast. Tombstones have same TTL. \\
+Interest lifecycle & Runtime creation via NATS API; validated against workload permissions. \\
+Deduplication & Subject + HLC with bounded recent-message cache. \\
+Ordered delivery & Receiver-side buffering with optional max\_latency. \\
+Clock sync & NTP/PTP encouraged; GPS time where available; HLC estimation fallback. \\
+Certificate bootstrap & Out-of-band provisioning; device\_issuer roles can sign new devices. \\
+Upgrades & avenad is a workload. bootc/OCI updates via workload specs. \\
+Compression & Always on. \\
+CRDT types & OR-Map for registries, OR-Set for interests, LWW-Register for single-writer data. \\
+Workload network mode & Two modes: Messaging (pub/sub only, default) and Addressable (overlay IP via sidecar). \\
+Layer 1 ownership & Host avenad owns all Layer 1 infrastructure. Workloads access network via NATS API or sidecar. \\
+Workload isolation & Messaging workloads isolated via Layer 2 encryption. Addressable workloads isolated via end-to-end Wireguard tunnels. Host cannot decrypt workload traffic. \\
+Wireguard backend & Dual-mode: Kernel backend via Linux netlink (\texttt{netlink-packet-wireguard} crate), userspace backend via \texttt{wireguard-go} subprocess with Unix socket UAPI. Host prefers kernel; sidecar uses userspace. \\
+Babel integration & \texttt{babeld} daemon with Unix control socket. Unicast mode for WireGuard compatibility (\texttt{type tunnel unicast true split-horizon true}). Dynamic interface add/remove via socket commands. \\
+WireGuard interface model & One interface per (peer, underlay) tuple. Interface names: \texttt{av-<hash8>}. Enables true multi-path where Babel sees each physical path as distinct link. \\
+Underlay filtering & Include/exclude glob patterns to select physical interfaces. Prevents Avena from using Docker bridges, veth pairs, etc. \\
+Port allocation & Deterministic from hash within configured range (default 51820--52820). Consistent across restarts. \\
+Sidecar control channel & NATS. Sidecars connect to host's NATS with JWT issued by avenad. JWTs scope subject permissions per workload spec. \\
+Container management & Quadlet (systemd integration). Write \texttt{.container} files; systemd manages lifecycle. No daemon process. \\
+Network interface management & Direct netlink via \texttt{rtnetlink} crate for veth pairs, bridges, address assignment. \\
+Workload internet access & NAT via host. Overlay traffic routes through Wireguard tunnels; non-overlay traffic NAT'd to host's internet interface. \\
+\bottomrule
+\end{longtable}
+
+% ============================================================
+\section{Open Questions}
+\label{sec:openquestions}
+% ============================================================
+
+The following questions require resolution during implementation:
+
+\begin{longtable}{@{}p{0.5cm}p{3cm}p{7cm}p{2cm}@{}}
+\toprule
+\textbf{ID} & \textbf{Topic} & \textbf{Question} & \textbf{Status} \\
+\midrule
+\endhead
+OQ-1 & Babel tuning & Optimal parameters for agricultural mobility (hello interval, link cost computation)? & Open \\
+OQ-2 & V2X Babel tuning & Different parameters needed for high-mobility highway scenarios vs. agricultural? & Open \\
+OQ-3 & Workload dependencies & Ordered deployment based on declared dependencies? & Open \\
+OQ-4 & Multi-farm federation & Trust bridging, subject namespacing across fleets? & Open \\
+OQ-5 & Hardware security & TPM/HSM for device keys where available? & Open \\
+OQ-6 & LoRa protocol & Raw LoRa vs. LoRaWAN, addressing, collision handling? & Open \\
+OQ-7 & LoRa gossip limits & Practical limits on gossip propagation over LoRa broadcast domain? & Open \\
+OQ-8 & V2X standards & Mapping between Avena subjects and SAE J2735 message types (BSM, SPaT, MAP)? & Open \\
+OQ-9 & Satellite integration & Special handling for LEO satellite links beyond high-latency high-rate treatment? & Open \\
+\bottomrule
+\end{longtable}
+
+% ============================================================
+\section{Future Work}
+% ============================================================
+
+\subsection{Explicitly Deferred}
+
+\textbf{Network-layer aggregation:} Interests could specify aggregation functions (average, min, max) over time windows. The network computes aggregates before delivery, reducing bandwidth for analytics. Complex in distributed setting---deferred.
+
+\textbf{Adaptive compression:} Currently always-on. Future work could adapt based on link characteristics and content compressibility.
+
+\textbf{Custom DTN buffer management:} Initial implementation uses pluggable DTN. Future work may develop interest-aware eviction policies that consider message priority, interest TTL, and likelihood of eventual delivery.
+
+\textbf{Hard real-time guarantees:} Current design provides best-effort priority delivery. Future work could explore bounded-latency guarantees for safety-critical V2X applications, potentially through dedicated channel reservation or admission control.
+
+\textbf{Cross-domain data relay incentives:} Mechanisms for compensating devices that relay data across domain boundaries (e.g., neighboring farms, passing vehicles). Economic models for data delivery in sparse networks.
+
+\textbf{Named geo-boundary registry:} Geo-spatial boundaries (field polygons, operational zones) could be stored in gossip state and referenced by name in permissions and interests.
+
+\subsection{Research Questions}
+
+\begin{description}
+    \item[RQ1:] How does workload convergence time vary across vehicle-centric network scenarios (always-connected baseline, periodic connectivity, opportunistic mobile relay)?
+    \item[RQ2:] What is the conflict rate and CRDT merge behavior when multiple operators issue workload updates during network partitions?
+    \item[RQ3:] How does the dynamic mesh topology (link formation/teardown) scale with device count and mobility patterns?
+    \item[RQ4:] What bandwidth reduction does geo-spatial interest filtering achieve in V2X scenarios with high device density?
+\end{description}

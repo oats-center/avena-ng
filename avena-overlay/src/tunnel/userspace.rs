@@ -341,11 +341,13 @@ mod tests {
         let guard = InterfaceGuard::new();
         let backend = UserspaceBackend::new();
 
-        backend.ensure_interface(guard.name()).await.expect("create interface");
+        backend
+            .ensure_interface(guard.name())
+            .await
+            .expect("create interface");
 
         let pubkey = [42u8; 32];
-        let config = PeerConfig::new(pubkey)
-            .with_allowed_ips(vec!["fd00::1/128".parse().unwrap()]);
+        let config = PeerConfig::new(pubkey).with_allowed_ips(vec!["fd00::1/128".parse().unwrap()]);
 
         let result = backend.add_peer(&config).await;
         assert!(result.is_ok(), "Failed to add peer: {:?}", result);
@@ -363,7 +365,10 @@ mod tests {
         let guard = InterfaceGuard::new();
         let backend = UserspaceBackend::new();
 
-        backend.ensure_interface(guard.name()).await.expect("create interface");
+        backend
+            .ensure_interface(guard.name())
+            .await
+            .expect("create interface");
 
         let pubkey = [42u8; 32];
         let config = PeerConfig::new(pubkey);
@@ -384,7 +389,10 @@ mod tests {
         let guard = InterfaceGuard::new();
         let backend = UserspaceBackend::new();
 
-        backend.ensure_interface(guard.name()).await.expect("first create");
+        backend
+            .ensure_interface(guard.name())
+            .await
+            .expect("first create");
         let result = backend.ensure_interface(guard.name()).await;
         assert!(result.is_ok(), "Second ensure_interface should succeed");
     }

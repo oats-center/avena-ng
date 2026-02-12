@@ -5,7 +5,9 @@
 
 use crate::pki::{NodePaths, TestPki};
 use crate::scenario::{NodeConfig, Scenario};
-use avena_overlay::{AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, RoutingConfig, StaticPeerConfig, TunnelMode};
+use avena_overlay::{
+    AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, RoutingConfig, StaticPeerConfig, TunnelMode,
+};
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
@@ -135,7 +137,8 @@ impl TestTopology {
         }
 
         for bridge_config in &scenario.bridges {
-            self.setup_bridge(bridge_config, &mut subnet_counter).await?;
+            self.setup_bridge(bridge_config, &mut subnet_counter)
+                .await?;
         }
 
         Ok(())
@@ -150,8 +153,10 @@ impl TestTopology {
         let subnet = *subnet_counter;
         *subnet_counter = subnet_counter.wrapping_add(1);
 
-        self.run_cmd("ip", &["link", "add", &bridge_name, "type", "bridge"]).await?;
-        self.run_cmd("ip", &["link", "set", &bridge_name, "up"]).await?;
+        self.run_cmd("ip", &["link", "add", &bridge_name, "type", "bridge"])
+            .await?;
+        self.run_cmd("ip", &["link", "set", &bridge_name, "up"])
+            .await?;
 
         let mut veth_pairs = Vec::new();
 
@@ -160,7 +165,8 @@ impl TestTopology {
             let veth_ns = format!("vn{}b{}", subnet, i);
 
             self.create_veth_pair(&veth_br, &veth_ns).await?;
-            self.run_cmd("ip", &["link", "set", &veth_br, "master", &bridge_name]).await?;
+            self.run_cmd("ip", &["link", "set", &veth_br, "master", &bridge_name])
+                .await?;
             self.run_cmd("ip", &["link", "set", &veth_br, "up"]).await?;
 
             let ip = std::net::Ipv4Addr::new(10, subnet, 0, (i + 1) as u8);
@@ -215,13 +221,15 @@ impl TestTopology {
                     .collect()
             };
 
-            let (child, inner_pid) = self.spawn_node_in_namespace(
-                &node_config.id,
-                &config_path,
-                log_dir,
-                &veth_config,
-                pki.temp_dir(),
-            ).await?;
+            let (child, inner_pid) = self
+                .spawn_node_in_namespace(
+                    &node_config.id,
+                    &config_path,
+                    log_dir,
+                    &veth_config,
+                    pki.temp_dir(),
+                )
+                .await?;
 
             tracing::debug!(node = %node_config.id, pid = inner_pid, "avenad spawned");
 
@@ -266,7 +274,9 @@ impl TestTopology {
             for (veth_br, _) in &bridge.veth_pairs {
                 let _ = self.run_cmd("ip", &["link", "del", veth_br]).await;
             }
-            let _ = self.run_cmd("ip", &["link", "del", &bridge.bridge_name]).await;
+            let _ = self
+                .run_cmd("ip", &["link", "del", &bridge.bridge_name])
+                .await;
         }
 
         self.nodes.clear();
@@ -328,11 +338,9 @@ impl TestTopology {
             .get(node_id)
             .ok_or_else(|| TopologyError::NodeNotFound(node_id.to_string()))?;
 
-        let pid = node.pid.ok_or_else(|| {
-            TopologyError::CommandFailed {
-                cmd: cmd.join(" "),
-                message: "node has no running process".into(),
-            }
+        let pid = node.pid.ok_or_else(|| TopologyError::CommandFailed {
+            cmd: cmd.join(" "),
+            message: "node has no running process".into(),
         })?;
 
         let output = Command::new("nsenter")
@@ -391,6 +399,8 @@ impl TestTopology {
                 mdns_interface: None,
                 mdns_interfaces,
                 static_peers,
+                presence_reannounce_interval_ms: 1000,
+                peer_retry_interval_ms: 250,
             },
             persistent_keepalive: 5,
             dead_peer_timeout_secs: 30,
@@ -442,7 +452,9 @@ impl TestTopology {
         let _ = self.run_cmd("ip", &["link", "del", veth_a]).await;
         self.run_cmd(
             "ip",
-            &["link", "add", veth_a, "type", "veth", "peer", "name", veth_b],
+            &[
+                "link", "add", veth_a, "type", "veth", "peer", "name", veth_b,
+            ],
         )
         .await
     }
@@ -471,7 +483,10 @@ impl TestTopology {
 
         let mut setup_script = String::from("set -e\n");
         setup_script.push_str(&format!("echo $$ > {}\n", pid_file.display()));
-        setup_script.push_str(&format!("while [ ! -f {} ]; do sleep 0.05; done\n", ready_file.display()));
+        setup_script.push_str(&format!(
+            "while [ ! -f {} ]; do sleep 0.05; done\n",
+            ready_file.display()
+        ));
         setup_script.push_str("mount -t tmpfs tmpfs /var/run\n");
         setup_script.push_str("mkdir -p /var/run/wireguard\n");
         setup_script.push_str("mkdir -p /run/avena\n");
@@ -487,7 +502,11 @@ impl TestTopology {
             ));
         }
 
-        setup_script.push_str(&format!("exec {} {}\n", avenad_path.display(), config_path.display()));
+        setup_script.push_str(&format!(
+            "exec {} {}\n",
+            avenad_path.display(),
+            config_path.display()
+        ));
 
         tracing::debug!(node = %node_id, stdout = %stdout_path.display(), stderr = %stderr_path.display(), "avenad logs");
 
@@ -510,17 +529,18 @@ impl TestTopology {
             .to_string();
 
         for (veth, _, _) in veth_config {
-            self.run_cmd("ip", &["link", "set", veth, "netns", &inner_pid]).await?;
+            self.run_cmd("ip", &["link", "set", veth, "netns", &inner_pid])
+                .await?;
         }
 
         std::fs::write(&ready_file, "ready")?;
 
-        let inner_pid_u32: u32 = inner_pid.parse().map_err(|_| {
-            TopologyError::CommandFailed {
+        let inner_pid_u32: u32 = inner_pid
+            .parse()
+            .map_err(|_| TopologyError::CommandFailed {
                 cmd: "parse pid".into(),
                 message: format!("invalid pid: {}", inner_pid),
-            }
-        })?;
+            })?;
 
         Ok((child, inner_pid_u32))
     }
@@ -570,12 +590,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_default_tunnel_mode_linux() {
-        assert!(matches!(default_tunnel_mode_for_testbed(), TunnelMode::Userspace));
+        assert!(matches!(
+            default_tunnel_mode_for_testbed(),
+            TunnelMode::Userspace
+        ));
     }
 
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_default_tunnel_mode_non_linux() {
-        assert!(matches!(default_tunnel_mode_for_testbed(), TunnelMode::Userspace));
+        assert!(matches!(
+            default_tunnel_mode_for_testbed(),
+            TunnelMode::Userspace
+        ));
     }
 }

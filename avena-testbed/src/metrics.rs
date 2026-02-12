@@ -145,6 +145,32 @@ impl MetricsLogger {
         });
     }
 
+    pub fn log_convergence_metric(
+        &self,
+        metric: &str,
+        link: &str,
+        from: &str,
+        to: &str,
+        underlay_up_ms: u64,
+        observed_ms: u64,
+        value_ms: u64,
+    ) {
+        self.log(MetricEvent {
+            timestamp_ms: self.elapsed_ms(),
+            event_type: "convergence_metric".to_string(),
+            node: None,
+            data: serde_json::json!({
+                "metric": metric,
+                "link": link,
+                "from": from,
+                "to": to,
+                "underlay_up_ms": underlay_up_ms,
+                "observed_ms": observed_ms,
+                "value_ms": value_ms
+            }),
+        });
+    }
+
     pub fn log_avenad_event(&self, node: &str, event_json: &str) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(event_json) {
             self.log(MetricEvent {
@@ -162,41 +188,51 @@ impl MetricsLogger {
         }
     }
 
-    pub fn log_parsed_events(&self, events: &[ParsedAvenadEvent], scenario_start: chrono::DateTime<chrono::Utc>) {
+    pub fn log_parsed_events(
+        &self,
+        events: &[ParsedAvenadEvent],
+        scenario_start: chrono::DateTime<chrono::Utc>,
+    ) {
         for event in events {
-            let timestamp_ms = event.timestamp
+            let timestamp_ms = event
+                .timestamp
                 .signed_duration_since(scenario_start)
                 .num_milliseconds()
                 .max(0) as u64;
 
             let (event_type, data) = match &event.event_type {
-                AvenadEventType::PeerDiscovered { peer_id, endpoint } => {
-                    ("peer_discovered", serde_json::json!({
+                AvenadEventType::PeerDiscovered { peer_id, endpoint } => (
+                    "peer_discovered",
+                    serde_json::json!({
                         "peer_id": peer_id,
                         "endpoint": endpoint
-                    }))
-                }
-                AvenadEventType::HandshakeStarted { peer_id } => {
-                    ("handshake_started", serde_json::json!({
+                    }),
+                ),
+                AvenadEventType::HandshakeStarted { peer_id } => (
+                    "handshake_started",
+                    serde_json::json!({
                         "peer_id": peer_id
-                    }))
-                }
-                AvenadEventType::PeerConnected { peer_id } => {
-                    ("peer_connected", serde_json::json!({
+                    }),
+                ),
+                AvenadEventType::PeerConnected { peer_id } => (
+                    "peer_connected",
+                    serde_json::json!({
                         "peer_id": peer_id
-                    }))
-                }
-                AvenadEventType::PeerDisconnected { peer_id, reason } => {
-                    ("peer_disconnected", serde_json::json!({
+                    }),
+                ),
+                AvenadEventType::PeerDisconnected { peer_id, reason } => (
+                    "peer_disconnected",
+                    serde_json::json!({
                         "peer_id": peer_id,
                         "reason": reason
-                    }))
-                }
-                AvenadEventType::Unknown { message } => {
-                    ("unknown_event", serde_json::json!({
+                    }),
+                ),
+                AvenadEventType::Unknown { message } => (
+                    "unknown_event",
+                    serde_json::json!({
                         "message": message
-                    }))
-                }
+                    }),
+                ),
             };
 
             self.log(MetricEvent {
@@ -248,7 +284,9 @@ pub struct LogParser {
 
 impl LogParser {
     pub fn new() -> Self {
-        Self { scenario_start: None }
+        Self {
+            scenario_start: None,
+        }
     }
 
     pub fn parse_log_file(&mut self, node_id: &str, path: &Path) -> Vec<ParsedAvenadEvent> {
@@ -331,7 +369,10 @@ impl LogParser {
     pub fn compute_metrics(&self, events: &[ParsedAvenadEvent]) -> AvenadMetrics {
         let mut metrics = AvenadMetrics::default();
 
-        let mut discovery_times: std::collections::HashMap<(String, String), chrono::DateTime<chrono::Utc>> = std::collections::HashMap::new();
+        let mut discovery_times: std::collections::HashMap<
+            (String, String),
+            chrono::DateTime<chrono::Utc>,
+        > = std::collections::HashMap::new();
 
         for event in events {
             match &event.event_type {
@@ -417,7 +458,8 @@ fn parse_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 fn extract_field(line: &str, prefix: &str) -> Option<String> {
     let start = line.find(prefix)? + prefix.len();
     let rest = &line[start..];
-    let end = rest.find(|c: char| c.is_whitespace() || c == ',' || c == ']' || c == ')')
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ',' || c == ']' || c == ')')
         .unwrap_or(rest.len());
     let value = rest[..end].to_string();
     if value.is_empty() {
@@ -440,15 +482,25 @@ mod tests {
         logger.log_scenario_started("test-scenario");
         logger.log_node_started("gateway", &"fd00::1".parse().unwrap());
         logger.log_link_changed("gateway-sensor", true);
+        logger.log_convergence_metric(
+            "underlay_up_to_first_peer_connected_ms",
+            "gateway-sensor",
+            "gateway",
+            "sensor",
+            100,
+            250,
+            150,
+        );
         logger.flush();
 
         let content = std::fs::read_to_string(temp.path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("scenario_started"));
         assert!(lines[1].contains("node_started"));
         assert!(lines[2].contains("link_changed"));
+        assert!(lines[3].contains("convergence_metric"));
     }
 
     #[test]
@@ -502,7 +554,9 @@ mod tests {
         let parser = LogParser::new();
         let events = vec![
             ParsedAvenadEvent {
-                timestamp: chrono::DateTime::parse_from_rfc3339("2025-12-10T21:41:10.000Z").unwrap().with_timezone(&chrono::Utc),
+                timestamp: chrono::DateTime::parse_from_rfc3339("2025-12-10T21:41:10.000Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
                 node: "nodeA".to_string(),
                 event_type: AvenadEventType::PeerDiscovered {
                     peer_id: "peer1".to_string(),
@@ -510,7 +564,9 @@ mod tests {
                 },
             },
             ParsedAvenadEvent {
-                timestamp: chrono::DateTime::parse_from_rfc3339("2025-12-10T21:41:10.100Z").unwrap().with_timezone(&chrono::Utc),
+                timestamp: chrono::DateTime::parse_from_rfc3339("2025-12-10T21:41:10.100Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
                 node: "nodeA".to_string(),
                 event_type: AvenadEventType::PeerConnected {
                     peer_id: "peer1".to_string(),

@@ -1,0 +1,191 @@
+% Chapter 7: Implementation
+% Contains: Components, Gossip Protocol, Data Flow Examples
+
+% ============================================================
+\section{Implementation Components}
+% ============================================================
+
+The three Avena subsystems (Overlay Network, Messaging Network, Fleet Management) are realized through the following software components.
+
+\subsection{avenad (Device Daemon)}
+
+The avenad daemon runs on every Avena device. Configuration is via TOML file (default: \texttt{/etc/avena/avenad.toml}).
+
+\textbf{Default configuration:}
+
+\begin{lstlisting}[language=Rust]
+struct AvenadConfig {
+    tunnel_mode: TunnelMode,        // default: Kernel
+    underlay: UnderlayConfig,       // physical interface filtering
+    wireguard: WireguardConfig,     // port allocation
+    persistent_keepalive: u16,      // default: 25 seconds
+    dead_peer_timeout_secs: u64,    // default: 180 seconds
+    keypair_path: Option<PathBuf>,  // optional: persist device identity
+    network: NetworkConfig,         // default: fd00:a0e0:a000::/48
+    discovery: DiscoveryConfig,     // mDNS enabled by default
+    routing: RoutingConfig,         // babeld configuration
+    root_cert_path: PathBuf,        // required: trusted CA
+    device_cert_path: PathBuf,      // required: device certificate
+}
+
+struct UnderlayConfig {
+    // Glob patterns for interfaces to include (e.g., "wlan*", "eth*")
+    include: Vec<String>,           // default: ["wlan*", "wwan*", "eth*", "enp*"]
+    // Glob patterns for interfaces to exclude (takes precedence)
+    exclude: Vec<String>,           // default: ["docker*", "veth*", "virbr*", "br-*"]
+}
+
+struct WireguardConfig {
+    port_range_start: u16,          // default: 51820
+    port_range_end: u16,            // default: 52820
+    handshake_port_offset: u16,     // default: 1000 (handshake = wg_port + offset)
+}
+
+struct RoutingConfig {
+    babel_binary: PathBuf,          // default: /usr/sbin/babeld
+    babel_socket: PathBuf,          // default: /run/avena/babel.sock
+    hello_interval_ms: u32,         // default: 4000
+    update_interval_ms: u32,        // default: 16000
+}
+\end{lstlisting}
+
+\textbf{Interface naming:} WireGuard interfaces are named \texttt{av-<hash8>} where \texttt{<hash8>} is the first 8 characters of a hash derived from \texttt{(local\_device\_id, peer\_device\_id, underlay\_name)}. This keeps names short while ensuring uniqueness.
+
+\textbf{Port allocation:} Each WireGuard interface requires a UDP listen port. Ports are allocated deterministically from the configured range using a hash of the interface name, ensuring consistency across restarts.
+
+The avenad daemon implements all three subsystems:
+
+\textbf{Overlay Network responsibilities:} Underlay Monitoring (netlink events for interface up/down); Peer Discovery (mDNS/DNS-SD per underlay, configured endpoints, LoRa presence); Tunnel Management (certificate exchange, Wireguard key derivation, per-peer-per-underlay interface creation); Routing (babeld in unicast mode); LoRa Channel (presence beacons, gossip updates).
+
+\textbf{Messaging Network responsibilities:} NATS Endpoint (local NATS-compatible API); Interest Management (validation, gossip propagation, tombstones); Message Routing (cost-aware path selection, store-and-forward, deduplication); Geo-Spatial Filtering.
+
+\textbf{Fleet Management responsibilities:} Identity Management (Ed25519 keypair, Device ID); Certificate Management (storage, validation, trust); State Synchronization (CRDT store, gossip protocol); Workload Reconciliation (quadlet configs, container lifecycle); Sidecar Management (spawn avena-sidecar for Addressable workloads, derive keys, push peer updates); Nested Avena Support (derived keypairs for workload\_spawner role).
+
+\subsection{avenactl (CLI Tool)}
+
+Command-line interface for operators: Context Management (connection profiles); Device Operations (list, ping, status, inspect); Workload Management (apply, delete, start/stop, logs); Certificate Management (issue, revoke); Network Diagnostics (links, routes, gossip state, tunnel status).
+
+\subsection{avena-overlay (Library)}
+
+Shared Rust library providing the overlay network foundation:
+
+\begin{lstlisting}[language=Rust]
+// Module structure
+pub mod identity;     // DeviceId, DeviceKeypair, derived keypairs
+pub mod address;      // NetworkConfig, IPv6 address derivation
+pub mod crypto;       // Handshake, certificates, key derivation
+pub mod discovery;    // mDNS, static peers, DiscoveryService
+pub mod tunnel;       // TunnelBackend trait, PeerConfig
+pub mod wg;           // WireGuard kernel/userspace implementations
+pub mod routing;      // BabeldController, unicast config
+pub mod underlay;     // UnderlayManager, netlink monitoring
+pub mod daemon;       // AvenadConfig, PeerState
+
+// Key types re-exported at crate root
+pub use identity::{DeviceId, DeviceKeypair};
+pub use address::NetworkConfig;
+pub use crypto::{HandshakeMessage, EphemeralKeypair, CertValidator};
+pub use discovery::{DiscoveryService, DiscoveredPeer, Capability};
+pub use tunnel::{TunnelBackend, PeerConfig, TunnelError};
+pub use routing::BabeldController;
+pub use underlay::UnderlayManager;
+\end{lstlisting}
+
+\textbf{Dependencies:} \texttt{ed25519-dalek}, \texttt{x25519-dalek}, \texttt{sha2}, \texttt{hkdf}, \texttt{jsonwebtoken}, \texttt{mdns-sd}, \texttt{tokio}, \texttt{netlink-packet-wireguard} (Linux).
+
+\subsection{avena-sidecar (Network Sidecar)}
+
+Lightweight container for Addressable-mode workloads. The host avenad spawns avena-sidecar alongside workloads that require direct overlay IP connectivity.
+
+\textbf{Responsibilities:} Wireguard endpoint management (userspace implementation); identity handling (derived keys from host); peer configuration (receives updates from host avenad); tunnel establishment with remote peers.
+
+\textbf{Non-responsibilities:} Peer discovery (host handles); Babel routing (host handles); gossip participation (host handles). The sidecar is intentionally minimal---it manages only the workload's Wireguard interfaces.
+
+\textbf{Communication with host:} The sidecar connects to the host's NATS endpoint using a JWT issued by avenad. The JWT scopes the sidecar's permissions to its control subject (\texttt{avena.sidecar.<workload-id>.control}). When the host learns of new peers (via gossip), it publishes peer configuration updates to the sidecar's control subject.
+
+% ============================================================
+\section{Gossip Protocol}
+% ============================================================
+
+\subsection{Synchronization Protocol}
+
+Upon connection between devices $d_1$ and $d_2$:
+
+\textbf{Phase 1 (Authentication):} Exchange certificates $\text{cert}(d_1)$, $\text{cert}(d_2)$. Verify certificate chains to trusted root. Establish Wireguard tunnel; Babel routes converge.
+
+\textbf{Phase 2 (Digest Exchange):} $d_1$ sends state digest: vector of (collection\_id, version\_vector) pairs. $d_2$ sends state digest similarly.
+
+\textbf{Phase 3 (Reconciliation):} For each CRDT collection where digests differ: exchange deltas needed for convergence; verify signatures on received entries; verify issuer certificates authorize the entries; apply CRDT merge operations to local state.
+
+\textbf{Phase 4 (Store-and-Forward):} For each pending application message $m$ with interest $i$ in outbox: determine if peer can deliver $m$ closer to $\text{owner}(i)$ based on relay policies; if so, forward $m$ to peer; peer acknowledges receipt; remove acknowledged messages from local outbox if no other interests require them.
+
+% ============================================================
+\section{Data Flow Examples}
+% ============================================================
+
+\subsection{Workload Deployment via Mobile Relay}
+
+\begin{Verbatim}[frame=single,fontsize=\small]
+Operator          Gateway            Tractor              Sensor
+   |                 |                  |                    |
+   | apply workload ->                  |                    |
+   | selector: sensor                   |                    |
+   |                 |                  |                    |
+   |                 | store + queue    |                    |
+   |                 | (sensor offline) |                    |
+   |                 |                  |                    |
+   |                 |<-- tractor ------+                    |
+   |                 |    connects      |                    |
+   |                 |                  |                    |
+   |                 | gossip sync ---->|                    |
+   |                 | (workload spec)  |                    |
+   |                 |                  |                    |
+   |                 |    tractor moves to field            |
+   |                 |                  |                    |
+   |                 |                  |<--- sensor in ---->|
+   |                 |                  |     LoRa range     |
+   |                 |                  |                    |
+   |                 |                  | gossip sync ------>|
+   |                 |                  | (workload spec)    |
+   |                 |                  |                    |
+   |                 |                  |        deploy ---->|
+\end{Verbatim}
+
+\subsection{LoRa-Assisted Convergence}
+
+\begin{Verbatim}[frame=single,fontsize=\small]
+Sensor (LoRa + WiFi)        Gateway (LoRa + WiFi)
+        |                            |
+        | presence (LoRa) ---------->|
+        | "sensor online,            |
+        |  have data for app.soil"   |
+        |                            |
+        |                            | prepare: 
+        |                            | queue workload update
+        |                            | for sensor
+        |                            |
+        |<-------- WiFi establishes --|
+        |                            |
+        |<-- immediate gossip sync --|
+        |    (workload already queued)
+        |                            |
+        |-- data transfer ---------->|
+\end{Verbatim}
+
+\subsection{V2X Emergency Preemption}
+
+\begin{Verbatim}[frame=single,fontsize=\small]
+Ambulance           RSU/Signal          Passenger Vehicle
+    |                   |                      |
+    | publish preempt ->|                      |
+    | (geo: within      |                      |
+    |  500ft of signal) |                      |
+    |                   |                      |
+    |                   | adjust timing        |
+    |                   |                      |
+    |                   | broadcast preempt -->|
+    |                   | notification         |
+    |                   |                      |
+    |                   |              vehicle adjusts
+\end{Verbatim}
+

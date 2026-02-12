@@ -28,8 +28,11 @@ impl DeviceId {
     }
 
     pub fn from_base32(s: &str) -> Result<Self, DecodeError> {
-        let bytes = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &s.to_uppercase())
-            .ok_or_else(|| DecodeError::InvalidBase32(s.to_string()))?;
+        let bytes = base32::decode(
+            base32::Alphabet::Rfc4648 { padding: false },
+            &s.to_uppercase(),
+        )
+        .ok_or_else(|| DecodeError::InvalidBase32(s.to_string()))?;
 
         if bytes.len() != 16 {
             return Err(DecodeError::InvalidLength(bytes.len()));
@@ -64,7 +67,7 @@ impl fmt::Display for DeviceId {
 impl fmt::Debug for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let b32 = self.to_base32();
-        write!(f, "DeviceId({}...{})", &b32[..4], &b32[b32.len()-4..])
+        write!(f, "DeviceId({}...{})", &b32[..4], &b32[b32.len() - 4..])
     }
 }
 

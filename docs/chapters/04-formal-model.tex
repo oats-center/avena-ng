@@ -1,0 +1,287 @@
+% Chapter 4: Formal State Model
+% Contains: Device Identity, Network Topology, Cost Model, HLC, CRDTs
+
+\section{Formal State Model}
+% ============================================================
+
+This section provides the formal definitions underlying Avena's distributed state management.
+
+\subsection{Device Identity}
+
+Let $\mathbf{D}$ denote the set of Avena devices. Each device $d \in \mathbf{D}$ possesses:
+\begin{itemize}
+    \item A keypair $(sk_d, pk_d)$ where $sk_d$ is an Ed25519 private key and $pk_d$ is the corresponding public key
+    \item Identity $\text{id}(d) = H(pk_d)$ where $H$ is SHA-256 truncated to 128 bits (16 bytes), encoded as lowercase Base32 (RFC 4648, no padding)
+    \item A certificate $\text{cert}(d)$ binding the public key to authorized capabilities
+\end{itemize}
+
+Devices form a containment hierarchy. Define the relation $d_1 \prec d_2$ (``$d_1$ is contained in $d_2$'') when $d_1$ is a nested Avena instance spawned by $d_2$. The transitive closure $\prec^*$ defines ancestral containment.
+
+Each device $d$ has associated metadata:
+\begin{itemize}
+    \item $\text{roles}(d) \subseteq \Sigma_r$, a set of role labels
+    \item $\text{labels}(d) : \Sigma_k \to \Sigma_v$, a partial function from label keys to values
+    \item $\text{scope}(d) \subseteq \mathcal{P}(\Sigma_s)$, permitted message subjects as a set of patterns
+\end{itemize}
+
+\textbf{Capability attenuation:} For nested devices, $\text{scope}(d_1) \subseteq \text{scope}(d_2)$ whenever $d_1 \prec d_2$.
+
+\subsection{Network Topology}
+
+The network is modeled as a time-varying dual-channel graph $G(t) = (D, E_h(t), E_l(t))$ where:
+\begin{itemize}
+    \item $E_h(t) \subseteq D \times D$ is the set of active high-rate links (Wireguard tunnels) at time $t$
+    \item $E_l(t) \subseteq D \times D$ is the set of active low-rate links (LoRa) at time $t$
+\end{itemize}
+
+\begin{definition}[Message Relay]
+Device $d$ will relay application message $m$ for interest $i$ if:
+\begin{itemize}
+    \item $\text{relay}(d) = \text{None} \Rightarrow d$ is the interest owner
+    \item $\text{relay}(d) = \text{Priority}(p) \Rightarrow \text{priority}(i) \geq p$
+    \item $\text{relay}(d) = \text{Full} \Rightarrow$ always relay
+    \item $\text{relay}(d) = \text{Subjects}(P) \Rightarrow \text{pattern}(i)$ matches some pattern in $P$
+\end{itemize}
+\end{definition}
+
+\begin{definition}[$T$-Connectivity]
+The network is $(T, i)$-connected for interest $i$ if for all device pairs (publisher, subscriber) where the subscriber holds $i$, and all times $\tau_0$, there exists a temporal admissible path completing within time $T$.
+\end{definition}
+
+\subsection{Cost Model}
+\label{sec:costmodel}
+
+Each device $d$ maintains cost metadata $c(d)$ propagated via gossip:
+
+\begin{lstlisting}[language=Rust]
+struct CostMetadata {
+    device_id: DeviceId,
+    timestamp: HLC,
+    
+    // Node state
+    battery_fraction: Option<f32>,  // (0.0, 1.0] or None for wall-powered
+    storage_available_mb: u32,
+    queue_depth: u32,
+    
+    // Per-neighbor link costs
+    links: HashMap<DeviceId, LinkCost>,
+}
+
+struct LinkCost {
+    latency_ms: u32,
+    bandwidth_kbps: u32,
+    loss_percent: f32,
+    dollar_cost_per_mb: Option<u32>,
+    energy_cost_per_mb: Option<u32>,
+}
+\end{lstlisting}
+
+Note: \texttt{battery\_fraction} is bounded to be strictly positive (the interval $(0.0, 1.0]$) because a device with zero battery cannot transmit messages.
+
+\textbf{Cost function:} For message $m$ with interest $i$ traversing edge $(d_1, d_2)$:
+
+\begin{equation}
+\text{cost}(m, i, d_1, d_2) = \sum_j w_j \cdot f_j(m, i, d_1, d_2, c(d_1), c(d_2))
+\end{equation}
+
+Component functions:
+\begin{align}
+f_{\text{latency}} &= \text{latency}(d_1, d_2) \\
+f_{\text{dollar}} &= \text{dollar\_cost}(d_1, d_2) \cdot \text{size}(m) \\
+f_{\text{energy}} &= \frac{\text{energy\_cost}(d_1, d_2) \cdot \text{size}(m)}{\text{battery}(d_1)} \\
+f_{\text{queue}} &= \frac{\text{queue\_depth}(d_1)}{\text{bandwidth}(d_1, d_2)} \\
+f_{\text{priority}} &= (\text{max\_priority} - \text{priority}(i)) \cdot \text{latency}(d_1, d_2)
+\end{align}
+
+Weights $w_j$ are configurable at network level (fleet policy) and device level (local constraints). When cost metadata is stale or unavailable, routing falls back to Babel shortest path.
+
+\subsubsection{Cost Profiles}
+
+Rather than requiring manual weight tuning, Avena provides preset profiles for common deployment scenarios:
+
+\begin{lstlisting}[language=Rust]
+enum CostProfile {
+    Balanced,          // Default: equal weight to all factors
+    EnergyConstrained, // Solar/battery: prioritize energy conservation
+    CostSensitive,     // Metered cellular: minimize dollar cost
+    LatencyCritical,   // V2X/real-time: minimize latency, ignore cost
+}
+\end{lstlisting}
+
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Profile} & $w_{\text{latency}}$ & $w_{\text{dollar}}$ & $w_{\text{energy}}$ & $w_{\text{queue}}$ \\
+\midrule
+Balanced & 1.0 & 1.0 & 1.0 & 1.0 \\
+EnergyConstrained & 0.5 & 0.5 & 3.0 & 1.0 \\
+CostSensitive & 0.5 & 3.0 & 0.5 & 1.0 \\
+LatencyCritical & 3.0 & 0.1 & 0.1 & 2.0 \\
+\bottomrule
+\end{tabular}
+
+Profiles are set at fleet level. Individual interests can override the fleet profile:
+
+\begin{lstlisting}[language=Rust]
+Interest {
+    subject: "v2x.bsm.>",
+    priority: Priority::High,
+    cost_profile: Some(CostProfile::LatencyCritical),
+    // ...
+}
+\end{lstlisting}
+
+\subsection{Hybrid Logical Clocks}
+
+Each device maintains a hybrid logical clock (HLC) consisting of:
+\begin{itemize}
+    \item $\text{wall} : \mathbb{N}$ (wall-clock time in milliseconds)
+    \item $\text{counter} : \mathbb{N}$ (logical counter for sub-millisecond ordering)
+    \item $\text{node} : D$ (node identifier for tie-breaking)
+\end{itemize}
+
+\textbf{HLC Operations:}
+
+\begin{lstlisting}[language=Rust]
+fn tick(hlc: &mut HLC) {
+    let pt = physical_time();
+    if pt > hlc.wall {
+        hlc.wall = pt;
+        hlc.counter = 0;
+    } else {
+        hlc.counter += 1;
+    }
+}
+
+fn send(hlc: &mut HLC, message: &mut Message) {
+    tick(hlc);
+    message.hlc = hlc.clone();
+}
+
+fn receive(hlc_local: &mut HLC, message: &Message) {
+    let hlc_remote = &message.hlc;
+    let pt = physical_time();
+    if pt > hlc_local.wall && pt > hlc_remote.wall {
+        hlc_local.wall = pt;
+        hlc_local.counter = 0;
+    } else if hlc_remote.wall > hlc_local.wall {
+        hlc_local.wall = hlc_remote.wall;
+        hlc_local.counter = hlc_remote.counter + 1;
+    } else if hlc_local.wall > hlc_remote.wall {
+        hlc_local.counter += 1;
+    } else {  // equal wall times
+        hlc_local.counter = max(hlc_local.counter, hlc_remote.counter) + 1;
+    }
+}
+\end{lstlisting}
+
+\textbf{Total ordering:} Define $\text{hlc}_1 < \text{hlc}_2$ iff:
+\begin{itemize}
+    \item $\text{wall}(\text{hlc}_1) < \text{wall}(\text{hlc}_2)$, or
+    \item $\text{wall}(\text{hlc}_1) = \text{wall}(\text{hlc}_2) \land \text{counter}(\text{hlc}_1) < \text{counter}(\text{hlc}_2)$, or
+    \item $\text{wall}(\text{hlc}_1) = \text{wall}(\text{hlc}_2) \land \text{counter}(\text{hlc}_1) = \text{counter}(\text{hlc}_2) \land \text{node}(\text{hlc}_1) < \text{node}(\text{hlc}_2)$
+\end{itemize}
+
+\subsection{CRDT State Model}
+
+Avena uses conflict-free replicated data types (CRDTs) to ensure convergence without coordination. Each state component uses a specific CRDT type:
+
+\textbf{Device Registry:} OR-Map$\langle$DeviceId, DeviceInfo$\rangle$
+
+Each DeviceInfo is a struct where fields use LWW-Register semantics with HLC timestamps:
+
+\begin{lstlisting}[language=Rust]
+struct DeviceInfo {
+    id: DeviceId,
+    public_key: Ed25519PublicKey,
+    roles: LWWRegister<Set<Role>>,
+    labels: LWWRegister<Map<String, String>>,
+    position: LWWRegister<Option<GeoPosition>>,
+    certificate: LWWRegister<Certificate>,
+    // ... additional fields
+}
+\end{lstlisting}
+
+\textbf{Merge operation:} For two DeviceInfo values with the same id:
+\[
+\text{merge}(a, b).\text{field} = 
+\begin{cases}
+a.\text{field} & \text{if } a.\text{field.hlc} > b.\text{field.hlc} \\
+b.\text{field} & \text{otherwise}
+\end{cases}
+\]
+
+\textbf{Workload Specifications:} OR-Map$\langle$WorkloadId, WorkloadSpec$\rangle$ with field-level LWW-Register merge.
+
+\textbf{Active Interests:} OR-Set$\langle$Interest$\rangle$ with add-wins semantics:
+
+\begin{lstlisting}[language=Rust]
+struct InterestSet {
+    // Each interest identified by (owner_device, interest_id)
+    // Tombstones represent terminated interests
+    entries: Map<(DeviceId, InterestId), InterestEntry>,
+}
+
+struct InterestEntry {
+    interest: Interest,
+    hlc: HLC,
+    terminated: bool,  // true = tombstone
+}
+\end{lstlisting}
+
+\textbf{Cost Metadata:} Map$\langle$DeviceId, LWWRegister$\langle$CostMetadata$\rangle\rangle$ (single-writer per device).
+
+\textbf{Convergence Property:} Under $(T, i)$-connectivity, and assuming all clocks have bounded drift $\delta$, any gossip state update at time $\tau_0$ propagates to all devices by time $\tau_0 + T$. CRDT semantics ensure that all devices converge to the same state regardless of propagation order.
+
+\subsection{Tombstone Management}
+
+Terminated interests and deleted workloads are represented as tombstones rather than removed from the CRDT. This prevents ``resurrection'' where a delete fails to propagate to a replica that still holds the original entry.
+
+\textbf{Tombstone lifecycle:}
+\begin{enumerate}
+    \item Entry marked as terminated with new HLC timestamp
+    \item Tombstone propagates via gossip like any other update
+    \item Tombstones retained for TTL period (default 6--12 months)
+    \item After TTL, tombstones eligible for garbage collection
+    \item GC events broadcast via gossip to coordinate cleanup
+\end{enumerate}
+
+\textbf{Resurrection edge case:} If a device rejoins the network after being offline longer than the tombstone TTL, it may attempt to re-propagate entries that were deleted. Defense: devices compare entry HLC against a ``minimum valid HLC'' threshold that advances with time. Entries with HLC older than the threshold are rejected.
+
+\textbf{Formal GC condition:} An entry $e$ with tombstone timestamp $ts$ can be garbage collected at device $d$ at time $t$ if:
+\[
+t - ts > \text{TTL} \land \forall d' \in D : d' \text{ has received } e.\text{tombstone}
+\]
+
+The second condition is approximated by waiting for TTL to exceed expected maximum propagation time under worst-case connectivity.
+
+\subsection{Local State Structure}
+
+Each device $d$ maintains:
+
+\begin{lstlisting}[language=Rust]
+struct LocalState {
+    // Gossip state (CRDT-based)
+    gossip: GossipState,
+    
+    // Application message queues (not CRDT)
+    messages: MessageState,
+    
+    // Local HLC
+    clock: HLC,
+}
+
+struct GossipState {
+    workloads: ORMap<WorkloadId, WorkloadSpec>,
+    devices: ORMap<DeviceId, DeviceInfo>,
+    cost_metadata: Map<DeviceId, LWWRegister<CostMetadata>>,
+    interests: ORSet<Interest>,
+    time_services: ORMap<DeviceId, TimeServiceInfo>,
+}
+
+struct MessageState {
+    pending_outbound: PriorityQueue<(Subject, Message, InterestId)>,
+    pending_inbound: PriorityQueue<(Message, InterestId)>,
+    delivered: BoundedSet<(Subject, HLC)>,  // for deduplication
+}
+\end{lstlisting}
+

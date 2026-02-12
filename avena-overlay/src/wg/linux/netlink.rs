@@ -5,8 +5,8 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use netlink_packet_core::{
-    NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable,
-    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+    NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable, NLM_F_ACK,
+    NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
 };
 use netlink_packet_generic::{
     ctrl::{nlas::GenlCtrlAttrs, GenlCtrl, GenlCtrlCmd},
@@ -110,9 +110,7 @@ where
                 NetlinkPayload::Error(msg) => {
                     return match msg.to_io().kind() {
                         ErrorKind::AlreadyExists => Ok(responses),
-                        ErrorKind::NotFound => {
-                            Err(WgError::InterfaceNotFound("not found".into()))
-                        }
+                        ErrorKind::NotFound => Err(WgError::InterfaceNotFound("not found".into())),
                         ErrorKind::PermissionDenied => {
                             Err(WgError::PermissionDenied("operation not permitted".into()))
                         }
@@ -351,11 +349,7 @@ fn peer_as_nlas(ifname: &str, peer: &Peer) -> Vec<WgDeviceAttrs> {
 
     attrs.push(WgPeerAttrs::Flags(WGPEER_F_REPLACE_ALLOWEDIPS));
 
-    let allowed_ips: Vec<WgAllowedIp> = peer
-        .allowed_ips
-        .iter()
-        .map(ip_addr_mask_to_nlas)
-        .collect();
+    let allowed_ips: Vec<WgAllowedIp> = peer.allowed_ips.iter().map(ip_addr_mask_to_nlas).collect();
     attrs.push(WgPeerAttrs::AllowedIps(allowed_ips));
 
     vec![

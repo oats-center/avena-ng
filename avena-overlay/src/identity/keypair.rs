@@ -15,14 +15,20 @@ impl DeviceKeypair {
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
         let device_id = DeviceId::from_public_key(&signing_key.verifying_key());
-        Self { signing_key, device_id }
+        Self {
+            signing_key,
+            device_id,
+        }
     }
 
     /// Deterministically create a device identity from a seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(seed);
         let device_id = DeviceId::from_public_key(&signing_key.verifying_key());
-        Self { signing_key, device_id }
+        Self {
+            signing_key,
+            device_id,
+        }
     }
 
     pub fn device_id(&self) -> DeviceId {
@@ -54,7 +60,6 @@ impl DeviceKeypair {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,7 +82,10 @@ mod tests {
         let keypair2 = DeviceKeypair::from_seed(&seed);
 
         assert_eq!(keypair1.device_id(), keypair2.device_id());
-        assert_eq!(keypair1.public_key().to_bytes(), keypair2.public_key().to_bytes());
+        assert_eq!(
+            keypair1.public_key().to_bytes(),
+            keypair2.public_key().to_bytes()
+        );
     }
 
     #[test]
@@ -103,7 +111,10 @@ mod tests {
         let restored = DeviceKeypair::from_bytes(&bytes);
 
         assert_eq!(original.device_id(), restored.device_id());
-        assert_eq!(original.public_key().to_bytes(), restored.public_key().to_bytes());
+        assert_eq!(
+            original.public_key().to_bytes(),
+            restored.public_key().to_bytes()
+        );
     }
 
     #[test]
@@ -122,7 +133,10 @@ mod tests {
         let wrong_message = b"tampered message";
 
         let signature = keypair.sign(message);
-        assert!(keypair.public_key().verify(wrong_message, &signature).is_err());
+        assert!(keypair
+            .public_key()
+            .verify(wrong_message, &signature)
+            .is_err());
     }
 
     #[test]

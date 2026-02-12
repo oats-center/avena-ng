@@ -26,7 +26,10 @@ pub enum HandshakeError {
     #[error("signature verification failed")]
     InvalidSignature,
     #[error("peer ID mismatch: expected {expected}, got {actual}")]
-    PeerIdMismatch { expected: DeviceId, actual: DeviceId },
+    PeerIdMismatch {
+        expected: DeviceId,
+        actual: DeviceId,
+    },
     #[error("message expired: timestamp {timestamp_secs}s, now {now_secs}s")]
     Expired { timestamp_secs: u64, now_secs: u64 },
     #[error("message from the future: timestamp {timestamp_secs}s, now {now_secs}s")]
@@ -493,10 +496,18 @@ mod tests {
         );
 
         assert!(alice_msg
-            .verify(&alice_device.public_key(), &bob_device.device_id(), &validator)
+            .verify(
+                &alice_device.public_key(),
+                &bob_device.device_id(),
+                &validator
+            )
             .is_ok());
         assert!(bob_msg
-            .verify(&bob_device.public_key(), &alice_device.device_id(), &validator)
+            .verify(
+                &bob_device.public_key(),
+                &alice_device.device_id(),
+                &validator
+            )
             .is_ok());
 
         let alice_keys = derive_session_keys(&alice_ephemeral, &bob_msg.ephemeral_public_key());

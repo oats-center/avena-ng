@@ -299,7 +299,9 @@ impl CertValidator {
 
         let now = Utc::now().timestamp();
         if now > cached.exp {
-            return Err(CertError::Expired(Utc.timestamp_opt(cached.exp, 0).unwrap()));
+            return Err(CertError::Expired(
+                Utc.timestamp_opt(cached.exp, 0).unwrap(),
+            ));
         }
 
         self.verify_chain_to_root(&cached.issuer_id, depth + 1)
@@ -412,12 +414,7 @@ mod tests {
         validator.cache_cert(&intermediate_jwt).unwrap();
 
         let device = DeviceKeypair::generate();
-        let device_jwt = issue_jwt(
-            &intermediate,
-            device.device_id(),
-            device.public_key(),
-            365,
-        );
+        let device_jwt = issue_jwt(&intermediate, device.device_id(), device.public_key(), 365);
 
         let claims = validator.validate_cert(&device_jwt).unwrap();
         assert_eq!(claims.device_id().unwrap(), device.device_id());
@@ -437,12 +434,7 @@ mod tests {
         );
 
         let device = DeviceKeypair::generate();
-        let device_jwt = issue_jwt(
-            &intermediate,
-            device.device_id(),
-            device.public_key(),
-            365,
-        );
+        let device_jwt = issue_jwt(&intermediate, device.device_id(), device.public_key(), 365);
 
         let result = validator.validate_cert(&device_jwt);
         assert!(matches!(result, Err(CertError::IssuerNotFound(_))));

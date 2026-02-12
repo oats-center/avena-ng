@@ -1,0 +1,90 @@
+% Chapter 3: Messaging and State Synchronization
+% Contains: Messaging Network, Gossip, State Sync
+
+% ============================================================
+\section{Avena Messaging Network}
+\label{sec:messaging}
+% ============================================================
+
+The Avena Messaging Network provides subject-based pub/sub with delay-tolerant delivery, built atop the Overlay Network. It is the primary interface for application communication.
+
+\subsection{Transparent API}
+
+Applications interact with the Messaging Network through a NATS-compatible API:
+
+\begin{lstlisting}[language=Rust]
+// Identical code on edge or cloud
+client.publish("app.telemetry.soil", &reading).await?;
+client.subscribe("avena.control.workload.>").await?;
+\end{lstlisting}
+
+Workloads connect to a local NATS-compatible endpoint provided by avenad. Interests are created at runtime when workloads issue subscribe calls. avenad validates these interests against the workload's \texttt{permitted\_subscribe} scope and propagates valid interests via gossip.
+
+\subsection{Relay Policies}
+
+Each device's signed specification includes its relay policy:
+
+\begin{lstlisting}[language=Rust]
+enum RelayPolicy {
+    None,                           // Endpoint only
+    Priority { min_priority: u8 },  // Forward priority >= min
+    Full,                           // Forward all traffic
+    Subjects { patterns: Vec<SubjectPattern> },  // Forward matching
+}
+\end{lstlisting}
+
+Relay policies affect \emph{application message} routing, not gossip state propagation. All gossip state (including interests) propagates to all devices regardless of relay policy.
+
+\subsection{Cost-Aware Routing}
+
+When multiple paths exist, routing considers message priority (derived from interest), link properties (latency, bandwidth, loss, monetary cost, energy cost), and node properties (battery level, queue depth). The cost function is formally defined in Section~\ref{sec:costmodel}.
+
+\subsection{Store-and-Forward}
+
+When subscribers are unreachable, messages buffer at intermediate nodes whose relay policy permits forwarding. Delivery occurs when connectivity is established---directly or via mobile relay. Unlike flooding-based DTN, Avena uses gossip-derived network knowledge to select specific relay routes.
+
+\textbf{Multi-route delivery:} A single message may match multiple interests owned by different devices. Each relay node processes received messages and routes them toward all matching interest owners. When multiple interests share a common next-hop, the message is sent once. When interests diverge to different paths, the message branches.
+
+\textbf{Buffer management:} Store-and-forward buffer management at relay nodes follows established DTN practices. The initial implementation delegates to a pluggable DTN bundle protocol implementation (e.g., IBR-DTN, DTN7) which provides buffer limits, eviction policies (typically priority-aware with oldest-first within priority class), and custody transfer semantics.
+
+\textbf{Message deduplication:} Messages are uniquely identified by (subject, HLC). Relay nodes and subscribers maintain a bounded set of recently-seen message identifiers. When a message arrives via multiple paths, duplicates are detected and dropped. The deduplication window should exceed expected maximum network delay; stale entries are evicted based on HLC age.
+
+\subsection{Channel Selection}
+
+Application data flows over the high-rate channel. Gossip topology and cost metadata prefer the low-rate (LoRa) channel. Critical control messages use both channels for redundancy.
+
+% ============================================================
+\section{State Synchronization (Gossip)}
+\label{sec:gossip}
+% ============================================================
+
+The gossip layer propagates distributed state as a \textbf{fully replicated global state} using conflict-free replicated data types (CRDTs). All gossip state propagates to all devices; there is no interest-based filtering at the gossip layer. Relay policies only affect application message routing.
+
+\textbf{Two data categories flow through Avena:}
+
+\begin{enumerate}
+    \item \textbf{Gossip state} --- Replicated data maintaining distributed system consistency (device registry, workload specs, cost metadata, active interests, time service locations). Uses CRDT merge semantics with HLC ordering. Propagates to all devices.
+    
+    \item \textbf{Application messages} --- Pub/sub messages from publishers to subscribers (telemetry, control commands, application data). Have delivery semantics (retention, ordering, TTL) but are delivered, not merged. Routing filtered by relay policies.
+\end{enumerate}
+
+The gossip protocol synchronizes gossip state to all devices using CRDT merge operations. The message routing layer (Layer 2) delivers application messages to subscribers whose interests have been learned via gossip.
+
+\textbf{Priority and routing semantics:} Message priority derives from the interest that requested the data, not from the message itself. Publishers emit to subjects; when interests for those subjects are learned via gossip, messages route according to the interest's priority. Publishers may cache messages locally (best-effort, bounded buffer) until interests are known.
+
+\textbf{Interest lifecycle:} Interests are created at runtime via the NATS-compatible API:
+\begin{enumerate}
+    \item Workload starts and connects to local NATS endpoint
+    \item Workload issues subscribe calls via NATS API
+    \item avenad validates interests against workload's \texttt{permitted\_subscribe} scope
+    \item Valid interests propagate via gossip to all devices
+    \item Publishers learn of interests and begin message routing
+    \item Workload terminates or unsubscribes $\rightarrow$ avenad marks interests as terminated (tombstone)
+    \item Termination propagates via gossip; nodes stop routing for terminated interests
+\end{enumerate}
+
+\textbf{Interest re-gossip:} When an interest propagates back to its originating device via gossip, avenad checks whether it remains active. If the workload has terminated or unsubscribed, avenad issues a tombstone with updated HLC. This ensures stale interests are eventually cleaned up.
+
+\textbf{Dual-channel gossip:} Topology, cost metadata, and interest updates (small, critical) use both channels. Workload specs (larger) use high-rate only.
+
+% ============================================================

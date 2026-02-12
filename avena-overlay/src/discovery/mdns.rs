@@ -9,29 +9,29 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-use super::{
-    Capability, DiscoveredPeer, DiscoveryError, DiscoverySource, LocalAnnouncement,
-};
+use super::{Capability, DiscoveredPeer, DiscoveryError, DiscoverySource, LocalAnnouncement};
 
 const SERVICE_TYPE: &str = "_avena._udp.local.";
 const TXT_AVENA_ID: &str = "avena-id";
 const TXT_WG_ENDPOINT: &str = "wg-endpoint";
 const TXT_CAPABILITIES: &str = "cap";
 
-#[expect(missing_debug_implementations, reason = "ServiceDaemon does not implement Debug")]
+#[expect(
+    missing_debug_implementations,
+    reason = "ServiceDaemon does not implement Debug"
+)]
 pub struct MdnsDiscovery {
     daemon: ServiceDaemon,
 }
 
 impl MdnsDiscovery {
     pub fn new(interfaces: &[String]) -> Result<Self, DiscoveryError> {
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
+        let daemon = ServiceDaemon::new().map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
 
         for if_name in interfaces {
-            daemon
-                .enable_interface(if_name)
-                .map_err(|e| DiscoveryError::Mdns(format!("failed to bind to interface {}: {}", if_name, e)))?;
+            daemon.enable_interface(if_name).map_err(|e| {
+                DiscoveryError::Mdns(format!("failed to bind to interface {}: {}", if_name, e))
+            })?;
             debug!(interface = if_name, "mDNS bound to interface");
         }
 
@@ -52,7 +52,10 @@ impl MdnsDiscovery {
 
         let mut properties = vec![
             (TXT_AVENA_ID.to_string(), announcement.device_id.to_base32()),
-            (TXT_WG_ENDPOINT.to_string(), announcement.wg_endpoint.to_string()),
+            (
+                TXT_WG_ENDPOINT.to_string(),
+                announcement.wg_endpoint.to_string(),
+            ),
         ];
 
         if !announcement.capabilities.is_empty() {
@@ -105,10 +108,7 @@ impl MdnsDiscovery {
         Ok(rx)
     }
 
-    fn browse_loop(
-        receiver: mdns_sd::Receiver<ServiceEvent>,
-        tx: mpsc::Sender<DiscoveredPeer>,
-    ) {
+    fn browse_loop(receiver: mdns_sd::Receiver<ServiceEvent>, tx: mpsc::Sender<DiscoveredPeer>) {
         while let Ok(event) = receiver.recv() {
             match event {
                 ServiceEvent::ServiceResolved(info) => {
@@ -211,10 +211,7 @@ mod tests {
     #[test]
     fn capability_parsing_from_txt() {
         let txt = "relay,gateway,workload-spawn";
-        let caps: HashSet<Capability> = txt
-            .split(',')
-            .filter_map(Capability::from_str)
-            .collect();
+        let caps: HashSet<Capability> = txt.split(',').filter_map(Capability::from_str).collect();
 
         assert_eq!(caps.len(), 3);
         assert!(caps.contains(&Capability::Relay));

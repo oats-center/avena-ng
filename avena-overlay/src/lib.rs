@@ -24,11 +24,15 @@ pub use crypto::{
     issue_jwt, wireguard_pubkey, CertClaims, CertError, CertValidator, EphemeralKeypair,
     HandshakeError, HandshakeMessage, SessionKeys, WireguardKeypair,
 };
+pub use daemon::{
+    AvenadConfig, ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, PeerState, RoutingConfig,
+    TunnelMode,
+};
 pub use discovery::{
-    Capability, DiscoveredPeer, DiscoveryConfig, DiscoveryError, DiscoveryEvent,
-    DiscoveryService, DiscoverySource, LocalAnnouncement, MdnsDiscovery, StaticPeerConfig,
-    StaticPeers,
+    Capability, DiscoveredPeer, DiscoveryConfig, DiscoveryError, DiscoveryEvent, DiscoveryService,
+    DiscoverySource, LocalAnnouncement, MdnsDiscovery, StaticPeerConfig, StaticPeers,
 };
 pub use identity::{derive_workload_keypair, DecodeError, DeviceId, DeviceKeypair};
-pub use tunnel::{KernelBackend, PeerConfig, PeerStats, TunnelBackend, TunnelError, UserspaceBackend};
-pub use daemon::{AvenadConfig, ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, PeerState, RoutingConfig, TunnelMode};
+pub use tunnel::{
+    KernelBackend, PeerConfig, PeerStats, TunnelBackend, TunnelError, UserspaceBackend,
+};

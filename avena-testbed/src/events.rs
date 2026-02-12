@@ -4,11 +4,11 @@
 //! assertions at specified times during scenario execution.
 
 use crate::links::{LinkError, LinkManager};
-use crate::metrics::{LogParser, MetricsLogger, AvenadEventType};
+use crate::metrics::{AvenadEventType, LogParser, MetricsLogger};
 use crate::scenario::{AssertCondition, Assertion, Event, EventAction};
 use crate::topology::{TestTopology, TopologyError};
-use std::future::Future;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +48,23 @@ struct EventTracker {
     log_positions: HashMap<String, u64>,
 }
 
+#[derive(Debug, Clone)]
+struct LinkConvergenceState {
+    link_id: String,
+    node_a: String,
+    node_b: String,
+    underlay_up_ms: u64,
+    baseline_connections_a: usize,
+    baseline_connections_b: usize,
+    first_peer_connected_ms: Option<u64>,
+    first_overlay_ping_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+enum ExecutedEvent {
+    LinkConnected { link_id: String },
+}
+
 const ASSERTION_PING_ATTEMPTS: usize = 5;
 const ASSERTION_PING_RETRY_DELAY: Duration = Duration::from_millis(300);
 
@@ -80,7 +97,15 @@ impl EventTracker {
             }
         }
     }
+}
 
+fn link_nodes_from_link_id(link_id: &str) -> Option<(String, String)> {
+    let (a, b) = link_id.split_once('-')?;
+    Some((a.to_string(), b.to_string()))
+}
+
+fn same_unordered_pair(a1: &str, b1: &str, a2: &str, b2: &str) -> bool {
+    (a1 == a2 && b1 == b2) || (a1 == b2 && b1 == a2)
 }
 
 pub struct EventExecutor {
@@ -131,6 +156,8 @@ impl EventExecutor {
         let mut assertions_passed = 0;
 
         let mut tracker = EventTracker::default();
+        let mut link_convergence: HashMap<String, LinkConvergenceState> = HashMap::new();
+        let mut latest_link_up: Option<String> = None;
 
         loop {
             let elapsed = start.elapsed().as_secs_f64();
@@ -139,16 +166,70 @@ impl EventExecutor {
                 break;
             }
 
-            while event_iter
-                .peek()
-                .is_some_and(|e| e.at_secs <= elapsed)
-            {
+            while event_iter.peek().is_some_and(|e| e.at_secs <= elapsed) {
                 let event = event_iter.next().unwrap();
-                self.execute_event(event).await?;
+                if let Some(executed) = self.execute_event(event).await? {
+                    match executed {
+                        ExecutedEvent::LinkConnected { link_id } => {
+                            if let Some((node_a, node_b)) = link_nodes_from_link_id(&link_id) {
+                                let baseline_connections_a =
+                                    *tracker.connection_counts.get(&node_a).unwrap_or(&0);
+                                let baseline_connections_b =
+                                    *tracker.connection_counts.get(&node_b).unwrap_or(&0);
+                                link_convergence.insert(
+                                    link_id.clone(),
+                                    LinkConvergenceState {
+                                        link_id: link_id.clone(),
+                                        node_a,
+                                        node_b,
+                                        underlay_up_ms: (elapsed * 1000.0) as u64,
+                                        baseline_connections_a,
+                                        baseline_connections_b,
+                                        first_peer_connected_ms: None,
+                                        first_overlay_ping_ms: None,
+                                    },
+                                );
+                                latest_link_up = Some(link_id);
+                            }
+                        }
+                    }
+                }
                 events_executed += 1;
             }
 
             tracker.update_from_logs(&self.node_ids, &self.log_dir);
+
+            let elapsed_ms = (elapsed * 1000.0) as u64;
+            for state in link_convergence.values_mut() {
+                if state.first_peer_connected_ms.is_some() {
+                    continue;
+                }
+
+                let connected_a = *tracker
+                    .connection_counts
+                    .get(&state.node_a)
+                    .unwrap_or(&0)
+                    > state.baseline_connections_a;
+                let connected_b = *tracker
+                    .connection_counts
+                    .get(&state.node_b)
+                    .unwrap_or(&0)
+                    > state.baseline_connections_b;
+
+                if connected_a || connected_b {
+                    state.first_peer_connected_ms = Some(elapsed_ms);
+                    let value_ms = elapsed_ms.saturating_sub(state.underlay_up_ms);
+                    self.metrics.log_convergence_metric(
+                        "underlay_up_to_first_peer_connected_ms",
+                        &state.link_id,
+                        &state.node_a,
+                        &state.node_b,
+                        state.underlay_up_ms,
+                        elapsed_ms,
+                        value_ms,
+                    );
+                }
+            }
 
             let mut still_pending = Vec::new();
             for assertion in pending_assertions.drain(..) {
@@ -166,6 +247,63 @@ impl EventExecutor {
                 assertions_run += 1;
                 match self.check_assertion(assertion).await {
                     Ok(()) => {
+                        if let AssertCondition::Ping { from, to, .. } = &assertion.condition {
+                            let selected_link = link_convergence
+                                .iter()
+                                .find_map(|(link_id, state)| {
+                                    if same_unordered_pair(&state.node_a, &state.node_b, from, to) {
+                                        Some(link_id.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .or_else(|| latest_link_up.clone());
+
+                            if let Some(link_id) = selected_link {
+                                if let Some(state) = link_convergence.get_mut(&link_id) {
+                                    if state.first_overlay_ping_ms.is_none() {
+                                        state.first_overlay_ping_ms = Some(elapsed_ms);
+                                        let value_ms =
+                                            elapsed_ms.saturating_sub(state.underlay_up_ms);
+                                        self.metrics.log_convergence_metric(
+                                            "underlay_up_to_first_successful_overlay_ping_ms",
+                                            &state.link_id,
+                                            from,
+                                            to,
+                                            state.underlay_up_ms,
+                                            elapsed_ms,
+                                            value_ms,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if let AssertCondition::NodesConnected { nodes } = &assertion.condition {
+                            if nodes.len() >= 2 {
+                                let from = &nodes[0];
+                                let to = &nodes[1];
+                                if let Some((_, state)) = link_convergence.iter_mut().find(|(_, s)| {
+                                    same_unordered_pair(&s.node_a, &s.node_b, from, to)
+                                }) {
+                                    if state.first_peer_connected_ms.is_none() {
+                                        state.first_peer_connected_ms = Some(elapsed_ms);
+                                        let value_ms =
+                                            elapsed_ms.saturating_sub(state.underlay_up_ms);
+                                        self.metrics.log_convergence_metric(
+                                            "underlay_up_to_first_peer_connected_ms",
+                                            &state.link_id,
+                                            from,
+                                            to,
+                                            state.underlay_up_ms,
+                                            elapsed_ms,
+                                            value_ms,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         assertions_passed += 1;
                         self.metrics.log_assertion_result(assertion, true);
                         tracing::debug!(
@@ -198,7 +336,7 @@ impl EventExecutor {
         })
     }
 
-    async fn execute_event(&self, event: &Event) -> Result<(), EventError> {
+    async fn execute_event(&self, event: &Event) -> Result<Option<ExecutedEvent>, EventError> {
         match &event.action {
             EventAction::DisconnectLink { link } => {
                 let mut links = self.links.lock().await;
@@ -215,6 +353,7 @@ impl EventExecutor {
                     .ok_or_else(|| EventError::UnknownLink(link.clone()))?;
                 links.set_link_enabled(&link_id, true).await?;
                 self.metrics.log_link_changed(&link_id, true);
+                return Ok(Some(ExecutedEvent::LinkConnected { link_id }));
             }
             EventAction::ModifyLink {
                 link,
@@ -225,7 +364,9 @@ impl EventExecutor {
                 let link_id = links
                     .link_id_from_ref(link)
                     .ok_or_else(|| EventError::UnknownLink(link.clone()))?;
-                links.modify_link(&link_id, *latency_ms, *loss_percent).await?;
+                links
+                    .modify_link(&link_id, *latency_ms, *loss_percent)
+                    .await?;
             }
             EventAction::StopNode { node } => {
                 let mut topology = self.topology.lock().await;
@@ -236,7 +377,7 @@ impl EventExecutor {
                 topology.start_node(node).await?;
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn check_assertion(&self, assertion: &Assertion) -> Result<(), EventError> {
@@ -244,8 +385,13 @@ impl EventExecutor {
             AssertCondition::NodesConnected { nodes } => {
                 self.check_nodes_connected(nodes, assertion.at_secs).await
             }
-            AssertCondition::Ping { from, to, timeout_ms } => {
-                self.check_ping(from, to, *timeout_ms, assertion.at_secs).await
+            AssertCondition::Ping {
+                from,
+                to,
+                timeout_ms,
+            } => {
+                self.check_ping(from, to, *timeout_ms, assertion.at_secs)
+                    .await
             }
             AssertCondition::PeerCount { node, count } => {
                 self.check_peer_count(node, *count, assertion.at_secs).await
@@ -253,14 +399,21 @@ impl EventExecutor {
         }
     }
 
-    async fn check_nodes_connected(&self, nodes: &[String], at_secs: f64) -> Result<(), EventError> {
+    async fn check_nodes_connected(
+        &self,
+        nodes: &[String],
+        at_secs: f64,
+    ) -> Result<(), EventError> {
         if nodes.len() >= 2 {
             let from = &nodes[0];
             let underlay_ip = {
                 let topology = self.topology.lock().await;
-                topology
-                    .node(&nodes[1])
-                    .and_then(|to_node| to_node.underlay_ips.first().map(|(_, underlay_ip)| *underlay_ip))
+                topology.node(&nodes[1]).and_then(|to_node| {
+                    to_node
+                        .underlay_ips
+                        .first()
+                        .map(|(_, underlay_ip)| *underlay_ip)
+                })
             };
 
             if let Some(underlay_ip) = underlay_ip {
@@ -303,7 +456,10 @@ impl EventExecutor {
                             let output = {
                                 let topology = self.topology.lock().await;
                                 topology
-                                    .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", "2", &ip_str])
+                                    .exec_in_node(
+                                        from,
+                                        &["ping", "-6", "-c", "1", "-W", "2", &ip_str],
+                                    )
                                     .await?
                             };
 
@@ -367,7 +523,10 @@ impl EventExecutor {
                     let output = {
                         let topology = self.topology.lock().await;
                         topology
-                            .exec_in_node(from, &["ping", "-6", "-c", "1", "-W", &timeout_arg, &ip_str])
+                            .exec_in_node(
+                                from,
+                                &["ping", "-6", "-c", "1", "-W", &timeout_arg, &ip_str],
+                            )
                             .await?
                     };
 
@@ -392,7 +551,10 @@ impl EventExecutor {
         if !connected {
             let route_output = {
                 let topology = self.topology.lock().await;
-                topology.exec_in_node(from, &["ip", "-6", "route"]).await.ok()
+                topology
+                    .exec_in_node(from, &["ip", "-6", "route"])
+                    .await
+                    .ok()
             };
             if let Some(output) = route_output {
                 tracing::debug!(
@@ -429,7 +591,12 @@ impl EventExecutor {
         Ok(())
     }
 
-    async fn check_peer_count(&self, node: &str, expected: usize, at_secs: f64) -> Result<(), EventError> {
+    async fn check_peer_count(
+        &self,
+        node: &str,
+        expected: usize,
+        at_secs: f64,
+    ) -> Result<(), EventError> {
         let topology = self.topology.lock().await;
 
         let output = topology
@@ -449,9 +616,7 @@ impl EventExecutor {
         if peer_count != expected {
             return Err(EventError::AssertionFailed {
                 at_secs,
-                message: format!(
-                    "node {node} has {peer_count} peers, expected {expected}"
-                ),
+                message: format!("node {node} has {peer_count} peers, expected {expected}"),
             });
         }
         Ok(())

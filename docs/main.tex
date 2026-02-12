@@ -1,0 +1,585 @@
+\documentclass[journal]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{amsthm}
+\usepackage{cite}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{definition}{Definition}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  xleftmargin=0.5em,
+  xrightmargin=0.5em
+}
+
+\title{Avena: A Distributed Fleet Management System for Vehicle-Centric Edge Computing}
+
+\author{
+  % Authors omitted for review
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Modern transportation and agricultural operations depend on software-defined systems operating where network connectivity is intermittent, expensive, or topologically unstable. Existing publish-subscribe messaging systems assume reliable networks; delay-tolerant networking (DTN) solutions assume point-to-point messaging. We present Avena, a distributed fleet management system that bridges these paradigms by combining subject-based pub/sub semantics with DTN-style store-and-forward delivery and cost-aware routing. Avena provides a NATS-compatible API where applications publish to subjects and subscribe to patterns, while the infrastructure transparently handles intermittent connectivity, mobile relays, and heterogeneous link costs. The architecture comprises three subsystems: an encrypted overlay network providing IP connectivity over heterogeneous links, an interest-driven messaging layer with priority-aware routing, and a CRDT-based fleet management daemon enabling workload orchestration without coordination. Containerized workloads run in two modes: Messaging mode for pub/sub-only communication, and Addressable mode providing overlay IP connectivity via sidecar containers with end-to-end encryption. Beyond technical capabilities, the architecture enables a decoupled ecosystem where hardware and software vendors compete independently. We evaluate Avena through emulation experiments measuring workload convergence, routing optimality, and bandwidth efficiency across agricultural and vehicle-to-everything scenarios.
+\end{abstract}
+
+\section{Introduction}
+
+Modern transportation and agricultural operations increasingly depend on software-defined systems. Tractors execute precision guidance algorithms, traffic signals adapt timing based on real-time vehicle data, autonomous field robots perform scouting and weeding, and connected vehicles exchange safety messages at intersections. Managing these fleets of edge devices---deploying software updates, collecting telemetry, coordinating operations---presents a distributed systems challenge that existing solutions do not adequately address.
+
+The fundamental difficulty is network connectivity. Agricultural and transportation environments are characterized by large geographic areas, sparse infrastructure, and mobile assets. A field sensor may communicate only when a tractor passes within radio range. A combine operating in a remote section may have no backhaul for hours. A grain truck serves as a potential data carrier between field and farm office. Cellular coverage is often expensive and unreliable. LEO satellite services provide backhaul but at per-device costs that preclude low-value sensors, with latencies unsuitable for safety-critical applications. These conditions render cloud-centric architectures impractical: systems assuming persistent connectivity fail when that assumption is violated.
+
+Two bodies of prior work address aspects of this challenge. Publish-subscribe messaging systems such as NATS, Kafka, and MQTT provide subject-based communication that decouples producers from consumers. This model suits heterogeneous fleet software, but these systems assume reliable infrastructure---when the broker is unreachable, communication fails.
+
+Delay-tolerant networking (DTN) addresses intermittent connectivity through store-and-forward mechanisms. Messages are stored at intermediate nodes and forwarded opportunistically. Mobile nodes can physically carry data between disconnected segments (``data muling''). However, DTN protocols target point-to-point delivery, not the many-to-many patterns of pub/sub systems, and lack routing semantics for heterogeneous link costs.
+
+This paper presents Avena, a distributed fleet management system bridging pub/sub semantics with delay-tolerant delivery. Avena provides a NATS-compatible API: applications publish to subjects and subscribe to patterns while the infrastructure handles intermittent connectivity, mobile relays, and cost-aware routing. The same code runs on cloud servers and battery-powered field sensors---the network abstraction hides underlying complexity.
+
+Beyond solving technical challenges, Avena enables a decoupled ecosystem. Traditional agricultural and V2X systems exhibit tight vertical integration: hardware vendors build complete software stacks, and software assumes specific hardware platforms. This coupling constrains both markets. Avena inverts this model: any workload conforming to the Avena API deploys to any Avena-compliant device. Hardware vendors compete on physical capabilities without building software stacks; software vendors access the combined installed base of all compliant hardware without per-OEM integration.
+
+\subsection{Contributions}
+
+Avena makes the following contributions:
+
+\textbf{Subject-based pub/sub with DTN delivery.} Messages are addressed to subjects, not destinations, enabling multiple subscribers to receive the same message. When subscribers are unreachable, messages are stored at intermediate relay nodes and forwarded opportunistically---including via mobile devices that physically transport data between disconnected segments.
+
+\textbf{Cost-aware message routing.} Vehicle-centric networks exhibit heterogeneous link characteristics: WiFi is local but free, cellular is wide-area but expensive, LoRa is long-range but low-bandwidth. Avena's routing layer considers message priority, link costs (monetary, energy, latency), and node state (battery level, queue depth) when selecting paths.
+
+\textbf{Dual-channel architecture.} The system operates over parallel networks: a high-rate channel (WiFi, cellular, Wireguard tunnels) for application data and a low-rate channel (LoRa) for control-plane traffic. The low-rate channel enables network convergence when high-rate links are unavailable, allowing presence announcements and topology exchange before data connections establish.
+
+\textbf{CRDT-based distributed state with relay-policy-filtered routing.} Distributed state (device registry, workload specifications, cost metadata, active interests) propagates to all devices using CRDTs, ensuring convergence without coordination. Relay policies determine which application messages a device forwards, enabling efficient use of constrained links while maintaining complete system visibility.
+
+\textbf{Interest-driven data flow with geo-spatial awareness.} Data flows only because interests request it. Subscribers specify what data they want and how: priority, retention policy, ordering, and geographic bounds. Geo-spatial permissions enable data sovereignty where, for example, yield data flows only to subscribers authorized for a field's boundary.
+
+\textbf{Hardware-software ecosystem decoupling.} The architecture enables interoperability through atomic message semantics rather than proprietary formats. Publishers emit self-describing messages without assumptions about consumers; integration occurs at the subscriber. This shifts the market from vertically-integrated stacks to horizontal competition on hardware capabilities and software value.
+
+\subsection{Paper Organization}
+
+The remainder of this paper is organized as follows. \Cref{sec:related} surveys related work. \Cref{sec:overview} presents the system overview, target domains, and design goals. \Cref{sec:overlay} describes the Avena Overlay Network. \Cref{sec:messaging} presents the Avena Messaging Network. \Cref{sec:fleet} describes the fleet management subsystem. \Cref{sec:model} presents the formal system model. \Cref{sec:methodology} describes the experimental methodology. \Cref{sec:results} presents evaluation results. \Cref{sec:discussion} discusses limitations. \Cref{sec:conclusion} concludes.
+
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Publish-Subscribe Messaging Systems}
+
+Publish-subscribe messaging decouples producers from consumers through subject-based addressing. Publishers emit to named subjects; subscribers declare interest in patterns and receive matching messages.
+
+NATS~\cite{nats} is a lightweight pub/sub system for cloud-native applications supporting hierarchical subjects, wildcard matching, and persistent messaging via JetStream. NATS clusters federate through leaf connections for distributed deployments. However, NATS assumes reliable connectivity; leaf connections require persistent TCP sessions, and delivery fails when connections cannot establish.
+
+Apache Kafka~\cite{kafka} provides durable, ordered message streams with strong persistence guarantees. Messages are written to partitioned logs and retained for configurable periods. Kafka's architecture centers on broker clusters with persistent storage, making it poorly suited to resource-constrained edge devices or intermittent connectivity.
+
+MQTT~\cite{mqtt} targets constrained devices and low-bandwidth networks with topic-based pub/sub and QoS levels from fire-and-forget to exactly-once. MQTT brokers can queue messages for disconnected subscribers, but the architecture remains broker-centric: communication fails when the broker is unreachable.
+
+DDS~\cite{dds} supports peer-to-peer pub/sub without a central broker, including QoS policies for reliability and deadline enforcement. The peer-to-peer model improves resilience but DDS assumes IP connectivity and does not address store-and-forward for intermittently connected nodes.
+
+Avena adopts NATS-compatible semantics but extends the model with DTN-style store-and-forward delivery, enabling communication between devices never simultaneously connected.
+
+\subsection{Delay-Tolerant Networking}
+
+DTN addresses communication where end-to-end connectivity is intermittent or absent~\cite{fall2003dtn}. The Bundle Protocol~\cite{rfc5050} encapsulates data into bundles stored at intermediate nodes and forwarded when connectivity arises.
+
+Epidemic routing~\cite{vahdat2000epidemic} floods bundles to all encountered nodes, maximizing delivery probability at high resource cost. Spray and Wait~\cite{spyropoulos2005spray} limits flooding by distributing fixed bundle copies. PRoPHET~\cite{lindgren2003probabilistic} uses encounter history to estimate delivery probability.
+
+DTN research has explored mobile nodes as data carriers. Message ferrying~\cite{zhao2004message} uses designated mobile nodes following routes to connect disconnected regions. Data mules~\cite{shah2003data} opportunistically carry data between sensors and base stations.
+
+DTN protocols assume point-to-point addressing: bundles have specific destination endpoints. Avena combines DTN delivery with pub/sub semantics, where messages address subjects and may have multiple recipients determined at delivery time.
+
+\subsection{Mobile Ad-Hoc Networks}
+
+MANET routing protocols enable communication with dynamic topology. OLSR~\cite{rfc3626} maintains topology through periodic link-state flooding. AODV~\cite{rfc3561} discovers routes reactively when needed.
+
+Babel~\cite{rfc8966} is a distance-vector protocol for wireless mesh networks handling link asymmetry, varying quality, and frequent topology changes. Its loop-avoidance mechanisms make it robust in unstable environments. Unlike OLSR and AODV, Babel was designed for wireless networks rather than adapted from wired protocols.
+
+Avena uses Babel for IP-layer routing within the high-rate network. However, MANET protocols provide connectivity, not content routing---they answer ``can packets reach node X?'' but not ``how should message M reach subscribers of subject S given priority requirements and link costs?'' Avena's message routing layer provides this abstraction.
+
+\subsection{Heterogeneous Wireless Networks}
+
+The integration of multiple wireless technologies into coherent networks remains an active research area. IEEE 802.11ah (WiFi HaLow)~\cite{sun2013halow} provides sub-GHz operation with kilometer-scale range, targeting IoT scenarios in agricultural and industrial environments. The Citizens Broadband Radio Service (CBRS)~\cite{fcc2015cbrs} enables database-coordinated access to 3.5~GHz spectrum without carrier dependency.
+
+Overlay network architectures using VPN tunnels have been proposed for heterogeneous integration. WireGuard~\cite{donenfeld2017wireguard} provides a modern, minimal tunnel primitive seeing adoption in mesh networking. The Babel RTT extension (RFC 9616)~\cite{jonglez2024rtt} enables delay-based metrics for overlay networks where physical-layer characteristics are hidden by tunnel abstraction.
+
+Cross-layer approaches that expose physical metrics to higher layers have been studied extensively~\cite{srivastava2005crosslayer}, though the tension between transport agnosticism and physical-layer awareness in tunnel overlays specifically has received less attention. Avena's cross-layer metric framework addresses this by monitoring physical interface statistics externally and injecting costs into Babel.
+
+\subsection{Conflict-Free Replicated Data Types}
+
+CRDTs~\cite{shapiro2011crdts} are data structures ensuring eventual consistency without coordination. Operations commute, so replicas converge regardless of order. CRDTs have been applied to collaborative editing~\cite{attiya2016crdt}, distributed databases~\cite{bailis2013bolt}, and edge computing~\cite{vanderlinde2017practical}.
+
+Avena uses CRDTs for distributed state synchronization. Device registry and workload specifications use map CRDTs with field-level merge semantics. Active interests use OR-Set CRDTs. Cost metadata uses LWW-Register CRDTs since each device is the single writer of its own information.
+
+CRDTs suit DTN environments where partitions are common and long-lasting. Unlike consensus-based systems that block during partitions, CRDT-based state remains available and writable, converging automatically when partitions heal.
+
+\subsection{Offline-First Systems}
+
+Secure Scuttlebutt~\cite{tarr2019ssb} is a peer-to-peer protocol for offline-first social applications where users maintain append-only logs replicating via gossip. SSB's ``follow'' graph determines replication scope, conceptually similar to Avena's relay policies but targeting social graphs rather than device fleets.
+
+Automerge~\cite{kleppmann2017automerge} and similar local-first CRDT libraries enable collaborative applications working offline with state merging on reconnection. These focus on data structure semantics rather than network topology or routing.
+
+Avena differs in its fleet management focus, dual-channel architecture for heterogeneous links, and integration of pub/sub semantics alongside replicated state.
+
+\subsection{Vehicle-to-Everything Communication}
+
+DSRC based on IEEE 802.11p~\cite{ieee80211p} provides direct vehicle-to-vehicle communication in the 5.9 GHz band, supporting Basic Safety Messages at 10 Hz for collision avoidance. C-V2X~\cite{3gpp36885} uses LTE and 5G for both direct (sidelink) and network-based V2X communication.
+
+These standards focus on radio layer and message formats for safety applications. Avena operates at a higher layer, providing pub/sub abstraction and store-and-forward capability. Avena could use DSRC or C-V2X as physical links while providing delay-tolerant delivery above them.
+
+
+\section{System Overview}
+\label{sec:overview}
+
+\subsection{Target Domains}
+
+Avena addresses distributed fleet management where intermittent connectivity, mobile assets, heterogeneous links, and multi-domain trust relationships intersect. The unifying characteristic is \emph{vehicle-centric networking}: mobile machines serve as both network participants and physical data carriers, while fixed assets scatter across large areas with sparse infrastructure.
+
+\subsubsection{Agricultural Edge Computing}
+
+Modern farms deploy computational assets across thousands of acres: tractors with guidance systems, irrigation controllers, autonomous robots, weather stations, and grain handling equipment. Network infrastructure is sparse---remote sensors may have no persistent connectivity.
+
+The operational pattern is vehicle-centric: tractors, combines, and grain carts traverse operations, creating transient connectivity with fixed sensors and each other. A combine harvesting a remote field accumulates yield data with no backhaul; data synchronizes when it returns to the elevator. These mobile assets are not merely clients---they are the network's backbone.
+
+Agricultural fleets are typically single-domain, but multi-domain scenarios arise naturally. Custom harvesters bring equipment onto client farms. Agronomic consultants need field data access without full privileges. Neighboring operations may share boundary sensor data.
+
+\subsubsection{Vehicle-to-Everything Communication}
+
+V2X infrastructure presents complementary challenges. Traffic controllers, roadside units (RSUs), and vehicles exchange information for safety applications (collision warnings, signal phase and timing) and efficiency applications (platooning, traffic optimization). Vehicles traverse networks at highway speeds, creating rapidly-changing topology.
+
+V2X inherently involves multiple administrative domains: infrastructure managed by transportation departments, commercial fleets managed by operators, and consumer vehicles with individual trust boundaries.
+
+V2X motivates Avena capabilities strongly. Geo-spatial interests are essential: vehicles care about signal timing for their route, not all metropolitan signals. Priority-aware routing matters because safety messages require sub-100ms delivery while bulk data tolerates seconds of delay.
+
+\subsection{Architecture}
+
+Avena comprises three interrelated subsystems providing delay-tolerant pub/sub messaging and fleet management. \Cref{fig:layers} illustrates the architecture.
+
+\begin{figure}[t]
+\centering
+\footnotesize
+\begin{tabular}{|p{0.92\columnwidth}|}
+\hline
+\textbf{Layer 4: Fleet Management (avenad)} \\
+Workload specification, deployment, reconciliation \\
+Certificate lifecycle, capability delegation \\
+\hline
+\textbf{Layer 3: State Synchronization (Gossip)} \\
+CRDT-based distributed state; cost metadata propagation \\
+\hline
+\textbf{Layer 2: Avena Messaging Network} \\
+Subject-based pub/sub (NATS-compatible API) \\
+Interest-driven routing; store-and-forward delivery \\
+\hline
+\textbf{Layer 1: Avena Overlay Network} \\
+Wireguard P2P tunnels; Babel routing \\
+LoRa mesh for low-rate control channel \\
+\hline
+\textbf{Layer 0: Physical Links} \\
+WiFi, cellular, ethernet, satellite, LoRa \\
+\hline
+\end{tabular}
+\caption{Avena layered architecture. Layer 3 (Gossip) propagates both messaging metadata and fleet state.}
+\label{fig:layers}
+\end{figure}
+
+\textbf{Avena Overlay Network.} The foundational layer provides encrypted, authenticated IP connectivity over heterogeneous links. Each device maintains Wireguard tunnels with discovered peers, forming a self-assembling encrypted mesh. Babel routing (RFC 8966) maintains IP reachability as topology changes. A parallel LoRa channel provides control-plane connectivity when high-rate links are unavailable.
+
+\textbf{Avena Messaging Network.} Built atop the overlay, this layer provides subject-based pub/sub with delay-tolerant delivery. Applications publish to named subjects; subscribers express interest with delivery requirements (priority, retention, ordering, geo-bounds). The layer routes messages toward subscribers, storing at intermediate relays when direct paths are unavailable and forwarding opportunistically---including via mobile data carriers.
+
+\textbf{Avena Fleet Management (avenad).} The fleet daemon handles workload orchestration. Specifications declare deployment targets, container images, and authorization scopes, propagating via gossip; each device reconciles local state. Certificate management and capability delegation are fleet management concerns.
+
+Fleet management and networking are intertwined: the messaging network's effectiveness depends on appropriate software running on devices. The same gossip protocol propagates both routing metadata and fleet state, ensuring consistent delivery semantics.
+
+\subsection{Workload Network Architecture}
+
+Containerized workloads run as isolated tenants on host devices. The host's avenad daemon owns Layer 1 infrastructure; workloads interact with the network through one of two modes.
+
+\textbf{Messaging mode} (default): The workload connects to the host avenad's local NATS-compatible endpoint. All communication occurs via pub/sub---the workload publishes messages and subscribes to subjects. The host avenad handles all overlay networking: tunnel management, routing, and message delivery. The workload has no overlay IP address and no direct network access.
+
+\textbf{Addressable mode}: For workloads requiring direct IP connectivity, the host avenad spawns an \texttt{avena-sidecar} container alongside the workload. The sidecar runs a userspace Wireguard endpoint with the workload's derived identity and overlay IP address. Remote nodes establish Wireguard tunnels directly to the sidecar. The host routes Wireguard UDP packets to the appropriate sidecar but cannot decrypt the traffic---tunnel keys are held only by the sidecar and remote peers.
+
+In both modes, workloads are isolated from each other. Messaging-mode workloads communicate only via Layer 2 pub/sub with message-level encryption. Addressable-mode workloads have end-to-end encrypted tunnels---even workloads on the same host cannot observe each other's traffic. The host avenad can observe metadata (source/destination IPs, message timing, sizes) but not payload content.
+
+\subsection{Design Goals}
+
+\textbf{G1: Eventual delivery under bounded connectivity.} If the network provides temporal connectivity---a path exists within some time bound, potentially via mobile relays---messages are eventually delivered.
+
+\textbf{G2: Consistency without coordination.} Distributed state converges without synchronous coordination. Concurrent updates merge deterministically using CRDTs.
+
+\textbf{G3: Security without central authority.} Authorization decisions use cryptographically-signed certificates; devices verify peers locally.
+
+\textbf{G4: Cost-aware resource utilization.} Routing considers priority, link characteristics, and node state. Safety-critical messages take expensive paths; bulk data waits for economical connectivity.
+
+\textbf{G5: Interest-driven data flow.} Data flows only because subscribers have expressed interest. No interest means no delivery, relay, or storage.
+
+\textbf{G6: Geo-spatial awareness.} Interests may specify geographic bounds for message filtering.
+
+\textbf{G7: Transparent edge-to-cloud.} The same application code runs on edge devices and cloud servers.
+
+
+\section{Avena Overlay Network}
+\label{sec:overlay}
+
+The Overlay Network provides encrypted, authenticated IP connectivity over heterogeneous physical links.
+
+\subsection{Physical Links}
+
+The physical layer comprises heterogeneous technologies with complementary characteristics. \textbf{High-rate links} include traditional WiFi (2.4/5~GHz), WiFi HaLow (802.11ah) providing kilometer-scale range in sub-GHz bands, CBRS (3.5~GHz) with cellular-like range requiring no license, cellular (LTE/5G), and satellite (LEO/GEO). \textbf{Low-rate links} include LoRa and TV White Spaces (TVWS), providing long-range coverage over miles with limited throughput. \textbf{V2X-specific links} include DSRC (802.11p) and C-V2X for direct vehicle-to-vehicle communication.
+
+A single agricultural vehicle might incorporate WiFi (local high-bandwidth), HaLow (kilometer-range sensors), and LoRa (presence announcements). The overlay abstracts this heterogeneity, presenting unified IP connectivity regardless of underlying transport.
+
+\subsection{Peer Discovery}
+
+Devices discover peers through multiple mechanisms: \textbf{mDNS/DNS-SD} on local networks advertising presence with service type \texttt{\_avena.\_udp}; \textbf{configured endpoints} for well-known infrastructure nodes; \textbf{LoRa presence announcements} enabling discovery before WiFi association; and \textbf{gossip-derived topology} providing transitive discovery through connected peers.
+
+\subsection{Tunnel Establishment}
+
+Tunnel establishment proceeds through four phases:
+
+\textbf{Phase 1 (Certificate Exchange):} Devices exchange certificate chains, verifying termination at a mutually trusted root CA, validity, and that device ID matches the certificate's public key hash.
+
+\textbf{Phase 2 (Key Derivation):} Rather than static Wireguard keys, session keys derive from Ed25519 identity keys. Devices exchange ephemeral X25519 keypairs signed with Ed25519 keys, compute shared secrets via Diffie-Hellman, and derive Wireguard session keys. This ties tunnel authentication to the certificate model.
+
+\textbf{Phase 3 (Tunnel Activation):} Both devices configure Wireguard interfaces. Once active, Babel advertises routes over the new interface.
+
+\textbf{Phase 4 (Gossip Synchronization):} Devices perform full gossip synchronization, exchanging device registry, workload specs, interests, and cost metadata.
+
+\subsection{IP Addressing and Routing}
+
+Avena uses IPv6 with Unique Local Addresses (ULA) in \texttt{fd00::/8}. Device addresses derive deterministically from device ID, ensuring addresses are verifiable from public keys.
+
+Babel (RFC 8966) via FRR provides IP-layer routing over Wireguard interfaces, handling link asymmetry and frequent topology changes. When tunnels form or break, Babel automatically updates routes.
+
+\subsection{Low-Rate Channel}
+
+A parallel LPWAN mesh (LoRa or similar) provides \emph{hint-only} control-plane connectivity, carrying presence beacons ($\sim$50 bytes), topology hints, cost deltas, and interest announcements. Full gossip synchronization occurs on the high-rate channel; LPWAN accelerates connection establishment. Estimated bandwidth is $\sim$1 Kbps for 100 devices.
+
+\subsection{Cross-Layer Metric Framework}
+
+The WireGuard tunnel abstraction hides transport details to achieve transport agnosticism, but effective routing requires awareness of physical-layer characteristics. Babel classifies WireGuard interfaces as wired point-to-point links, applying binary up/down cost computation rather than continuous quality estimation.
+
+Avena addresses this through a cross-layer metrics daemon monitoring physical interface statistics and injecting costs into Babel via its control socket. The framework uses the Babel RTT extension (RFC 9616) for transport-agnostic delay measurement, combined with transport-specific metrics (SNR, bitrate, channel utilization for 802.11; RSRP, RSRQ for cellular).
+
+The cost function combines multiplicative transport factors with RTT:
+\begin{equation}
+\text{cost} = C_{\text{base}} \times T_{\text{bitrate}} \times T_{\text{snr}} \times T_{\text{util}} + C_{\text{rtt}}
+\end{equation}
+
+The bitrate factor normalizes capacity against a reference rate (5~Mbps), making a 1~Mbps HaLow link 5$\times$ costlier than a 50~Mbps WiFi link. SNR and utilization factors penalize degraded signal quality and congested channels. Exponential smoothing and hysteresis (15\% improvement threshold) prevent oscillation from transient variations.
+
+
+\section{Avena Messaging Network}
+\label{sec:messaging}
+
+The Messaging Network provides subject-based pub/sub with delay-tolerant delivery.
+
+\subsection{Application Interface}
+
+Applications interact through a NATS-compatible API:
+
+\begin{lstlisting}[language=Python]
+client.publish("app.telemetry.soil", reading)
+client.subscribe("app.control.workload.>")
+\end{lstlisting}
+
+Workloads connect to a local endpoint provided by avenad. Interests are created at runtime when workloads subscribe; avenad validates against the workload's authorized scope and propagates valid interests via gossip.
+
+Interest lifecycle proceeds as follows: workload starts and connects to the local NATS endpoint; workload issues subscribe calls via the NATS API; avenad validates interests against the workload's \texttt{permitted\_subscribe} scope; valid interests propagate via gossip to all devices; publishers learn of interests and begin message routing; when the workload terminates or unsubscribes, avenad marks interests as terminated (tombstone); termination propagates via gossip and nodes stop routing for terminated interests.
+
+\subsection{Interest Model}
+
+Data flows only because an interest exists. Publishers emit to subjects; the network routes to subscribers with registered interest. No interest means no delivery, storage, or relay---pull-based semantics with push delivery.
+
+An interest specifies: subject pattern (NATS wildcard syntax), priority (delivery urgency), retention policy (all, latest, latest-$n$, time window), ordering requirement, TTL, and geographic constraints.
+
+Subscribers should use the lowest priority meeting their requirements. The same subject can have multiple interests with different semantics: latest-only for real-time display, all messages for historical records.
+
+\subsection{Relay Policies}
+
+Each device's specification includes a relay policy determining what messages it forwards: \texttt{None} (endpoint only), \texttt{Priority(p)} (forward priority $\geq p$), \texttt{Full} (forward all), or \texttt{Subjects(P)} (forward matching patterns).
+
+Relay policies affect application message routing, not gossip propagation. All gossip state propagates to all devices regardless of relay policy.
+
+\subsection{Cost-Aware Routing}
+
+When multiple paths exist, routing considers message priority, link properties (latency, bandwidth, loss, monetary/energy cost), and node properties (battery, queue depth). Rather than requiring manual weight tuning, Avena provides preset cost profiles for common deployment scenarios:
+
+\begin{itemize}[noitemsep]
+\item \textbf{Balanced}: Equal weight to all factors (default)
+\item \textbf{EnergyConstrained}: Solar/battery devices prioritize energy conservation
+\item \textbf{CostSensitive}: Metered cellular minimizes dollar cost
+\item \textbf{LatencyCritical}: V2X/real-time minimizes latency, ignores cost
+\end{itemize}
+
+Profiles are set at fleet level; individual interests can override. The formal cost function is defined in \Cref{sec:model}.
+
+\subsection{Store-and-Forward}
+
+When subscribers are unreachable, messages buffer at intermediate nodes whose relay policy permits forwarding. Unlike flooding-based DTN, Avena uses gossip-derived network knowledge to select specific relay routes. Buffer management delegates to pluggable DTN implementations (e.g., DTN7) providing priority-aware eviction.
+
+Messages may match multiple interests owned by different devices. Relay nodes route toward all matching interest owners, sending once when interests share a next-hop and branching when paths diverge. Messages are uniquely identified by (subject, HLC); duplicates arriving via multiple paths are detected and dropped.
+
+\subsection{Geo-Spatial Features}
+
+Devices report position via gossip. Subscribers limit data flow based on publisher location through geo-bounds: absolute radius, polygon boundary, or relative radius from subscriber position.
+
+Certificates can include geo-constraints on subject permissions, enabling data sovereignty. Position information may be stale; Avena adopts receiver-side filtering where messages route optimistically and receivers perform final geo validation.
+
+
+\section{Fleet Management}
+\label{sec:fleet}
+
+The fleet management subsystem handles workload orchestration and identity management.
+
+\subsection{Device Identity}
+
+Each device possesses an Ed25519 keypair. The identity is SHA-256 of the public key, truncated to 128 bits and encoded as base32. A certificate binds the key to authorized capabilities.
+
+Devices form a containment hierarchy where nested instances can spawn from parent devices. Capability attenuation ensures nested devices cannot exceed parent capabilities.
+
+\subsection{Certificate Model}
+
+Certificates form a DAG rooted at fleet CA(s), containing subject public key, issuer public key, capabilities (roles, permitted subjects, delegation authority), and validity period.
+
+Capability delegation requires issued certificates have capabilities $\subseteq$ issuer's capabilities. Devices with \texttt{device\_issuer} role may sign certificates for new devices. Initial provisioning occurs out-of-band (USB, QR code, manufacturer pre-provisioning).
+
+Certificate lifetimes are months, not years. Revocation lists propagate via gossip. A revoked device operates within its partition until certificate expiry or partition healing; short lifetimes bound this exposure window.
+
+\subsection{Workload Model}
+
+A workload specification contains: workload ID (issuer, name), target (device ID or selector), container specification (image, runtime, environment), authorization scope (permitted publish/subscribe patterns), TTL, and signature with certificate chain.
+
+The authorization scope defines what interests the workload may create at runtime. Workloads target specific devices or match via selectors (predicates over roles and labels). Explicit targets can override selector-based workloads for device-specific customization.
+
+\subsection{State Synchronization}
+
+The gossip layer propagates distributed state as fully replicated global state using CRDTs. Two categories flow through Avena:
+
+\textbf{Gossip state} maintains consistency: device registry, workload specs, cost metadata, active interests. Uses CRDT merge semantics with HLC ordering; propagates to all devices.
+
+\textbf{Application messages} flow from publishers to subscribers. Have delivery semantics but are delivered, not merged; routing filtered by relay policies.
+
+Upon connection, devices authenticate via certificate exchange, exchange state digests, reconcile via CRDT merge, then drain store-and-forward queues. Tombstones represent terminated interests and deleted workloads with TTL-based garbage collection (6--12 months).
+
+\subsection{Clock Synchronization}
+
+Avena encourages clock synchronization through multiple mechanisms: NTP or PTP when network connectivity permits; GPS time from equipped devices that may serve as time sources for nearby devices; and time service discovery via gossip. The availability and location of time services propagates under \texttt{avena.gossip.time.>}.
+
+When a device rejoins after extended disconnection, clock drift may cause ordering anomalies. Avena implements \emph{time quarantine}: on first peer connection after boot, the device computes the delta between local and peer HLC. If delta exceeds a threshold (default 1 hour), the device enters quarantine---it can receive gossip state and application messages but cannot publish or create interests until time sync completes via GPS lock, NTP sync, or manual override. Thresholds are configurable per-fleet; V2X deployments may use tighter bounds (5 minutes) while agricultural deployments may tolerate longer drift (4 hours).
+
+\subsection{Implementation Components}
+
+The three Avena subsystems are realized through the following software components:
+
+\textbf{avenad} (Device Daemon): Runs on every Avena device implementing all three subsystems. Overlay Network responsibilities include peer discovery, tunnel management, Babel routing via FRR, and LoRa channel. Messaging Network responsibilities include the local NATS endpoint, interest management, message routing, and geo-spatial filtering. Fleet Management responsibilities include identity management, certificate validation, CRDT state synchronization, workload reconciliation via Quadlet, and sidecar management for Addressable workloads.
+
+\textbf{avenactl} (CLI Tool): Command-line interface for operators providing context management, device operations, workload management, certificate management, and network diagnostics.
+
+\textbf{avena-sidecar} (Network Sidecar): Lightweight container for Addressable-mode workloads. The host avenad spawns avena-sidecar alongside workloads requiring direct overlay IP connectivity. Responsibilities include userspace Wireguard endpoint management, derived key handling, and peer configuration. The sidecar connects to the host's NATS endpoint using a JWT issued by avenad, scoped to its control subject.
+
+
+\section{Formal System Model}
+\label{sec:model}
+
+\subsection{Devices and Identity}
+
+Let $\mathbf{D}$ denote the set of Avena devices. Each device $d \in \mathbf{D}$ possesses a keypair $(sk_d, pk_d)$ where $sk_d$ is an Ed25519 private key and $pk_d$ is the corresponding public key. The identity is $\text{id}(d) = H(pk_d)$ where $H$ is SHA-256 truncated to 128 bits. A certificate $\text{cert}(d)$ binds the public key to authorized capabilities.
+
+Each device $d$ has associated metadata: $\text{roles}(d) \subseteq \Sigma_r$ (role labels), $\text{labels}(d) : \Sigma_k \to \Sigma_v$ (key-value labels), and $\text{scope}(d) \subseteq \mathcal{P}(\Sigma_s)$ (permitted message subjects).
+
+\subsection{Network Topology}
+
+The network is modeled as a time-varying dual-channel graph $G(t) = (D, E_h(t), E_l(t))$ where $E_h(t) \subseteq D \times D$ is the set of active high-rate links (Wireguard tunnels) at time $t$ and $E_l(t) \subseteq D \times D$ is the set of active low-rate links (LoRa) at time $t$.
+
+\begin{definition}[Message Relay]
+Device $d$ will relay application message $m$ for interest $i$ if:
+\begin{align*}
+\text{relay}(d) = \text{None} &\Rightarrow d = \text{owner}(i) \\
+\text{relay}(d) = \text{Priority}(p) &\Rightarrow \text{priority}(i) \geq p \\
+\text{relay}(d) = \text{Full} &\Rightarrow \text{always} \\
+\text{relay}(d) = \text{Subjects}(P) &\Rightarrow \text{pattern}(i) \in P
+\end{align*}
+\end{definition}
+
+\begin{definition}[T-Connectivity]
+The network is $(T, i)$-connected for interest $i$ if for all device pairs (publisher, subscriber) where the subscriber holds $i$, and all times $\tau_0$, there exists a temporal admissible path completing within time $T$.
+\end{definition}
+
+\subsection{Cost Model}
+
+Each device $d$ maintains cost metadata $c(d)$ propagated via gossip:
+\begin{align*}
+c(d) = \{&\text{battery} \in (0, 1] \cup \{\infty\}, \\
+&\text{storage\_mb} \in \mathbb{N}, \\
+&\text{queue\_depth} \in \mathbb{N}, \\
+&\text{links} : \text{neighbor} \to \text{LinkCost}\}
+\end{align*}
+
+Note that battery is bounded to be strictly positive because a device with zero battery cannot transmit.
+
+For message $m$ with interest $i$ traversing edge $(d_1, d_2)$:
+\begin{equation}
+\text{cost}(m, i, d_1, d_2) = \sum_j w_j \cdot f_j(m, i, d_1, d_2, c(d_1), c(d_2))
+\end{equation}
+
+Component functions include latency, dollar cost per byte, energy cost normalized by battery, queue delay, and priority-weighted latency. Weights $w_j$ are configurable at network and device levels. \Cref{tab:costprofiles} shows the preset cost profiles.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Cost profile weight configurations}
+\label{tab:costprofiles}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Profile} & $w_{\text{lat}}$ & $w_{\text{\$}}$ & $w_{\text{energy}}$ & $w_{\text{queue}}$ \\
+\midrule
+Balanced & 1.0 & 1.0 & 1.0 & 1.0 \\
+EnergyConstrained & 0.5 & 0.5 & 3.0 & 1.0 \\
+CostSensitive & 0.5 & 3.0 & 0.5 & 1.0 \\
+LatencyCritical & 3.0 & 0.1 & 0.1 & 2.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Path cost is the sum of edge costs. When cost metadata is stale or unavailable, routing falls back to Babel shortest path.
+
+\subsection{Hybrid Logical Clocks}
+
+Each device maintains a hybrid logical clock (HLC) consisting of wall-clock time $w \in \mathbb{N}$ (milliseconds), logical counter $c \in \mathbb{N}$, and node identifier $n \in D$. Total ordering is defined lexicographically: $\text{hlc}_1 < \text{hlc}_2$ iff $(w_1, c_1, n_1) < (w_2, c_2, n_2)$.
+
+The HLC operations (tick, send, receive) follow Kulkarni et al.~\cite{kulkarni2014hlc}, ensuring that the physical component is bounded close to real time while providing causality ordering.
+
+\textbf{Time quarantine:} When a device rejoins after extended disconnection, clock drift may corrupt timestamps. On first peer connection after boot, the device computes $\Delta = |\text{local\_hlc.wall} - \text{peer\_hlc.wall}|$. For $\Delta < 1$ minute, normal operation proceeds. For $1$ minute $< \Delta < 1$ hour, the device accepts the peer HLC and logs a warning. For $\Delta > 1$ hour (configurable), the device enters quarantine: it can receive gossip state and application messages but cannot publish or create interests until time sync completes via GPS lock, NTP sync, or manual override.
+
+\subsection{CRDT State Model}
+
+Avena uses CRDTs to ensure convergence without coordination:
+
+\textbf{Device Registry:} OR-Map$\langle$DeviceId, DeviceInfo$\rangle$ where DeviceInfo fields use LWW-Register semantics with HLC timestamps.
+
+\textbf{Workload Specifications:} OR-Map$\langle$WorkloadId, WorkloadSpec$\rangle$ with field-level LWW-Register merge.
+
+\textbf{Active Interests:} OR-Set$\langle$Interest$\rangle$ with add-wins semantics; terminated interests represented as tombstones.
+
+\textbf{Cost Metadata:} Map$\langle$DeviceId, LWW-Register$\langle$CostMetadata$\rangle\rangle$ (single-writer per device).
+
+\begin{theorem}[Convergence]
+Under $(T, i)$-connectivity and bounded clock drift $\delta$, any gossip state update at time $\tau_0$ propagates to all devices by time $\tau_0 + T$. CRDT semantics ensure all devices converge to the same state regardless of propagation order.
+\end{theorem}
+
+\subsection{Interest Semantics}
+
+An interest $i$ specifies: unique identifier, owner device, subject pattern, priority, retention policy, optional historic priority, TTL, ordering requirement, geo-bounds, HLC timestamp, and termination status.
+
+\begin{definition}[Delivery Set]
+For interest $i$ on device $d$ at time $t$:
+\begin{align*}
+\text{deliver}(i, d, t) = \{m : &\text{subj}(m) \in \text{pattern}(i) \\
+\land\ &\text{permitted}(d, \text{subj}(m)) \\
+\land\ &\text{satisfies\_retention}(m, i) \\
+\land\ &\text{satisfies\_geo}(m, i, d, t) \\
+\land\ &\neg\text{delivered}(m, i) \\
+\land\ &\neg\text{terminated}(i)\}
+\end{align*}
+\end{definition}
+
+
+\section{Experimental Methodology}
+\label{sec:methodology}
+
+We evaluate Avena through emulation using virtualized devices running the actual implementation under simulated network conditions.
+
+\subsection{Emulation Infrastructure}
+
+Each emulated device runs as a systemd-nspawn container containing the complete stack: Linux userspace, avenad, Wireguard, FRR, and NATS. Network conditions are simulated using ns-3 in real-time emulation mode.
+
+\subsection{Metrics}
+
+Primary metrics: convergence time (workload issuance to deployment), propagation delay (state update to specific device), conflict rate (concurrent modification fraction), CRDT merge correctness, mesh stability (link event rate), and gossip overhead.
+
+\subsection{Network Condition Models}
+
+Link models representative of vehicle-centric deployments: WiFi (5--50ms latency, 0.1--5\% loss, 10--50 Mbps), cellular (50--200ms, 1--3\%, 2--20 Mbps), LoRa (500ms, 2\%, 50 Kbps), LEO satellite (40ms, 100 Mbps), GEO satellite (600ms, 10 Mbps).
+
+\subsection{Experimental Scenarios}
+
+\textbf{A (Baseline):} Always-connected devices establishing performance ceiling.
+\textbf{B (Periodic):} 5-minute connectivity windows every $T$ hours.
+\textbf{C (Mobile Relay):} Disconnected clusters with traversing mobile relay.
+\textbf{D (Partition):} Concurrent workload modifications during partition.
+\textbf{E (Scaling):} $N \in \{10, 30, 50, 100\}$ devices with random geometric connectivity.
+\textbf{F (Relay Policy):} Heterogeneous device types and relay policies.
+\textbf{G (Routing):} Cost-optimal routing vs. metadata freshness tradeoff.
+\textbf{H (Geo-Spatial):} Traffic reduction with geo-bounded interests.
+\textbf{I (Failure):} Clock drift, malicious metadata, interference.
+\textbf{J (Comparison):} Standard MQTT/NATS under same conditions.
+\textbf{K (V2X):} Intersection SPaT delivery latency.
+\textbf{L (Platoon):} High-rate position sharing interest propagation.
+
+\subsection{Physical Validation}
+
+Emulation validated against physical deployment: agricultural (5--10 fixed devices, 3--5 mobile assets, 10+ sensors) and V2X (intersection controller, 3--5 vehicles, RSUs).
+
+
+\section{Results}
+\label{sec:results}
+
+[Results to be populated from experimental evaluation.]
+
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Limitations}
+
+Avena provides best-effort priority delivery rather than hard real-time guarantees. Applications requiring guaranteed deadlines need dedicated channel reservation or admission control.
+
+The practical limits of gossip propagation over LoRa broadcast require further characterization. Protocol specifics (raw LoRa vs. LoRaWAN, collision handling) remain open implementation details.
+
+Certificate revocation during partition is bounded by certificate lifetime. Short lifetimes (months) mitigate but do not eliminate the window where revoked devices operate within their partition.
+
+Position staleness affects geo-spatial filtering accuracy. Receiver-side filtering trades over-delivery for simplicity; applications requiring strict geo-fencing should implement additional validation.
+
+\subsection{Future Work}
+
+Network-layer aggregation could enable interests to specify aggregation functions over time windows, with the network computing aggregates before delivery.
+
+Cross-domain data relay incentives could compensate devices relaying across domain boundaries. Economic models for data delivery in sparse networks remain unexplored.
+
+Integration with V2X standards (SAE J2735) would enable Avena as the delay-tolerant layer above DSRC or C-V2X physical links.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented Avena, a distributed fleet management system bridging pub/sub messaging with delay-tolerant delivery. The system comprises an encrypted overlay network, an interest-driven messaging layer with store-and-forward delivery, and a CRDT-based fleet daemon enabling workload orchestration without coordination.
+
+Avena addresses vehicle-centric edge computing where mobile assets serve as both network participants and data carriers in environments with intermittent, expensive, or unstable connectivity. The NATS-compatible API lets applications publish to subjects and subscribe to patterns while infrastructure handles connectivity, mobile relays, cost-aware routing, and multi-domain trust. Two network modes---Messaging for pub/sub-only workloads and Addressable for direct IP connectivity via sidecar containers---provide flexibility while maintaining workload isolation through end-to-end encryption.
+
+Beyond technical capabilities, Avena enables a decoupled ecosystem where hardware vendors compete on physical capabilities and software vendors access the combined installed base without per-OEM integration. This parallels successful platform models while addressing the unique requirements of industrial edge computing.
+
+Our evaluation demonstrates [to be completed] eventual delivery under bounded connectivity, correct CRDT merging during partitions, and bandwidth reduction through geo-spatial filtering compared to baseline systems that fail under intermittent connectivity.
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

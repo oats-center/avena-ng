@@ -56,7 +56,10 @@ fn is_in_user_namespace() -> bool {
             // Check if this is a narrow mapping (user namespace) vs full range
             if parts.len() >= 3 {
                 // If the range is small, we're in a user namespace
-                parts[2].parse::<u64>().map(|range| range < 1000).unwrap_or(false)
+                parts[2]
+                    .parse::<u64>()
+                    .map(|range| range < 1000)
+                    .unwrap_or(false)
             } else {
                 false
             }
@@ -64,7 +67,12 @@ fn is_in_user_namespace() -> bool {
         .unwrap_or(false)
 }
 
-fn reexec_in_namespace(scenario: &PathBuf, output: &PathBuf, keep_namespaces: bool, verbose: bool) -> ExitCode {
+fn reexec_in_namespace(
+    scenario: &PathBuf,
+    output: &PathBuf,
+    keep_namespaces: bool,
+    verbose: bool,
+) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -178,7 +186,11 @@ async fn main() -> ExitCode {
             Ok(s) => {
                 println!("✓ Scenario '{}' is valid", s.name);
                 println!("  {} nodes, {} links", s.nodes.len(), s.links.len());
-                println!("  {} events, {} assertions", s.events.len(), s.assertions.len());
+                println!(
+                    "  {} events, {} assertions",
+                    s.events.len(),
+                    s.assertions.len()
+                );
                 println!("  Duration: {}s", s.duration_secs);
                 ExitCode::SUCCESS
             }

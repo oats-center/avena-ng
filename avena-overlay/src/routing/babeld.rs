@@ -47,11 +47,11 @@ fn default_binary_path() -> PathBuf {
 }
 
 const fn default_hello_interval() -> u16 {
-    4000
+    1000
 }
 
 const fn default_update_interval() -> u16 {
-    16000
+    4000
 }
 
 impl Default for BabeldConfig {
@@ -182,10 +182,6 @@ impl BabeldController {
             .arg("-H")
             .arg(hello_secs.to_string());
 
-        for iface in interfaces {
-            cmd.arg(*iface);
-        }
-
         info!(
             binary = %self.config.binary_path.display(),
             socket = %self.config.socket_path.display(),
@@ -193,9 +189,9 @@ impl BabeldController {
             "starting babeld"
         );
 
-        let child = cmd.spawn().map_err(|e| {
-            RoutingError::spawn_failed(self.config.binary_path.clone(), e)
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| RoutingError::spawn_failed(self.config.binary_path.clone(), e))?;
 
         self.process = Some(child);
 
@@ -204,6 +200,10 @@ impl BabeldController {
 
         // Connect to control socket
         self.connect().await?;
+
+        for iface in interfaces {
+            self.add_interface(iface).await?;
+        }
 
         Ok(())
     }
@@ -289,13 +289,14 @@ impl BabeldController {
 
     /// Add an interface to the babel routing domain.
     pub async fn add_interface(&mut self, name: &str) -> Result<(), RoutingError> {
-        self.send_command(&format!("interface {name}\n")).await?;
+        self.send_command(&interface_tunnel_command(name)).await?;
         self.read_until_ok().await
     }
 
     /// Remove an interface from the babel routing domain.
     pub async fn flush_interface(&mut self, name: &str) -> Result<(), RoutingError> {
-        self.send_command(&format!("flush interface {name}\n")).await?;
+        self.send_command(&format!("flush interface {name}\n"))
+            .await?;
         self.read_until_ok().await
     }
 
@@ -333,10 +334,7 @@ impl BabeldController {
     pub async fn monitor(&mut self) -> Result<mpsc::Receiver<BabelEvent>, RoutingError> {
         self.send_command("monitor\n").await?;
 
-        let reader = self
-            .reader
-            .take()
-            .ok_or_else(RoutingError::not_running)?;
+        let reader = self.reader.take().ok_or_else(RoutingError::not_running)?;
 
         self.writer = None; // Close writer too since monitor takes over
 
@@ -642,7 +640,10 @@ fn parse_flush_route(parts: &[&str]) -> Option<BabelEvent> {
         i += 1;
     }
 
-    Some(BabelEvent::RouteRemoved { id, prefix: prefix? })
+    Some(BabelEvent::RouteRemoved {
+        id,
+        prefix: prefix?,
+    })
 }
 
 fn parse_flush_neighbour(parts: &[&str]) -> Option<BabelEvent> {
@@ -655,9 +656,29 @@ fn parse_flush_neighbour(parts: &[&str]) -> Option<BabelEvent> {
     })
 }
 
+fn interface_tunnel_command(name: &str) -> String {
+    format!("interface {name} type tunnel unicast true split-horizon true\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_tunnel_command_uses_unicast_tunnel_mode() {
+        let cmd = interface_tunnel_command("av-deadbeef");
+        assert_eq!(
+            cmd,
+            "interface av-deadbeef type tunnel unicast true split-horizon true\n"
+        );
+    }
+
+    #[test]
+    fn default_babeld_intervals_are_mobility_friendly() {
+        let config = BabeldConfig::default();
+        assert_eq!(config.hello_interval, 1000);
+        assert_eq!(config.update_interval, 4000);
+    }
 
     #[test]
     fn parse_interface_line() {
@@ -674,7 +695,8 @@ mod tests {
 
     #[test]
     fn parse_neighbour_line() {
-        let line = "add neighbour 12ab34cd address fe80::2 if avena0 reach ffff rxcost 256 txcost 256";
+        let line =
+            "add neighbour 12ab34cd address fe80::2 if avena0 reach ffff rxcost 256 txcost 256";
         let parsed = parse_babel_line(line);
         assert!(matches!(parsed, Some(ParsedLine::Neighbour(_))));
 
@@ -696,7 +718,10 @@ mod tests {
 
         if let Some(ParsedLine::Route(route)) = parsed {
             assert_eq!(route.id, "12ab34cd");
-            assert_eq!(route.prefix, "fd00:a0e0:a000::1/128".parse::<IpNet>().unwrap());
+            assert_eq!(
+                route.prefix,
+                "fd00:a0e0:a000::1/128".parse::<IpNet>().unwrap()
+            );
             assert!(route.installed);
             assert_eq!(route.metric, 256);
             assert_eq!(route.via, "fe80::2".parse::<Ipv6Addr>().unwrap());
@@ -711,7 +736,10 @@ mod tests {
         assert!(matches!(parsed, Some(ParsedLine::Xroute(_))));
 
         if let Some(ParsedLine::Xroute(xroute)) = parsed {
-            assert_eq!(xroute.prefix, "fd00:a0e0:a000::/48".parse::<IpNet>().unwrap());
+            assert_eq!(
+                xroute.prefix,
+                "fd00:a0e0:a000::/48".parse::<IpNet>().unwrap()
+            );
             assert_eq!(xroute.metric, 0);
         }
     }

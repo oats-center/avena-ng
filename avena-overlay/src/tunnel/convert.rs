@@ -18,7 +18,8 @@ pub(crate) fn peer_config_to_wg_peer(config: &PeerConfig) -> WgPeer {
     }
 
     for ip in &config.allowed_ips {
-        peer.allowed_ips.push(IpAddrMask::new(ip.addr(), ip.prefix_len()));
+        peer.allowed_ips
+            .push(IpAddrMask::new(ip.addr(), ip.prefix_len()));
     }
 
     peer

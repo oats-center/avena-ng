@@ -195,7 +195,9 @@ impl DiscoveryService {
     }
 
     pub fn emit_event(&self, event: DiscoveryEvent) -> Result<(), DiscoveryError> {
-        self.tx.send(event).map_err(|_| DiscoveryError::ChannelClosed)?;
+        self.tx
+            .send(event)
+            .map_err(|_| DiscoveryError::ChannelClosed)?;
         Ok(())
     }
 

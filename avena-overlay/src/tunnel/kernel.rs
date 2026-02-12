@@ -91,7 +91,8 @@ impl TunnelBackend for KernelBackend {
                 .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
             let wg = wg_guard.as_ref().unwrap();
 
-            let current_host = wg.read_host()
+            let current_host = wg
+                .read_host()
                 .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
 
             let mut host = Host::default();
@@ -331,11 +332,13 @@ mod tests {
         let guard = InterfaceGuard::new();
         let backend = KernelBackend::new();
 
-        backend.ensure_interface(guard.name()).await.expect("create interface");
+        backend
+            .ensure_interface(guard.name())
+            .await
+            .expect("create interface");
 
         let pubkey = [42u8; 32];
-        let config = PeerConfig::new(pubkey)
-            .with_allowed_ips(vec!["fd00::1/128".parse().unwrap()]);
+        let config = PeerConfig::new(pubkey).with_allowed_ips(vec!["fd00::1/128".parse().unwrap()]);
 
         let result = backend.add_peer(&config).await;
         assert!(result.is_ok(), "Failed to add peer: {:?}", result);
@@ -351,7 +354,10 @@ mod tests {
         let guard = InterfaceGuard::new();
         let backend = KernelBackend::new();
 
-        backend.ensure_interface(guard.name()).await.expect("create interface");
+        backend
+            .ensure_interface(guard.name())
+            .await
+            .expect("create interface");
 
         let pubkey = [42u8; 32];
         let config = PeerConfig::new(pubkey);

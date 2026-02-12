@@ -148,9 +148,19 @@ impl LinkManager {
         let loss_arg = format!("{}%", state.loss_percent);
 
         self.run_cmd(&[
-            "tc", "qdisc", "add", "dev", &state.bridge_name, "root", "netem",
-            "delay", &delay_arg, "loss", &loss_arg,
-        ]).await
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            &state.bridge_name,
+            "root",
+            "netem",
+            "delay",
+            &delay_arg,
+            "loss",
+            &loss_arg,
+        ])
+        .await
     }
 
     async fn run_cmd(&self, args: &[&str]) -> Result<(), LinkError> {
@@ -167,7 +177,11 @@ impl LinkManager {
         Ok(())
     }
 
-    pub async fn set_link_enabled(&mut self, link_id: &str, enabled: bool) -> Result<(), LinkError> {
+    pub async fn set_link_enabled(
+        &mut self,
+        link_id: &str,
+        enabled: bool,
+    ) -> Result<(), LinkError> {
         let state = self
             .links
             .get(link_id)

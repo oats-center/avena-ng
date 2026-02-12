@@ -165,7 +165,11 @@ impl TestRunner {
             scenario.assertions.len()
         ));
         let result = executor
-            .run_timeline(&scenario.events, &scenario.assertions, scenario.duration_secs)
+            .run_timeline(
+                &scenario.events,
+                &scenario.assertions,
+                scenario.duration_secs,
+            )
             .await;
         phase.done();
 

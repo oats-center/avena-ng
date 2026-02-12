@@ -1,0 +1,510 @@
+% Chapter 2: Avena Overlay Network
+% Contains: Physical Links, Discovery, Tunnels, Routing, Cross-Layer Metrics, WiFi Modes
+
+% ============================================================
+\section{Avena Overlay Network}
+% ============================================================
+
+The Avena Overlay Network provides encrypted, authenticated IP connectivity over heterogeneous physical links. It is the foundation upon which the Messaging Network operates.
+
+\subsection{Physical Links (Layer 0)}
+
+The physical layer comprises heterogeneous link technologies, each with distinct range, throughput, and propagation characteristics. The proliferation of unlicensed and lightly-licensed spectrum options creates an opportunity for multi-technology deployments where a single node may incorporate multiple radio interfaces.
+
+\textbf{High-rate links:}
+
+\begin{description}
+    \item[WiFi (802.11a/b/g/n/ac/ax):] Traditional WiFi at 2.4~GHz and 5~GHz provides high throughput (tens to hundreds of Mbps) at short range (tens to hundreds of meters). Latency is low (5--50~ms). The 2.4~GHz band offers better propagation through vegetation but faces congestion; 5~GHz provides higher throughput but shorter range.
+
+    \item[WiFi HaLow (802.11ah):] Sub-GHz operation (900~MHz in US) provides kilometer-scale range with throughput in the hundreds of Kbps to low Mbps. The sub-GHz propagation characteristics (better penetration, longer range) suit agricultural environments with long distances and vegetation. HaLow defines specific enhancements for IoT scenarios including longer beacons and restricted access windows.
+
+    \item[CBRS (Citizens Broadband Radio Service):] 3.5~GHz spectrum (3550--3700~MHz) available through database-coordinated sharing in the US. GAA (General Authorized Access) tier requires no license. CBRS provides cellular-like range with generous power limits (30~dBm EIRP for GAA), offering a middle ground between short-range WiFi and carrier-dependent cellular.
+
+    \item[Cellular (LTE/5G):] Wide-area coverage where available, but recurring costs, latency through core network transit (50--200~ms), and dependency on carrier infrastructure. Rural coverage is often unreliable or absent.
+
+    \item[Satellite (LEO/GEO):] LEO services (Starlink, OneWeb) provide backhaul with 20--40~ms latency but per-device costs that do not scale to low-value sensors. GEO satellites offer wider coverage at 600ms+ latency, unsuitable for safety-critical applications.
+\end{description}
+
+\textbf{Low-rate links:}
+
+\begin{description}
+    \item[LoRa:] Long-range (miles) at low throughput (bytes to kilobytes per second). Sub-GHz operation (900~MHz ISM band in US) with excellent propagation. Suitable for presence announcements and control-plane traffic, not bulk data.
+
+    \item[TV White Spaces (TVWS):] UHF bands (470--698~MHz) available through database-coordinated spectrum sharing. Long-range propagation characteristics similar to LoRa but with higher throughput potential. Requires geolocation-based spectrum access via FCC databases.
+\end{description}
+
+\textbf{V2X-specific links:}
+
+\begin{description}
+    \item[DSRC (802.11p):] Dedicated 5.9~GHz band with OCB (Outside the Context of a BSS) operation eliminating association delays. Purpose-built for vehicular environments with latencies under 10~ms. Supports Basic Safety Messages at 10~Hz.
+
+    \item[C-V2X (Cellular V2X):] LTE/5G-based V2X with both direct (sidelink) and network-based modes. PC5 interface enables direct vehicle-to-vehicle communication without infrastructure.
+\end{description}
+
+A single agricultural vehicle or field installation might reasonably incorporate WiFi (for local high-bandwidth connections), HaLow (for kilometer-range sensor communication), and LoRa (for presence and topology announcements). The overlay network abstracts this heterogeneity, presenting applications with unified IP connectivity regardless of the underlying path.
+
+\subsection{Peer Discovery}
+
+Devices discover potential peers through multiple mechanisms:
+
+\textbf{mDNS/DNS-SD:} On local networks (WiFi, ethernet), devices advertise presence using mDNS with service type \texttt{\_avena.\_udp.local.}. The advertisement includes TXT records:
+
+\begin{lstlisting}
+_avena._udp.local.
+  avena-id=<base32-device-id>       # lowercase base32, 26 chars
+  wg-endpoint=<ip>:<port>           # WireGuard UDP endpoint
+  cap=relay,gateway,workload-spawn  # comma-separated capabilities
+\end{lstlisting}
+
+\textbf{Defined capabilities:}
+\begin{itemize}[nosep]
+    \item \texttt{relay} --- Device can relay messages for other peers
+    \item \texttt{workload-spawn} --- Device can spawn containerized workloads
+    \item \texttt{device-issue} --- Device can issue certificates for new devices
+    \item \texttt{gateway} --- Device provides connectivity to external networks
+\end{itemize}
+
+\textbf{Configured endpoints:} Devices may be configured with static peer endpoints (IP addresses or DNS names) for well-known infrastructure nodes such as farm gateways or fleet coordinators. These bootstrap initial connectivity.
+
+\textbf{LoRa presence announcements:} On the low-rate channel, devices broadcast presence beacons containing their Avena ID and a flag indicating they are available for high-rate connection. This enables discovery before WiFi association---a tractor entering a field announces presence via LoRa, and nearby devices can prepare for tunnel establishment.
+
+\begin{lstlisting}[language=Rust]
+struct LoRaPresence {
+    device_id: DeviceId,
+    capabilities: Set<Capability>,
+    high_rate_available: bool,
+    // Optional: coarse position for geo-aware discovery
+    position: Option<CoarsePosition>,
+}
+\end{lstlisting}
+
+\textbf{Gossip-derived topology:} Once connected to any peer, a device receives the full device registry via gossip. This registry includes endpoint hints for other devices, enabling transitive discovery---device A learns about device C through device B.
+
+\subsection{Tunnel Establishment}
+
+When a device discovers a potential peer, it initiates tunnel establishment:
+
+\subsubsection{Handshake Protocol}
+
+The handshake uses a custom TCP protocol on port \texttt{wg\_port + 1}:
+
+\begin{lstlisting}
++------+-------+--------+--------+---------+
+| AVHS | Ver=1 | PubKey | Length | JSON    |
+| 4B   | 1B    | 32B    | 4B     | <=8KB   |
++------+-------+--------+--------+---------+
+\end{lstlisting}
+
+\textbf{Wire format:}
+\begin{enumerate}[nosep]
+    \item Magic bytes: \texttt{AVHS} (4 bytes)
+    \item Protocol version: \texttt{0x01} (1 byte)
+    \item Sender's Ed25519 public key (32 bytes)
+    \item Message length as u32 big-endian (4 bytes)
+    \item JSON-encoded \texttt{HandshakeMessage} (max 8KB)
+\end{enumerate}
+
+\textbf{Security parameters:}
+\begin{itemize}[nosep]
+    \item Handshake timeout: 10 seconds
+    \item Max concurrent incoming handshakes: 32
+    \item Max concurrent outgoing handshakes: 16
+    \item Rate limit: 5 handshakes per IP per 60 seconds
+    \item Nonce cache: 10,000 entries, 70-second expiry
+    \item Timestamp validity window: $\pm$60 seconds
+\end{itemize}
+
+\textbf{Tie-breaking:} When both peers discover each other, the device with the larger DeviceId initiates. The other waits.
+
+\subsubsection{Phase 1: Message Exchange and Verification}
+
+Both devices exchange \texttt{HandshakeMessage} payloads. Each device verifies the peer's message:
+\begin{enumerate}
+    \item Timestamp within $\pm$60 seconds of local time
+    \item Signature valid over: \texttt{ephemeral\_pubkey || nonce || timestamp || peer\_device\_id || wg\_pubkey}
+    \item Certificate (JWT) validates against trusted root CA
+    \item Certificate subject matches sender's DeviceId
+    \item Nonce not previously seen (replay protection)
+\end{enumerate}
+
+If verification fails, the connection is dropped. No tunnel is established with untrusted peers.
+
+\subsubsection{Phase 2: Key Derivation}
+
+Avena uses two types of WireGuard keys:
+
+\textbf{Interface keys (stable):} Derived deterministically from the device's Ed25519 identity using HKDF-SHA256:
+
+\begin{lstlisting}[language=Rust]
+const WG_DEVICE_KEY_SALT: &[u8] = b"avena-wireguard-device-key-v1";
+const WG_DEVICE_KEY_INFO: &[u8] = b"wireguard-interface";
+
+fn derive_wireguard_keypair(device: &DeviceKeypair) -> WireguardKeypair {
+    let hkdf = Hkdf::<Sha256>::new(Some(WG_DEVICE_KEY_SALT), &device.to_bytes());
+    let mut private = [0u8; 32];
+    hkdf.expand(WG_DEVICE_KEY_INFO, &mut private).unwrap();
+    let public = X25519PublicKey::from(&StaticSecret::from(private)).to_bytes();
+    WireguardKeypair { private, public }
+}
+\end{lstlisting}
+
+\textbf{Session PSKs (per-connection):} Derived from ephemeral X25519 Diffie-Hellman:
+
+\begin{lstlisting}[language=Rust]
+const SESSION_KEY_SALT: &[u8] = b"avena-session-keys-v1";
+const WG_PSK_INFO: &[u8] = b"wireguard-psk";
+
+fn derive_session_keys(local: &EphemeralKeypair, peer: &X25519PublicKey) -> SessionKeys {
+    let shared_secret = local.diffie_hellman(peer);
+    let hkdf = Hkdf::<Sha256>::new(Some(SESSION_KEY_SALT), &shared_secret);
+    let mut wg_psk = [0u8; 32];
+    hkdf.expand(WG_PSK_INFO, &mut wg_psk).unwrap();
+    SessionKeys { wireguard_psk: wg_psk }
+}
+\end{lstlisting}
+
+\textbf{HandshakeMessage structure:}
+
+\begin{lstlisting}[language=Rust]
+struct HandshakeMessage {
+    ephemeral_pubkey: [u8; 32],    // X25519 ephemeral for DH
+    nonce: [u8; 32],               // Random, for replay protection
+    timestamp_secs: u64,           // Unix timestamp
+    wg_pubkey: [u8; 32],           // Stable WireGuard interface key
+    signature: [u8; 64],           // Ed25519 over message fields
+    device_cert: String,           // JWT certificate
+}
+\end{lstlisting}
+
+The signature covers: \texttt{ephemeral\_pubkey || nonce || timestamp || peer\_device\_id || wg\_pubkey}.
+
+\subsubsection{Phase 3: Wireguard Tunnel Activation}
+
+With derived keys, both devices create a dedicated Wireguard interface for this (peer, underlay) combination:
+\begin{enumerate}
+    \item Generate interface name: \texttt{av-<hash8>} from hash of \texttt{(local\_id, peer\_id, underlay\_name)}
+    \item Allocate UDP port deterministically from configured range using interface name hash
+    \item Create Wireguard interface with derived private key
+    \item Configure peer entry with: public key, PSK, endpoint (peer's underlay IP:port), \texttt{AllowedIPs = ::/0}
+    \item Assign IPv6 link-local address (\texttt{fe80::}) derived from interface name for Babel
+    \item Assign overlay IPv6 address for the local device
+    \item Notify babeld: \texttt{interface av-<hash8> type tunnel unicast true split-horizon true}
+\end{enumerate}
+
+\textbf{AllowedIPs configuration:} All peer interfaces use \texttt{AllowedIPs = ::/0}. This permits Babel to route any destination through any peer. Babel's routing decisions, not WireGuard's AllowedIPs, determine which interface carries traffic.
+
+If the peer is discovered over multiple underlay interfaces (e.g., WiFi and cellular), a separate Wireguard interface is created for each. Babel sees these as distinct links and can route traffic over whichever has better metrics, or failover automatically if one path degrades.
+
+Once a link is active, Babel begins advertising routes over the associated Wireguard interface.
+
+\subsubsection{Phase 4: Gossip Synchronization}
+
+Immediately after tunnel establishment, devices perform full gossip synchronization (see Section~\ref{sec:gossip}). This exchanges device registry, workload specs, interests, and cost metadata.
+
+\subsection{Tunnel Teardown}
+
+Tunnels are torn down when peers become unreachable or explicitly disconnect.
+
+\textbf{Dead Peer Detection:} Wireguard maintains a last-handshake timestamp for each peer. If no successful handshake occurs within a configurable timeout (default: 180 seconds), the peer is considered potentially dead. Avena additionally sends lightweight keepalive probes over established tunnels.
+
+When a peer is unresponsive:
+\begin{enumerate}
+    \item Babel withdraws routes through the dead peer (triggered by link quality degradation)
+    \item After timeout, Wireguard peer entry is removed
+    \item Tunnel interface is reconfigured without the peer
+    \item Store-and-forward queues retain any messages destined for interests owned by the departed peer
+\end{enumerate}
+
+\textbf{Explicit Disconnection:} A device may send a disconnect notification before departing (e.g., tractor leaving WiFi range). This enables graceful teardown:
+\begin{enumerate}
+    \item Peer receives disconnect notification
+    \item Babel immediately withdraws routes (no timeout delay)
+    \item Wireguard peer entry is removed
+    \item Gossip state is retained---the departed device remains in the device registry with stale cost metadata
+\end{enumerate}
+
+\textbf{Mobility and Reconnection:} When a previously-known peer reconnects (same device ID, valid certificate):
+\begin{enumerate}
+    \item Discovery occurs via mDNS, LoRa, or configured endpoint
+    \item Certificate exchange verifies identity (certificate may have been refreshed)
+    \item New tunnel handshake derives fresh session keys
+    \item Gossip synchronization catches up any missed state changes
+    \item Store-and-forward queues drain messages accumulated during disconnection
+\end{enumerate}
+
+\subsection{IP Addressing}
+
+IPv6 with Unique Local Addresses (ULA) in the \texttt{fd00::/8} range. The default prefix is \texttt{fd00:a0e0:a000::/48}. Device addresses are derived from the device ID:
+
+\begin{lstlisting}[language=Rust]
+// Device host address derivation
+// prefix_segments[0..3] = network prefix (48 bits)
+// segments[4..7] = first 8 bytes of device ID
+// segment[7] = 0x0001 for host address
+fn device_address(prefix: &Ipv6Addr, id: &DeviceId) -> Ipv6Addr {
+    let suffix = id.to_ipv6_suffix();  // first 8 bytes of ID
+    Ipv6Addr::new(
+        prefix.segments()[0], prefix.segments()[1], prefix.segments()[2],
+        u16::from_be_bytes([suffix[0], suffix[1]]),
+        u16::from_be_bytes([suffix[2], suffix[3]]),
+        u16::from_be_bytes([suffix[4], suffix[5]]),
+        u16::from_be_bytes([suffix[6], suffix[7]]),
+        1,  // host suffix
+    )
+}
+
+// Workload address derivation
+// Same as device but segment[7] = 0x0100 + workload_idx
+fn workload_address(prefix: &Ipv6Addr, id: &DeviceId, idx: u16) -> Ipv6Addr {
+    // ... same prefix and suffix ...
+    // segment[7] = idx.wrapping_add(0x100)
+}
+\end{lstlisting}
+
+This ensures addresses are deterministic and verifiable from the device's public key. Only \texttt{/48} prefixes are supported.
+
+\subsection{Routing}
+
+\textbf{Babel (RFC 8966)} via the \texttt{babeld} daemon provides IP-layer routing over Wireguard interfaces. Babel is designed for wireless mesh networks with lossy links and frequent topology changes. Key characteristics:
+\begin{enumerate}
+    \item Distance-vector protocol with loop-avoidance via feasibility conditions
+    \item Handles link asymmetry (common in wireless)
+    \item Fast convergence on topology changes
+    \item Supports multiple metrics (hop count, latency, loss)
+\end{enumerate}
+
+\textbf{Babel is mandatory.} There is no mode where Avena operates without Babel routing. If \texttt{babeld} fails to start, avenad treats this as a fatal error.
+
+\subsubsection{Unicast Mode for WireGuard}
+
+WireGuard interfaces are point-to-point tunnels that do not support multicast. Standard Babel relies on link-local multicast (\texttt{ff02::1:6}) for neighbor discovery. To work with WireGuard, Babel runs in \textbf{unicast mode}:
+
+\begin{lstlisting}
+interface av-<hash> type tunnel unicast true split-horizon true
+\end{lstlisting}
+
+\begin{description}
+    \item[\texttt{type tunnel}] Enables RTT measurement via timestamps; applies tunnel-appropriate cost defaults.
+    \item[\texttt{unicast true}] Sends Babel TLVs via unicast to each known neighbor instead of multicast. Required since WireGuard does not forward multicast.
+    \item[\texttt{split-horizon true}] Optimization for point-to-point links: do not advertise a route back to the neighbor from which it was learned.
+\end{description}
+
+Each WireGuard interface requires an IPv6 link-local address (\texttt{fe80::/64}) for Babel to function. When avenad creates a WireGuard interface, it assigns a deterministic \texttt{fe80::} address derived from the interface name hash.
+
+\subsubsection{Dynamic Interface Management}
+
+When peers are discovered or lost, avenad dynamically reconfigures Babel via its Unix control socket (\texttt{/run/avena/babel.sock}):
+
+\begin{itemize}[nosep]
+    \item \textbf{Peer discovered:} Create WireGuard interface, assign \texttt{fe80::} address, tell Babel: \texttt{interface av-<hash> type tunnel unicast true split-horizon true}
+    \item \textbf{Peer lost:} Tell Babel: \texttt{flush interface av-<hash>}, then remove WireGuard interface
+    \item \textbf{Underlay change:} If physical interface goes down, remove associated WireGuard interfaces and notify Babel
+\end{itemize}
+
+Babel runs over all WireGuard interfaces belonging to an identity. When tunnels form or break, Babel automatically updates routes. When multiple underlay links exist to the same peer (e.g., WiFi and cellular), each link appears as a separate WireGuard interface with its own Babel metrics. Babel selects the best path; if one underlay fails, traffic automatically routes via the remaining path.
+
+\subsection{Underlay Manager}
+
+The Underlay Manager monitors physical network interfaces and triggers overlay reconfiguration when the physical topology changes.
+
+\textbf{Interface filtering:} Not all network interfaces should participate in the overlay. The configuration specifies include/exclude patterns:
+
+\begin{lstlisting}
+[underlay]
+include = ["wlan*", "wwan*", "eth*", "enp*"]
+exclude = ["docker*", "veth*", "virbr*", "br-*", "lo"]
+\end{lstlisting}
+
+Exclude patterns take precedence. An interface matches if it matches any include pattern and no exclude pattern.
+
+\textbf{Netlink monitoring:} The Underlay Manager subscribes to Linux netlink events (\texttt{RTM\_NEWLINK}, \texttt{RTM\_DELLINK}, \texttt{RTM\_NEWADDR}, \texttt{RTM\_DELADDR}) to detect:
+\begin{itemize}[nosep]
+    \item Interface up/down (e.g., WiFi adapter enabled/disabled)
+    \item IP address changes (e.g., DHCP lease renewal, new WiFi network)
+    \item Interface addition/removal (e.g., USB network adapter plugged in)
+\end{itemize}
+
+\textbf{Reactions to underlay changes:}
+\begin{description}
+    \item[Interface appears:] If it matches filter, start mDNS discovery on it. Existing peers may become reachable via new path.
+    \item[Interface disappears:] Stop discovery. Remove all WireGuard interfaces associated with that underlay. Notify Babel to flush those interfaces. Peers reached only via that underlay become unreachable (Babel will route via other paths if available).
+    \item[IP address changes:] Update mDNS advertisements. Existing tunnels may need endpoint updates (WireGuard handles this via roaming, but discovery must advertise new address).
+\end{description}
+
+\textbf{Graceful degradation:} Loss of one underlay does not disrupt connections reachable via other underlays. Babel automatically reroutes within seconds of detecting the link failure.
+
+\subsection{Low-Rate Channel (LPWAN)}
+
+A parallel LPWAN mesh (LoRa or similar) provides \textbf{hint-only} control-plane connectivity. The channel accelerates high-rate connection establishment; it is not a data path.
+
+\textbf{What flows over LPWAN:}
+
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Message} & \textbf{Size} & \textbf{Frequency} & \textbf{Purpose} \\
+\midrule
+Presence beacon & $\sim$50 bytes & 30--60s & Device ID, capabilities, coarse position \\
+Topology hint & $\sim$30 bytes & On change & ``I can reach device X'' \\
+Cost delta & $\sim$40 bytes & On change & Battery low, queue backing up \\
+Interest hint & $\sim$80 bytes & On subscribe & ``Someone wants subject X'' \\
+\bottomrule
+\end{tabular}
+
+\textbf{What does NOT flow:} Full device registry, workload specs, certificate chains, application messages. Full gossip synchronization occurs on high-rate channel.
+
+\textbf{Estimated bandwidth:} $\sim$1 Kbps for 100-device broadcast domain---well within LPWAN budgets.
+
+\textbf{Value proposition:} A tractor approaching a field sensor hears its presence beacon. Before WiFi association completes, the tractor knows: sensor exists, has data for \texttt{app.soil.*}, battery at 80\%. Connection setup is one RTT, not discovery + negotiation.
+
+Protocol specifics (raw LoRa vs. LoRaWAN, addressing, collision handling) are documented in Section~\ref{sec:openquestions}.
+
+\subsection{Cross-Layer Metric Framework}
+\label{sec:crosslayer}
+
+The WireGuard tunnel abstraction deliberately hides transport details to achieve transport agnosticism. However, effective routing requires awareness of transport characteristics that influence path quality. This tension---between transport-agnostic design and physical-layer awareness---motivates a cross-layer metric framework.
+
+\subsubsection{Interface Classification Problem}
+
+The tunnel overlay creates a classification ambiguity for Babel. WireGuard interfaces present as point-to-point tunnel devices, which Babel classifies as wired. Consequently, Babel applies wired-mode cost computation (binary up/down) rather than wireless-mode ETX computation (continuous quality estimation).
+
+The underlying transport characteristics---packet loss, latency variation, throughput constraints---remain present but become invisible to Babel's native measurement. A lossy wireless link manifests as a lossy tunnel, but Babel does not apply the continuous cost adaptation that would occur on a native wireless interface.
+
+Two remediation approaches exist:
+
+\textbf{Interface reclassification:} Configure tunnel interfaces with wireless mode (\texttt{type wireless} in babeld), forcing ETX-style cost computation. This restores continuous cost adaptation but treats all transports uniformly regardless of their actual characteristics.
+
+\textbf{External cost injection:} A cross-layer daemon monitors physical interface statistics and injects appropriate costs via Babel's control interface. This preserves transport-specific awareness at the cost of additional system complexity.
+
+Avena follows the second approach, implementing a cross-layer metrics daemon with visibility into both physical interface statistics (via driver/kernel interfaces) and Babel routing state (via the Babel control socket).
+
+\subsubsection{Babel RTT Extension}
+
+RFC 9616 defines a delay-based metric extension for Babel that measures round-trip time between neighbors. The extension piggybacks timestamps on Hello and IHU (I Heard You) messages, enabling RTT computation without synchronized clocks using Mills' algorithm:
+
+\[
+\text{RTT} = (t_2 - t_1) - (t'_2 - t'_1)
+\]
+
+where $t_1$ is the transmit timestamp at node A, $t'_1$ and $t'_2$ are receive and transmit timestamps at node B, and $t_2$ is the receive timestamp at node A.
+
+The RTT measurement captures end-to-end delay through the tunnel, including queueing, transmission, and propagation components. This provides a transport-agnostic quality signal that partially compensates for the loss of physical-layer visibility.
+
+The extension maps RTT to cost via a piecewise linear function:
+
+\[
+C_{\text{rtt}} = \begin{cases}
+0 & \text{if } \text{RTT} < \text{rtt-min} \\
+\frac{\text{max-rtt-penalty} \times (\text{RTT} - \text{rtt-min})}{\text{rtt-max} - \text{rtt-min}} & \text{if } \text{rtt-min} \leq \text{RTT} \leq \text{rtt-max} \\
+\text{max-rtt-penalty} & \text{if } \text{RTT} > \text{rtt-max}
+\end{cases}
+\]
+
+Default parameters (rtt-min = 10~ms, rtt-max = 120~ms, max-rtt-penalty = 150) distinguish low-latency local links from high-latency distant links.
+
+\subsubsection{Observable Metrics}
+
+Different transport technologies expose different observable metrics:
+
+\begin{description}
+    \item[WiFi/HaLow (802.11):] Signal-to-noise ratio (SNR), received signal strength indicator (RSSI), current MCS index and data rate, retry statistics, channel busy time (via survey data).
+    \item[Cellular (LTE/5G):] Reference Signal Received Power (RSRP), Reference Signal Received Quality (RSRQ), Channel Quality Indicator (CQI), throughput estimates.
+    \item[Satellite:] Round-trip latency (highly variable), throughput, link availability.
+\end{description}
+
+The framework accommodates this heterogeneity, extracting whatever metrics each transport provides and mapping them to a common cost representation.
+
+\subsubsection{Babel Cost Model}
+
+We use a composite cost function combining multiplicative transport factors with an additive RTT component:
+
+\[
+\text{cost}(\text{link}) = C_{\text{base}} \times T_{\text{bitrate}}(B) \times T_{\text{snr}}(S) \times T_{\text{util}}(U) + C_{\text{rtt}}(\text{RTT})
+\]
+
+where $C_{\text{base}}$ is a baseline cost (96, matching Babel's wired default), each $T$ factor is a multiplier $\geq 1$, and $C_{\text{rtt}}$ is the RTT-derived cost.
+
+\textbf{Bitrate factor:} Normalizes link capacity against a reference rate:
+
+\[
+T_{\text{bitrate}} = \max\left(1, \frac{B_{\text{ref}}}{B_{\text{measured}}}\right)
+\]
+
+With $B_{\text{ref}}$ = 5~Mbps, a 1~Mbps HaLow link yields $T_{\text{bitrate}}$ = 5, while a 50~Mbps WiFi link yields $T_{\text{bitrate}}$ = 1.
+
+\textbf{SNR factor:} Maps signal quality to cost via piecewise linear scaling:
+
+\[
+T_{\text{snr}} = \begin{cases}
+1.0 & \text{if } S \geq S_{\text{good}} \\
+1 + k(S_{\text{good}} - S) & \text{if } S_{\text{bad}} < S < S_{\text{good}} \\
+T_{\text{max}} & \text{if } S \leq S_{\text{bad}}
+\end{cases}
+\]
+
+Recommended parameters: $S_{\text{good}}$ = 25~dB, $S_{\text{bad}}$ = 12~dB, $k$ = 0.2, $T_{\text{max}}$ = 4.
+
+\textbf{Utilization factor:} Approximates queueing delay from channel utilization:
+
+\[
+T_{\text{util}} = \min\left(T_{\text{max}}, \frac{1}{1 - U}\right)
+\]
+
+where $U$ is the observed channel utilization. At 50\% utilization, $T_{\text{util}}$ = 2; at 80\%, $T_{\text{util}}$ = 5.
+
+\subsubsection{Stabilization}
+
+Physical-layer metrics exhibit short-term variation that, if propagated directly to routing, would cause excessive path oscillation. The framework applies stabilization techniques:
+
+\textbf{Exponential smoothing:} Raw metric samples are filtered through an exponential moving average before cost computation:
+
+\[
+\bar{x}_n = \alpha \bar{x}_{n-1} + (1 - \alpha) x_n
+\]
+
+A smoothing constant $\alpha$ = 0.85 provides a half-life of approximately 4 samples.
+
+\textbf{Hysteresis:} Route changes require the alternative path to be substantially better, not merely marginally better. A 15\% cost improvement threshold prevents oscillation between nearly-equivalent paths.
+
+\textbf{Bounded mapping:} All cost factors saturate at defined bounds, preventing unbounded cost inflation from transient anomalies.
+
+\subsection{WiFi Operating Mode Analysis}
+\label{sec:wifimode}
+
+IEEE 802.11 defines several operating modes relevant to peer-to-peer mesh operation:
+
+\textbf{Infrastructure mode (AP/STA):} One node operates as Access Point; others associate as Stations. The AP coordinates medium access, providing airtime fairness and eliminating hidden node collisions within the BSS. The limitation is the requirement for a designated coordinator---problematic in fully distributed mobile networks.
+
+\textbf{Ad-hoc mode (IBSS):} All nodes are peers with no coordinator. Nodes share a common BSSID and communicate directly. Medium access is fully distributed via CSMA/CA. Implementation support is universal but scaling is poor due to collision growth and hidden node susceptibility.
+
+\textbf{Mesh mode (802.11s):} Purpose-built mesh standard with peer link management (MPM) and optional coordinated medium access (MCCA). The specification includes HWMP routing, which creates layering complications when Babel provides routing at layer 3.
+
+\subsubsection{Scaling Considerations}
+
+The critical scaling factor for distributed medium access is collision probability under load. For $n$ nodes with per-node transmission probability $\tau$:
+
+\[
+P_{\text{collision}} \approx 1 - (1 - \tau)^{n-1}
+\]
+
+Measured IBSS networks exhibit throughput degradation beyond 10--15 simultaneously active nodes, with aggregate throughput sometimes decreasing as node count increases due to collision overhead.
+
+The hidden node problem exacerbates this scaling. Nodes A and C, both in range of B but not each other, may transmit simultaneously and collide at B. Neither A nor C detects the collision, so exponential backoff does not engage appropriately.
+
+\subsubsection{802.11s Without HWMP}
+
+A middle path uses 802.11s mesh peering without the HWMP routing function. Linux wireless drivers support this via the \texttt{mesh\_fwding=0} configuration option. This provides:
+
+\begin{itemize}[nosep]
+    \item Explicit peer link state machines with authenticated establishment
+    \item Configurable peer monitoring and timeout
+    \item Foundation for optional coordinated scheduling (MCCA)
+\end{itemize}
+
+The overhead includes peering frame exchanges and state maintenance, but the benefit is explicit neighbor management rather than IBSS's implicit discovery.
+
+\subsubsection{Recommendations}
+
+For Avena deployments, we tentatively recommend IBSS mode for initial deployment due to universal support and configuration simplicity, with recognition that scaling limitations may necessitate migration to 802.11s (without HWMP) or dynamic AP election in dense deployments.
+
+The overlay architecture mitigates WiFi scaling problems to some extent: when WiFi becomes congested, Babel routes traffic over alternative transports (HaLow, cellular). The WiFi segment need not be globally optimal---it must provide useful capacity, with the routing layer exploiting whatever capacity is available.
+

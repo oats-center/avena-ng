@@ -1,0 +1,224 @@
+% Chapter 5: Interests and Geo-Spatial
+% Contains: Subject Namespace, Interest Model, Geo-Spatial Features
+
+% ============================================================
+\section{Subject Namespace}
+\label{sec:subjects}
+% ============================================================
+
+Standard subject hierarchy for Avena system and applications:
+
+\begin{Verbatim}[frame=single,fontsize=\small]
+avena.                              # System namespace
+|-- gossip.                         # State synchronization
+|   |-- topology.>                  # Network topology (LoRa-eligible)
+|   |-- cost.>                      # Cost metadata (LoRa-eligible)
+|   |-- workload.>                  # Workload specs
+|   |-- device.>                    # Device registry + positions
+|   +-- time.>                      # Time service locations (NTP/PTP)
+|-- control.                        # Control plane
+|   |-- workload.>                  # Workload commands
+|   +-- device.>                    # Device commands
++-- events.                         # System events
+    |-- health.>                    # Workload health
+    |-- link.>                      # Link up/down
+    +-- gc.>                        # Garbage collection
+
+app.                                # Application namespace
++-- <app-name>.                     # Per-application prefix
+    +-- ...                         # Application-defined
+\end{Verbatim}
+
+\textbf{Default priorities:} \texttt{avena.control.>} $\rightarrow$ HIGH; \texttt{avena.gossip.>} $\rightarrow$ HIGH (small messages); \texttt{avena.events.>} $\rightarrow$ MEDIUM; \texttt{app.>} $\rightarrow$ application-specified via interest.
+
+\textbf{LoRa eligibility:} Subjects under \texttt{avena.gossip.topology.>}, \texttt{avena.gossip.cost.>}, and \texttt{avena.gossip.time.>} are small and infrequent---ideal for LoRa transmission.
+
+% ============================================================
+\section{Interest Model}
+% ============================================================
+
+\textbf{Core principle:} Data only flows because an interest exists. Publishers emit to subjects; the network routes to subscribers who have registered interest. No interest means no delivery, no storage, no relay.
+
+This is pull-based semantics with push delivery. Subscribers declare what they need and how they need it.
+
+\begin{lstlisting}[language=Rust]
+struct Interest {
+    id: InterestId,
+    owner: DeviceId,
+
+    // What data
+    subject: SubjectPattern,
+
+    // Delivery urgency (use lowest that works)
+    priority: Priority,
+
+    // Retention semantics
+    retention: RetentionPolicy,
+
+    // For "latest with history" pattern
+    historic_priority: Option<Priority>,
+
+    // Time bounds
+    ttl: Option<Duration>,
+
+    // Ordering
+    ordering: Ordering,
+
+    // Geo-spatial bounds (optional)
+    geo_bounds: Option<GeoBounds>,
+
+    // Cost routing override (optional)
+    cost_profile: Option<CostProfile>,
+
+    // CRDT metadata
+    hlc: HLC,
+    terminated: bool,
+}
+
+enum RetentionPolicy {
+    All,                // Every message
+    Latest,             // Only most recent per subject
+    LatestN(u32),       // Last N messages
+    Window(Duration),   // Messages within time window
+}
+
+enum Ordering {
+    Ordered,    // Deliver in HLC order (buffered at receiver)
+    Unordered,  // Deliver as available (faster)
+}
+\end{lstlisting}
+
+\textbf{Ordered delivery:} When \texttt{Ordering::Ordered} is specified, messages buffer at the receiver and are delivered in HLC order. This introduces latency when messages arrive out of order. An optional \texttt{max\_latency} parameter bounds waiting time; if the expected prior message does not arrive within max\_latency, it is considered lost and delivery proceeds.
+
+\textbf{Subscriber responsibility:} Use the lowest priority that meets requirements. This relieves network burden and allows critical traffic to flow.
+
+\textbf{Multiple interests:} Same subject can have multiple interests with different semantics. One subscriber gets \texttt{Latest} for real-time display; another gets \texttt{All} for historical records.
+
+\textbf{Delivery set:} For interest $i$ on device $d$ at time $t$, the messages to deliver:
+\begin{align*}
+\text{deliver}(i, d, t) = \{m : &\ \text{subj}(m) \in \text{pattern}(i) \\
+&\land \text{permitted}(d, \text{subj}(m)) \\
+&\land \text{satisfies\_retention}(m, i) \\
+&\land \text{satisfies\_geo}(m, i, d, t) \\
+&\land \lnot\text{delivered}(m, i) \\
+&\land \lnot\text{terminated}(i)\}
+\end{align*}
+
+\subsection{Retention Patterns}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Pattern} & \textbf{Priority} & \textbf{Retention} & \textbf{Use Case} \\
+\midrule
+Real-time position & HIGH & Latest & Current machine location \\
+Telemetry stream & MEDIUM & All & Sensor readings for analysis \\
+Position history & LOW & All & GPS breadcrumbs for records \\
+Latest + history & HIGH/LOW & All & Fast current + eventual history \\
+Heartbeat & LOW & Latest & Device alive signal \\
+Critical alert & HIGH & All & Events that must not be lost \\
+V2X BSM & HIGH & Latest & Safety-critical vehicle position \\
+SPaT & HIGH & Latest & Signal phase/timing \\
+\bottomrule
+\end{tabular}
+\caption{Common retention patterns}
+\end{table}
+
+\textbf{Latest with history pattern:}
+
+\begin{lstlisting}[language=Rust]
+Interest {
+    subject: "app.position.tractor-1",
+    priority: Priority::High,
+    retention: RetentionPolicy::All,
+    historic_priority: Some(Priority::Low),  // Older messages demoted
+}
+\end{lstlisting}
+
+When new message arrives: deliver immediately at HIGH priority. Older undelivered messages remain queued but at LOW priority, yielding to other traffic.
+
+% ============================================================
+\section{Geo-Spatial Features}
+% ============================================================
+
+\subsection{Position Tracking}
+
+Devices report position via gossip (LoRa-eligible for updates):
+
+\begin{lstlisting}[language=Rust]
+struct GeoPosition {
+    latitude: f64,
+    longitude: f64,
+    altitude_m: Option<f32>,
+    accuracy_m: Option<f32>,
+}
+\end{lstlisting}
+
+Stationary devices have fixed positions configured at deployment. Mobile devices update position periodically.
+
+\subsection{Geo-Bounded Interests}
+
+Subscribers can limit data flow based on publisher location:
+
+\begin{lstlisting}[language=Rust]
+struct GeoBounds {
+    boundary: Option<GeoBoundary>,
+    relative_radius_m: Option<u32>,  // Relative to subscriber's position
+}
+
+enum GeoBoundary {
+    Radius { center: GeoPoint, radius_m: u32 },
+    Polygon { vertices: Vec<GeoPoint> },
+    Named { boundary_id: String },  // e.g., "field-north-40"
+}
+\end{lstlisting}
+
+\textbf{Use case --- Agricultural traffic optimization:}
+
+\begin{lstlisting}[language=Rust]
+// Only receive high-rate telemetry when tractor-2 is within 300 feet
+Interest {
+    subject: "app.telemetry.tractor-2.high-rate",
+    priority: Priority::High,
+    retention: RetentionPolicy::Latest,
+    geo_bounds: Some(GeoBounds {
+        relative_radius_m: Some(100),  // ~300 feet
+    }),
+}
+\end{lstlisting}
+
+\textbf{Use case --- V2X intersection awareness:}
+
+\begin{lstlisting}[language=Rust]
+// Receive SPaT from signals within 500 feet
+Interest {
+    subject: "v2x.spat.>",
+    priority: Priority::High,
+    retention: RetentionPolicy::Latest,
+    geo_bounds: Some(GeoBounds {
+        relative_radius_m: Some(150),  // ~500 feet
+    }),
+}
+\end{lstlisting}
+
+\subsection{Geo-Spatial Permissions}
+
+Certificates can include geo-constraints on subject permissions:
+
+\begin{lstlisting}[language=Rust]
+struct SubjectPermission {
+    pattern: SubjectPattern,
+    action: Action,  // Publish, Subscribe
+    geo_constraint: Option<GeoConstraint>,
+}
+
+struct GeoConstraint {
+    publisher_bounds: Option<GeoBoundary>,
+    subscriber_bounds: Option<GeoBoundary>,
+    mutual_proximity_m: Option<u32>,
+}
+\end{lstlisting}
+
+\textbf{Position staleness:} Position information propagates via gossip and may be stale relative to message timestamps. Avena adopts receiver-side filtering: messages route optimistically, and the receiving device performs final geo validation using its current position. This trades potential over-delivery for simplicity. Applications requiring strict geo-fencing should implement additional validation.
+

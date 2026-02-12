@@ -1,9 +1,9 @@
 use avena_overlay::{
-    derive_session_keys, derive_wireguard_keypair, AvenadConfig, CertValidator, DeviceId,
-    DeviceKeypair, DiscoveredPeer, DiscoveryEvent, DiscoveryService, EphemeralKeypair,
-    HandshakeMessage, KernelBackend, LocalAnnouncement, NetworkConfig, PeerConfig, PeerState,
-    TunnelBackend, TunnelMode, UserspaceBackend,
-    routing::BabeldController,
+    derive_session_keys, derive_wireguard_keypair,
+    routing::{BabeldController, RoutingError},
+    AvenadConfig, CertValidator, DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent,
+    DiscoveryService, EphemeralKeypair, HandshakeMessage, KernelBackend, LocalAnnouncement,
+    NetworkConfig, PeerConfig, PeerState, TunnelBackend, TunnelMode, UserspaceBackend,
 };
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
@@ -30,8 +30,6 @@ const MAX_HANDSHAKES_PER_IP: u32 = 5;
 const MAX_NONCE_CACHE_SIZE: usize = 10_000;
 const MAX_RATE_LIMITER_SIZE: usize = 10_000;
 const MAX_CONCURRENT_OUTGOING_HANDSHAKES: usize = 16;
-const PRESENCE_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
-const DISCOVERED_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 struct NonceCache {
     entries: Mutex<LruCache<(DeviceId, [u8; 32]), Instant>>,
@@ -129,7 +127,8 @@ impl Avenad {
         let device_id = keypair.device_id();
         info!(device_id = %device_id, "Initialized device identity");
 
-        let (cert_validator, device_cert) = config.load_crypto().map_err(AvenadError::CertConfig)?;
+        let (cert_validator, device_cert) =
+            config.load_crypto().map_err(AvenadError::CertConfig)?;
         info!("Loaded device certificate");
 
         let wg_keys = derive_wireguard_keypair(&keypair);
@@ -165,23 +164,7 @@ impl Avenad {
         let handshake_listener = TcpListener::bind(listen_addr).await?;
         info!(addr = %listen_addr, "Handshake listener bound");
 
-        // Start babeld if enabled
-        let routing = if config.routing.enable_babel {
-            let mut controller = BabeldController::new(config.routing.babel.clone());
-            match controller.start(&[&config.interface_name]).await {
-                Ok(()) => {
-                    info!("Started babeld for dynamic routing");
-                    Some(controller)
-                }
-                Err(e) => {
-                    warn!("Failed to start babeld: {}. Dynamic routing disabled.", e);
-                    None
-                }
-            }
-        } else {
-            info!("Babel routing disabled in config");
-            None
-        };
+        let routing = Some(start_routing_controller(&config).await?);
 
         let inner = Arc::new(AvenadInner {
             config,
@@ -208,7 +191,10 @@ impl Avenad {
     }
 
     async fn run(&mut self) -> Result<(), AvenadError> {
-        let mut discovery_rx = self.discovery_rx.take().expect("discovery_rx already taken");
+        let mut discovery_rx = self
+            .discovery_rx
+            .take()
+            .expect("discovery_rx already taken");
         let inner = Arc::clone(&self.inner);
 
         inner.announce_presence().await?;
@@ -226,19 +212,29 @@ impl Avenad {
 
         info!("Avenad running. Press Ctrl+C to stop.");
 
-        let mut dead_peer_interval = tokio::time::interval(Duration::from_secs(inner.config.dead_peer_timeout_secs));
+        let mut dead_peer_interval =
+            tokio::time::interval(Duration::from_secs(inner.config.dead_peer_timeout_secs));
         dead_peer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut overlay_route_interval = tokio::time::interval(Duration::from_secs(2));
         overlay_route_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut reannounce_interval = tokio::time::interval(PRESENCE_REANNOUNCE_INTERVAL);
+        let reannounce_every = Duration::from_millis(
+            inner
+                .config
+                .discovery
+                .presence_reannounce_interval_ms
+                .max(1),
+        );
+        let mut reannounce_interval = tokio::time::interval(reannounce_every);
         reannounce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         reannounce_interval.tick().await;
 
-        let mut discovered_peer_retry_interval =
-            tokio::time::interval(DISCOVERED_PEER_RETRY_INTERVAL);
-        discovered_peer_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let peer_retry_every =
+            Duration::from_millis(inner.config.discovery.peer_retry_interval_ms.max(1));
+        let mut discovered_peer_retry_interval = tokio::time::interval(peer_retry_every);
+        discovered_peer_retry_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         discovered_peer_retry_interval.tick().await;
 
         loop {
@@ -309,10 +305,13 @@ impl Avenad {
                                         }
                                         drop(peers);
 
-                                        if inserted {
-                                            if let Err(e) = inner_clone.reconcile_peer_allowed_ips().await {
-                                                warn!(peer_id = %device_id, "Failed to reconcile peer allowed-ips after incoming handshake: {}", e);
-                                            }
+                                        if let Err(e) = inner_clone.reconcile_peer_allowed_ips().await {
+                                            warn!(
+                                                peer_id = %device_id,
+                                                inserted,
+                                                "Failed to reconcile peer allowed-ips after incoming handshake: {}",
+                                                e
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -352,9 +351,20 @@ impl Avenad {
     }
 }
 
+async fn start_routing_controller(config: &AvenadConfig) -> Result<BabeldController, AvenadError> {
+    let mut controller = BabeldController::new(config.routing.babel.clone());
+    controller.start(&[&config.interface_name]).await?;
+    info!("Started babeld for dynamic routing");
+    Ok(controller)
+}
+
 impl AvenadInner {
     async fn announce_presence(&self) -> Result<(), AvenadError> {
-        let wg_port = self.tunnel.listen_port().await.unwrap_or(self.config.listen_port);
+        let wg_port = self
+            .tunnel
+            .listen_port()
+            .await
+            .unwrap_or(self.config.listen_port);
         let interfaces = self.config.discovery.effective_mdns_interfaces();
 
         if interfaces.is_empty() {
@@ -406,22 +416,20 @@ impl AvenadInner {
         info!(peer_id = %peer.device_id, "Initiating handshake");
 
         let handshake_addr = SocketAddr::new(peer.endpoint.ip(), peer.endpoint.port() + 1);
-        let peer_state = self.perform_outgoing_handshake(handshake_addr, &peer).await?;
+        let peer_state = self
+            .perform_outgoing_handshake(handshake_addr, &peer)
+            .await?;
 
         let mut peers = self.peers.write().await;
-        let mut inserted = false;
         if let Entry::Vacant(entry) = peers.entry(peer.device_id) {
             entry.insert(peer_state);
-            inserted = true;
             info!(peer_id = %peer.device_id, "Peer connected");
         } else {
             debug!(peer_id = %peer.device_id, "Peer already connected, discarding duplicate handshake result");
         }
         drop(peers);
 
-        if inserted {
-            self.reconcile_peer_allowed_ips().await?;
-        }
+        self.reconcile_peer_allowed_ips().await?;
 
         Ok(())
     }
@@ -431,9 +439,12 @@ impl AvenadInner {
         addr: SocketAddr,
         peer: &DiscoveredPeer,
     ) -> Result<PeerState, AvenadError> {
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.perform_outgoing_handshake_inner(addr, peer))
-            .await
-            .map_err(|_| AvenadError::Timeout)?
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            self.perform_outgoing_handshake_inner(addr, peer),
+        )
+        .await
+        .map_err(|_| AvenadError::Timeout)?
     }
 
     async fn perform_outgoing_handshake_inner(
@@ -492,7 +503,11 @@ impl AvenadInner {
         let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;
 
         peer_msg
-            .verify(&peer_pubkey, &self.keypair.device_id(), &self.cert_validator)
+            .verify(
+                &peer_pubkey,
+                &self.keypair.device_id(),
+                &self.cert_validator,
+            )
             .map_err(|e| AvenadError::Handshake(format!("handshake verification failed: {}", e)))?;
 
         let peer_ephemeral = peer_msg.ephemeral_public_key();
@@ -515,8 +530,10 @@ impl AvenadInner {
         // immediately after handshake so overlay probes are routable.
         ensure_direct_peer_route(&self.config.interface_name, peer_overlay_ip)?;
 
-        Ok(PeerState::new(peer.device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
-            .with_endpoint(peer.endpoint))
+        Ok(
+            PeerState::new(peer.device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
+                .with_endpoint(peer.endpoint),
+        )
     }
 
     async fn handle_incoming_handshake(
@@ -524,9 +541,12 @@ impl AvenadInner {
         stream: TcpStream,
         addr: SocketAddr,
     ) -> Result<PeerState, AvenadError> {
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.handle_incoming_handshake_inner(stream, addr))
-            .await
-            .map_err(|_| AvenadError::Timeout)?
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            self.handle_incoming_handshake_inner(stream, addr),
+        )
+        .await
+        .map_err(|_| AvenadError::Timeout)?
     }
 
     async fn handle_incoming_handshake_inner(
@@ -560,10 +580,18 @@ impl AvenadInner {
         let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;
 
         peer_msg
-            .verify(&peer_pubkey, &self.keypair.device_id(), &self.cert_validator)
+            .verify(
+                &peer_pubkey,
+                &self.keypair.device_id(),
+                &self.cert_validator,
+            )
             .map_err(|e| AvenadError::Handshake(format!("handshake verification failed: {}", e)))?;
 
-        if !self.nonce_cache.check_and_insert(peer_device_id, peer_msg.nonce).await {
+        if !self
+            .nonce_cache
+            .check_and_insert(peer_device_id, peer_msg.nonce)
+            .await
+        {
             return Err(AvenadError::Handshake("replay detected".into()));
         }
 
@@ -613,8 +641,10 @@ impl AvenadInner {
         // immediately after handshake so overlay probes are routable.
         ensure_direct_peer_route(&self.config.interface_name, peer_overlay_ip)?;
 
-        Ok(PeerState::new(peer_device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
-            .with_endpoint(peer_wg_endpoint))
+        Ok(
+            PeerState::new(peer_device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
+                .with_endpoint(peer_wg_endpoint),
+        )
     }
 
     async fn handle_peer_lost(&self, device_id: &DeviceId) {
@@ -632,16 +662,19 @@ impl AvenadInner {
     }
 
     async fn reconcile_peer_allowed_ips(&self) -> Result<(), AvenadError> {
-        if !self.config.routing.enable_babel {
-            return Ok(());
-        }
-
         let (peer_count, peers) = {
             let peers = self.peers.read().await;
             let peer_count = peers.len();
             let snapshot = peers
                 .values()
-                .map(|peer| (peer.device_id, peer.wg_pubkey, peer.overlay_ip, peer.endpoint))
+                .map(|peer| {
+                    (
+                        peer.device_id,
+                        peer.wg_pubkey,
+                        peer.overlay_ip,
+                        peer.endpoint,
+                    )
+                })
                 .collect::<Vec<_>>();
             (peer_count, snapshot)
         };
@@ -649,7 +682,8 @@ impl AvenadInner {
         info!(peer_count, "Reconciling peer allowed-ips");
 
         if peer_count == 1 {
-            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network) {
+            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network)
+            {
                 if e.kind() != std::io::ErrorKind::Unsupported {
                     return Err(e.into());
                 }
@@ -663,12 +697,7 @@ impl AvenadInner {
         }
 
         for (device_id, wg_pubkey, overlay_ip, endpoint) in peers {
-            let allowed_ips = peer_allowed_ips(
-                overlay_ip,
-                self.config.routing.enable_babel,
-                peer_count,
-                &self.network,
-            );
+            let allowed_ips = peer_allowed_ips(overlay_ip, peer_count, &self.network);
 
             let mut peer_config = PeerConfig::new(wg_pubkey)
                 .with_allowed_ips(allowed_ips)
@@ -689,13 +718,10 @@ impl AvenadInner {
     }
 
     async fn maintain_overlay_prefix_route(&self) {
-        if !self.config.routing.enable_babel {
-            return;
-        }
-
         let peer_count = self.peers.read().await.len();
         if peer_count == 1 {
-            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network) {
+            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network)
+            {
                 if e.kind() != std::io::ErrorKind::Unsupported {
                     warn!(
                         interface = %self.config.interface_name,
@@ -787,13 +813,22 @@ fn validate_interface_name(name: &str) -> Result<(), AvenadError> {
         return Err(AvenadError::Config("interface name cannot be empty".into()));
     }
     if name.len() > 15 {
-        return Err(AvenadError::Config("interface name too long (max 15 chars)".into()));
+        return Err(AvenadError::Config(
+            "interface name too long (max 15 chars)".into(),
+        ));
     }
     if name.starts_with('-') {
-        return Err(AvenadError::Config("interface name cannot start with '-'".into()));
+        return Err(AvenadError::Config(
+            "interface name cannot start with '-'".into(),
+        ));
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(AvenadError::Config("interface name contains invalid characters".into()));
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AvenadError::Config(
+            "interface name contains invalid characters".into(),
+        ));
     }
     Ok(())
 }
@@ -852,13 +887,11 @@ fn assign_interface_address(
 ) -> Result<(), std::io::Error> {
     use avena_overlay::wg::linux::netlink;
 
-    netlink::add_ipv6_address(interface_name, addr, 128).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("add address: {e}"))
-    })?;
+    netlink::add_ipv6_address(interface_name, addr, 128)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add address: {e}")))?;
 
-    netlink::set_link_up(interface_name).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("set link up: {e}"))
-    })?;
+    netlink::set_link_up(interface_name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("set link up: {e}")))?;
 
     Ok(())
 }
@@ -881,9 +914,8 @@ fn add_peer_route(
 ) -> Result<(), std::io::Error> {
     use avena_overlay::wg::linux::netlink;
 
-    netlink::add_ipv6_route(interface_name, peer_addr, 128).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("add route: {e}"))
-    })
+    netlink::add_ipv6_route(interface_name, peer_addr, 128)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add route: {e}")))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -917,7 +949,10 @@ fn ensure_overlay_prefix_route(
     use avena_overlay::wg::linux::netlink;
 
     netlink::add_ipv6_route(interface_name, network.prefix, network.prefix_len).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("add overlay prefix route: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("add overlay prefix route: {e}"),
+        )
     })
 }
 
@@ -938,13 +973,12 @@ fn direct_peer_allowed_ips(peer_overlay_ip: std::net::Ipv6Addr) -> Vec<IpNet> {
 
 fn peer_allowed_ips(
     peer_overlay_ip: std::net::Ipv6Addr,
-    babel_enabled: bool,
     active_peer_count: usize,
     network: &NetworkConfig,
 ) -> Vec<IpNet> {
     let mut allowed = direct_peer_allowed_ips(peer_overlay_ip);
 
-    if babel_enabled && active_peer_count <= 1 {
+    if active_peer_count <= 1 {
         if let Ok(prefix) = IpNet::new(network.prefix.into(), network.prefix_len) {
             if !allowed.contains(&prefix) {
                 allowed.push(prefix);
@@ -972,6 +1006,7 @@ enum AvenadError {
     CertConfig(avena_overlay::ConfigError),
     Tunnel(avena_overlay::TunnelError),
     Discovery(avena_overlay::DiscoveryError),
+    Routing(RoutingError),
     Io(std::io::Error),
     Handshake(String),
     Json(serde_json::Error),
@@ -985,6 +1020,7 @@ impl std::fmt::Display for AvenadError {
             AvenadError::CertConfig(e) => write!(f, "certificate config error: {}", e),
             AvenadError::Tunnel(e) => write!(f, "tunnel error: {}", e),
             AvenadError::Discovery(e) => write!(f, "discovery error: {}", e),
+            AvenadError::Routing(e) => write!(f, "routing error: {}", e),
             AvenadError::Io(e) => write!(f, "io error: {}", e),
             AvenadError::Handshake(e) => write!(f, "handshake error: {}", e),
             AvenadError::Json(e) => write!(f, "json error: {}", e),
@@ -1007,6 +1043,12 @@ impl From<avena_overlay::DiscoveryError> for AvenadError {
     }
 }
 
+impl From<RoutingError> for AvenadError {
+    fn from(e: RoutingError) -> Self {
+        AvenadError::Routing(e)
+    }
+}
+
 impl From<std::io::Error> for AvenadError {
     fn from(e: std::io::Error) -> Self {
         AvenadError::Io(e)
@@ -1022,31 +1064,32 @@ impl From<serde_json::Error> for AvenadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn routing_startup_is_fatal_when_babel_binary_is_missing() {
+        let mut config = AvenadConfig::default();
+        config.routing.babel.binary_path = PathBuf::from("/definitely/missing/babeld");
+
+        let err = start_routing_controller(&config).await.unwrap_err();
+        assert!(matches!(err, AvenadError::Routing(_)));
+    }
 
     #[test]
-    fn peer_allowed_ips_include_overlay_prefix_when_babel_and_single_peer() {
+    fn peer_allowed_ips_include_overlay_prefix_for_single_peer() {
         let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
         let network = NetworkConfig::default();
-        let allowed_ips = peer_allowed_ips(overlay_ip, true, 1, &network);
-
+        let allowed_ips = peer_allowed_ips(overlay_ip, 1, &network);
         assert_eq!(allowed_ips.len(), 2);
         assert!(allowed_ips.contains(&"fd00:a0e0:a000::1/128".parse().unwrap()));
         assert!(allowed_ips.contains(&"fd00:a0e0:a000::/48".parse().unwrap()));
     }
 
     #[test]
-    fn peer_allowed_ips_are_host_routes_when_babel_disabled() {
-        let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
-        let network = NetworkConfig::default();
-        let allowed_ips = peer_allowed_ips(overlay_ip, false, 1, &network);
-        assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
-    }
-
-    #[test]
     fn peer_allowed_ips_are_host_routes_when_babel_and_multiple_peers() {
         let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
         let network = NetworkConfig::default();
-        let allowed_ips = peer_allowed_ips(overlay_ip, true, 2, &network);
+        let allowed_ips = peer_allowed_ips(overlay_ip, 2, &network);
         assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
     }
 }

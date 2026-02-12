@@ -1,0 +1,225 @@
+\documentclass[11pt,a4paper]{article}
+
+% ============================================================
+% Packages
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyvrb}
+\usepackage{float}
+
+% ============================================================
+% Configuration
+% ============================================================
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+    citecolor=blue!60!black,
+    pdftitle={Avena Design Document},
+    pdfauthor={},
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    breakatwhitespace=true,
+    frame=single,
+    framesep=3pt,
+    xleftmargin=3pt,
+    xrightmargin=3pt,
+    backgroundcolor=\color{gray!5},
+    keywordstyle=\color{blue!70!black},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red!60!black},
+    showstringspaces=false,
+    tabsize=4,
+}
+
+\lstdefinelanguage{Rust}{
+    keywords={struct, enum, fn, let, mut, pub, if, else, match, Some, None, Option, impl, trait, where, for, in, loop, while, break, continue, return, self, Self, true, false, async, await, use, mod, crate, super},
+    morecomment=[l]{//},
+    morecomment=[s]{/*}{*/},
+    morestring=[b]",
+    sensitive=true,
+}
+
+\newtheorem{definition}{Definition}
+
+% ============================================================
+% Title
+% ============================================================
+\title{\textbf{Avena Design Document}}
+\author{}
+\date{Version 1.0 --- \today}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================
+% Executive Summary
+% ============================================================
+\begin{abstract}
+\noindent\textbf{Executive Summary}
+
+Avena is a distributed fleet management system for vehicle-centric edge computing. It bridges publish-subscribe messaging (NATS-compatible) with delay-tolerant networking, enabling coordination of mobile assets in environments with intermittent, expensive, or unstable connectivity.
+
+\textbf{Key Capabilities:}
+\begin{itemize}[nosep]
+\item Subject-based pub/sub with DTN-style store-and-forward delivery
+\item Cost-aware routing considering priority, monetary cost, energy, and latency
+\item Dual-channel architecture (high-rate IP + low-rate LoRa)
+\item CRDT-based state synchronization without coordination
+\item Delegated certificate model for decentralized authorization
+\end{itemize}
+
+\textbf{Target Domains:} Agricultural edge computing and Vehicle-to-Everything (V2X) communication.
+
+\textbf{Document Purpose:} This document specifies Avena's architecture, protocols, and data structures for implementation.
+\end{abstract}
+
+% ============================================================
+% Document Guide (AI/Human Navigation)
+% ============================================================
+\section*{Document Guide}
+\addcontentsline{toc}{section}{Document Guide}
+
+This design document is organized into chapters for maintainability. Use this guide to find relevant sections for specific tasks.
+
+\subsection*{Chapter Overview}
+
+\begin{longtable}{@{}p{3.5cm}p{9.5cm}@{}}
+\toprule
+\textbf{Chapter} & \textbf{Contents and When to Read} \\
+\midrule
+\endhead
+
+\textbf{01-introduction} &
+\textbf{Overview, Target Domains, Ecosystem, System Architecture}
+
+Read when: Understanding Avena's purpose, target markets (agricultural, V2X), design philosophy, or the high-level system architecture (4-layer stack). Contains the ``why'' and ``what'' of Avena.
+
+Key concepts: Design principles, hardware-software decoupling, message semantics, layered architecture, workload network modes (Messaging vs Addressable). \\
+\midrule
+
+\textbf{02-overlay} &
+\textbf{Avena Overlay Network (Layer 1)}
+
+Read when: Working on peer discovery (mDNS, LoRa), tunnel establishment (handshake, key derivation), WireGuard integration, Babel routing, underlay management, or physical link handling.
+
+Key concepts: Per-(peer, underlay) WireGuard interfaces, Babel unicast mode, cross-layer metric framework (RFC 9616 RTT, SNR/bitrate/utilization factors), WiFi operating modes (IBSS vs 802.11s), LoRa control channel. \\
+\midrule
+
+\textbf{03-messaging} &
+\textbf{Avena Messaging Network (Layer 2) and State Synchronization}
+
+Read when: Working on pub/sub API, relay policies, cost-aware routing, store-and-forward, message deduplication, or gossip protocol behavior.
+
+Key concepts: NATS-compatible API, relay policy types (None/Priority/Full/Subjects), priority-aware routing, interest lifecycle, dual-channel gossip. \\
+\midrule
+
+\textbf{04-formal-model} &
+\textbf{Formal State Model}
+
+Read when: Implementing or debugging CRDT state, understanding cost functions, HLC operations, or network topology modeling.
+
+Key concepts: Device identity (Ed25519, DeviceId), $T$-connectivity, cost function components ($f_{\text{latency}}, f_{\text{dollar}}, f_{\text{energy}}$), cost profiles, HLC tick/send/receive operations, CRDT types (OR-Map, OR-Set, LWW-Register), tombstone management. \\
+\midrule
+
+\textbf{05-interests} &
+\textbf{Subject Namespace, Interest Model, Geo-Spatial Features}
+
+Read when: Working on subject hierarchies, interest creation/validation, retention policies, geo-bounded interests, or geo-spatial permissions.
+
+Key concepts: \texttt{avena.} and \texttt{app.} namespaces, Interest struct fields (priority, retention, geo\_bounds), RetentionPolicy variants (All/Latest/LatestN/Window), GeoBounds and GeoBoundary types. \\
+\midrule
+
+\textbf{06-fleet} &
+\textbf{Fleet Management (Certificates, Workloads, Clock Sync)}
+
+Read when: Working on certificate validation/issuance, workload deployment/targeting, or time synchronization (NTP, GPS, quarantine).
+
+Key concepts: JWT certificates (EdDSA), certificate chain validation (MAX\_CHAIN\_DEPTH=10), capability attenuation, WorkloadSpec struct, NetworkMode (Messaging/Addressable), time quarantine thresholds. \\
+\midrule
+
+\textbf{07-implementation} &
+\textbf{Implementation Components and Data Flow}
+
+Read when: Understanding avenad daemon structure, avenactl CLI, avena-sidecar, or reviewing data flow examples (mobile relay, LoRa convergence, V2X preemption).
+
+Key concepts: AvenadConfig struct, module structure (identity, crypto, discovery, tunnel, routing), gossip synchronization phases, store-and-forward handoff. \\
+\midrule
+
+\textbf{08-status} &
+\textbf{Testing, Implementation Status, Decisions, Open Questions}
+
+Read when: Checking implementation progress, understanding resolved design decisions, or identifying open research questions.
+
+Key concepts: Unit/integration/emulation test strategy, component completion status table, resolved decisions table, open questions (Babel tuning, LoRa protocol, V2X standards). \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Quick Reference by Task}
+
+\begin{description}[leftmargin=2cm,style=nextline]
+\item[Adding a new radio technology] \texttt{02-overlay} (Physical Links, Underlay Manager, Cross-Layer Metrics)
+\item[Implementing peer discovery] \texttt{02-overlay} (Peer Discovery, mDNS, LoRa presence)
+\item[Debugging tunnel issues] \texttt{02-overlay} (Tunnel Establishment, Key Derivation, Teardown)
+\item[Modifying routing behavior] \texttt{02-overlay} (Routing, Babel, Cross-Layer Metric Framework)
+\item[Working on pub/sub API] \texttt{03-messaging} (Transparent API, Interest lifecycle)
+\item[Implementing relay logic] \texttt{03-messaging} (Relay Policies), \texttt{04-formal-model} (Message Relay definition)
+\item[Adding cost factors] \texttt{04-formal-model} (Cost Model, Cost Profiles)
+\item[CRDT implementation] \texttt{04-formal-model} (CRDT State Model, Tombstone Management)
+\item[Interest/subscription logic] \texttt{05-interests} (Interest Model, Retention Patterns)
+\item[Geo-spatial features] \texttt{05-interests} (Geo-Bounded Interests, Geo-Spatial Permissions)
+\item[Certificate handling] \texttt{06-fleet} (Certificate Model, Chain Validation)
+\item[Workload deployment] \texttt{06-fleet} (Workload Model, NetworkMode)
+\item[Clock sync/quarantine] \texttt{06-fleet} (Clock Synchronization, Time Quarantine)
+\item[avenad structure] \texttt{07-implementation} (avenad, avena-overlay library)
+\item[Understanding data flow] \texttt{07-implementation} (Data Flow Examples)
+\item[Checking what's implemented] \texttt{08-status} (Implementation Status table)
+\item[Finding design rationale] \texttt{08-status} (Resolved Design Decisions table)
+\end{description}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+% Chapter Includes
+% ============================================================
+
+\input{chapters/01-introduction}
+\newpage
+
+\input{chapters/02-overlay}
+\newpage
+
+\input{chapters/03-messaging}
+\newpage
+
+\input{chapters/04-formal-model}
+\newpage
+
+\input{chapters/05-interests}
+\newpage
+
+\input{chapters/06-fleet}
+\newpage
+
+\input{chapters/07-implementation}
+\newpage
+
+\input{chapters/08-status}
+
+\end{document}

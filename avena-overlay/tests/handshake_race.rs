@@ -51,12 +51,11 @@ async fn test_concurrent_handshake_does_not_corrupt_peer_state() {
         }));
     }
 
-    let results: Vec<(bool, [u8; 32])> =
-        futures::future::join_all(handles)
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
+    let results: Vec<(bool, [u8; 32])> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
 
     let insert_count = results.iter().filter(|(inserted, _)| *inserted).count();
     assert_eq!(
