@@ -81,6 +81,30 @@ impl TunnelBackend for KernelBackend {
         })
     }
 
+    async fn remove_interface(&self) -> Result<(), TunnelError> {
+        block_in_place(|| {
+            let mut wg_guard = self
+                .wg
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+            let mut name_guard = self
+                .interface_name
+                .lock()
+                .map_err(|e| TunnelError::Wireguard(format!("lock poisoned: {}", e)))?;
+
+            let wg = wg_guard.as_ref().ok_or_else(|| {
+                TunnelError::InterfaceNotFound("interface not initialized".into())
+            })?;
+
+            wg.remove_interface()
+                .map_err(|e| TunnelError::Wireguard(e.to_string()))?;
+
+            *wg_guard = None;
+            *name_guard = None;
+            Ok(())
+        })
+    }
+
     async fn set_private_key(&self, private_key: &[u8; 32]) -> Result<(), TunnelError> {
         let private_key = *private_key;
         block_in_place(|| {
@@ -256,6 +280,13 @@ mod tests {
         let backend = KernelBackend::new();
         let config = PeerConfig::new([1u8; 32]);
         let result = backend.add_peer(&config).await;
+        assert!(matches!(result, Err(TunnelError::InterfaceNotFound(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn remove_interface_fails_without_interface() {
+        let backend = KernelBackend::new();
+        let result = backend.remove_interface().await;
         assert!(matches!(result, Err(TunnelError::InterfaceNotFound(_))));
     }
 

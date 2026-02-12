@@ -121,7 +121,7 @@ The handshake uses a custom TCP protocol on port \texttt{wg\_port + 1}:
 Both devices exchange \texttt{HandshakeMessage} payloads. Each device verifies the peer's message:
 \begin{enumerate}
     \item Timestamp within $\pm$60 seconds of local time
-    \item Signature valid over: \texttt{ephemeral\_pubkey || nonce || timestamp || peer\_device\_id || wg\_pubkey}
+    \item Signature valid over: \texttt{ephemeral\_pubkey || nonce || timestamp || peer\_device\_id || wg\_pubkey || wg\_listen\_port}
     \item Certificate (JWT) validates against trusted root CA
     \item Certificate subject matches sender's DeviceId
     \item Nonce not previously seen (replay protection)
@@ -171,18 +171,19 @@ struct HandshakeMessage {
     nonce: [u8; 32],               // Random, for replay protection
     timestamp_secs: u64,           // Unix timestamp
     wg_pubkey: [u8; 32],           // Stable WireGuard interface key
+    wg_listen_port: u16,           // Peer tunnel listen port (signed)
     signature: [u8; 64],           // Ed25519 over message fields
     device_cert: String,           // JWT certificate
 }
 \end{lstlisting}
 
-The signature covers: \texttt{ephemeral\_pubkey || nonce || timestamp || peer\_device\_id || wg\_pubkey}.
+The signature covers: \texttt{ephemeral\_pubkey || nonce || timestamp || peer\_device\_id || wg\_pubkey || wg\_listen\_port}.
 
 \subsubsection{Phase 3: Wireguard Tunnel Activation}
 
 With derived keys, both devices create a dedicated Wireguard interface for this (peer, underlay) combination:
 \begin{enumerate}
-    \item Generate interface name: \texttt{av-<hash8>} from hash of \texttt{(local\_id, peer\_id, underlay\_name)}
+    \item Resolve local underlay interface name from the handshake socket's bound local address, then generate interface name: \texttt{av-<hash8>} from hash of \texttt{(local\_id, peer\_id, underlay\_name)}
     \item Allocate UDP port deterministically from configured range using interface name hash
     \item Create Wireguard interface with derived private key
     \item Configure peer entry with: public key, PSK, endpoint (peer's underlay IP:port), \texttt{AllowedIPs = ::/0}
@@ -191,9 +192,15 @@ With derived keys, both devices create a dedicated Wireguard interface for this 
     \item Notify babeld: \texttt{interface av-<hash8> type tunnel unicast true split-horizon true}
 \end{enumerate}
 
-\textbf{AllowedIPs configuration:} All peer interfaces use \texttt{AllowedIPs = ::/0}. This permits Babel to route any destination through any peer. Babel's routing decisions, not WireGuard's AllowedIPs, determine which interface carries traffic.
+\textbf{AllowedIPs configuration:} All peer interfaces use \texttt{AllowedIPs = ::/0}. This is required for routed mesh forwarding: transit traffic may arrive from a peer with source addresses that are not that peer's own host \texttt{/128}. Restrictive host-route AllowedIPs can drop valid multi-hop traffic during steady-state routing and failover.
+
+With \texttt{::/0} on each per-(peer, underlay) interface, WireGuard admits encrypted traffic from authenticated peers, while Babel alone selects next hops and interfaces. In other words, AllowedIPs is not used for route selection; Babel metrics and feasibility rules decide path choice.
+
+For startup and single-neighbor topologies, avenad may also install an overlay-prefix route toward the only active peer as a bootstrap optimization. This does not change path selection semantics because no alternate next hop exists in that state.
 
 If the peer is discovered over multiple underlay interfaces (e.g., WiFi and cellular), a separate Wireguard interface is created for each. Babel sees these as distinct links and can route traffic over whichever has better metrics, or failover automatically if one path degrades.
+
+Underlay identity binding is strict: if local underlay interface resolution fails for a handshake, tunnel activation is aborted and retried later via normal discovery/handshake retry flow.
 
 Once a link is active, Babel begins advertising routes over the associated Wireguard interface.
 
@@ -507,4 +514,3 @@ The overhead includes peering frame exchanges and state maintenance, but the ben
 For Avena deployments, we tentatively recommend IBSS mode for initial deployment due to universal support and configuration simplicity, with recognition that scaling limitations may necessitate migration to 802.11s (without HWMP) or dynamic AP election in dense deployments.
 
 The overlay architecture mitigates WiFi scaling problems to some extent: when WiFi becomes congested, Babel routes traffic over alternative transports (HaLow, cellular). The WiFi segment need not be globally optimal---it must provide useful capacity, with the routing layer exploiting whatever capacity is available.
-

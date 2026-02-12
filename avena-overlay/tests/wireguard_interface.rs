@@ -30,6 +30,7 @@ fn three_node_interface_key_stability() {
         &EphemeralKeypair::from_seed([10u8; 32]),
         &peer_b.device_id(),
         local_wg.public,
+        51820,
         &local_cert,
     );
     assert!(msg_to_b
@@ -41,6 +42,7 @@ fn three_node_interface_key_stability() {
         &EphemeralKeypair::from_seed([11u8; 32]),
         &peer_c.device_id(),
         local_wg.public,
+        51820,
         &local_cert,
     );
     assert!(msg_to_c

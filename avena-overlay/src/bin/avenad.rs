@@ -8,8 +8,9 @@ use avena_overlay::{
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
 use lru::LruCache;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -30,6 +31,8 @@ const MAX_HANDSHAKES_PER_IP: u32 = 5;
 const MAX_NONCE_CACHE_SIZE: usize = 10_000;
 const MAX_RATE_LIMITER_SIZE: usize = 10_000;
 const MAX_CONCURRENT_OUTGOING_HANDSHAKES: usize = 16;
+const TUNNEL_PORT_BASE: u16 = 20000;
+const TUNNEL_PORT_SPAN: u16 = 40000;
 
 struct NonceCache {
     entries: Mutex<LruCache<(DeviceId, [u8; 32]), Instant>>,
@@ -101,9 +104,10 @@ struct AvenadInner {
     keypair: DeviceKeypair,
     wg_public: [u8; 32],
     network: NetworkConfig,
-    tunnel: Arc<dyn TunnelBackend>,
+    base_tunnel: Arc<dyn TunnelBackend>,
+    peer_tunnels: Mutex<HashMap<String, Arc<dyn TunnelBackend>>>,
     discovery: DiscoveryService,
-    peers: RwLock<HashMap<DeviceId, PeerState>>,
+    peers: RwLock<HashMap<String, PeerState>>,
     nonce_cache: NonceCache,
     rate_limiter: RateLimiter,
     handshake_semaphore: Arc<Semaphore>,
@@ -119,9 +123,69 @@ struct Avenad {
     handshake_listener: TcpListener,
 }
 
+#[derive(Clone)]
+struct PeerTunnelBinding {
+    interface_name: String,
+    tunnel: Arc<dyn TunnelBackend>,
+    listen_port: u16,
+}
+
+fn peer_tunnel_interface_name(local: &DeviceId, peer: &DeviceId, underlay_hint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(local.as_bytes());
+    hasher.update(peer.as_bytes());
+    hasher.update(underlay_hint.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = hex::encode(&digest[..4]);
+    format!("av-{suffix}")
+}
+
+fn canonical_underlay_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_local_underlay_identifier(local_ip: IpAddr) -> Result<String, AvenadError> {
+    use avena_overlay::wg::linux::netlink;
+
+    let canonical_ip = canonical_underlay_ip(local_ip);
+    netlink::get_interface_name_for_ip(canonical_ip).ok_or_else(|| {
+        AvenadError::Handshake(format!(
+            "strict underlay resolution failed for local IP {}",
+            canonical_ip
+        ))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_local_underlay_identifier(local_ip: IpAddr) -> Result<String, AvenadError> {
+    Err(AvenadError::Handshake(format!(
+        "strict underlay resolution unsupported on this platform for local IP {}",
+        local_ip
+    )))
+}
+
+fn deterministic_tunnel_listen_port(interface_name: &str) -> u16 {
+    let mut hasher = Sha256::new();
+    hasher.update(interface_name.as_bytes());
+    let digest = hasher.finalize();
+    let n = u16::from_le_bytes([digest[0], digest[1]]);
+    TUNNEL_PORT_BASE + (n % TUNNEL_PORT_SPAN)
+}
+
 impl Avenad {
     async fn new(config: AvenadConfig) -> Result<Self, AvenadError> {
         validate_interface_name(&config.interface_name)?;
+
+        if let Err(e) = try_raise_nofile_limit() {
+            warn!("Failed to raise NOFILE limit: {}", e);
+        }
 
         let keypair = load_or_generate_keypair(&config)?;
         let device_id = keypair.device_id();
@@ -137,15 +201,13 @@ impl Avenad {
         let overlay_ip = network.device_address(&device_id);
         info!(overlay_ip = %overlay_ip, "Overlay address");
 
-        let tunnel: Arc<dyn TunnelBackend> = match config.tunnel_mode {
-            TunnelMode::Kernel => Arc::new(KernelBackend::new()),
-            TunnelMode::Userspace => Arc::new(UserspaceBackend::new()),
-        };
-        info!(mode = ?config.tunnel_mode, "Tunnel backend created");
+        let base_tunnel =
+            select_tunnel_backend(config.tunnel_mode.clone(), &config.interface_name, "base")
+                .await?;
+        info!(mode = ?config.tunnel_mode, "Tunnel backend selected");
 
-        tunnel.ensure_interface(&config.interface_name).await?;
-        tunnel.set_private_key(&*wg_keys.private).await?;
-        tunnel.set_listen_port(config.listen_port).await?;
+        base_tunnel.set_private_key(&*wg_keys.private).await?;
+        base_tunnel.set_listen_port(config.listen_port).await?;
 
         assign_interface_address(&config.interface_name, overlay_ip)?;
         info!(interface = %config.interface_name, addr = %overlay_ip, "Assigned overlay address to interface");
@@ -156,7 +218,10 @@ impl Avenad {
         discovery.start_mdns_browse()?;
         info!("Discovery service initialized");
 
-        let wg_port = tunnel.listen_port().await.unwrap_or(config.listen_port);
+        let wg_port = base_tunnel
+            .listen_port()
+            .await
+            .unwrap_or(config.listen_port);
         let handshake_port = wg_port + 1;
         let listen_addr: SocketAddr = config
             .listen_address
@@ -171,7 +236,8 @@ impl Avenad {
             keypair,
             wg_public: wg_keys.public,
             network,
-            tunnel,
+            base_tunnel,
+            peer_tunnels: Mutex::new(HashMap::new()),
             discovery,
             peers: RwLock::new(HashMap::new()),
             nonce_cache: NonceCache::new(),
@@ -294,14 +360,15 @@ impl Avenad {
                                 match inner_clone.handle_incoming_handshake(stream, addr).await {
                                     Ok(peer_state) => {
                                         let device_id = peer_state.device_id;
+                                        let iface = peer_state.tunnel_interface.clone();
                                         let mut peers = inner_clone.peers.write().await;
                                         let mut inserted = false;
-                                        if let Entry::Vacant(entry) = peers.entry(device_id) {
+                                        if let Entry::Vacant(entry) = peers.entry(iface.clone()) {
                                             entry.insert(peer_state);
                                             inserted = true;
-                                            info!(peer_id = %device_id, "Peer connected via incoming handshake");
+                                            info!(peer_id = %device_id, iface = %iface, "Peer connected via incoming handshake");
                                         } else {
-                                            debug!(peer_id = %device_id, "Peer already connected, discarding duplicate handshake result");
+                                            debug!(peer_id = %device_id, iface = %iface, "Peer tunnel already connected, discarding duplicate handshake result");
                                         }
                                         drop(peers);
 
@@ -358,10 +425,104 @@ async fn start_routing_controller(config: &AvenadConfig) -> Result<BabeldControl
     Ok(controller)
 }
 
+async fn select_tunnel_backend(
+    mode: TunnelMode,
+    interface_name: &str,
+    context: &str,
+) -> Result<Arc<dyn TunnelBackend>, AvenadError> {
+    let prefer_kernel = matches!(mode, TunnelMode::PreferKernel);
+    let candidates: Vec<Arc<dyn TunnelBackend>> = match mode {
+        TunnelMode::Kernel => vec![Arc::new(KernelBackend::new())],
+        TunnelMode::Userspace => vec![Arc::new(UserspaceBackend::new())],
+        TunnelMode::PreferKernel => vec![
+            Arc::new(KernelBackend::new()),
+            Arc::new(UserspaceBackend::new()),
+        ],
+    };
+
+    let mut last_err = None;
+    for (idx, tunnel) in candidates.into_iter().enumerate() {
+        match tunnel.ensure_interface(interface_name).await {
+            Ok(()) => return Ok(tunnel),
+            Err(e) => {
+                if idx == 0 && prefer_kernel {
+                    debug!(
+                        iface = %interface_name,
+                        context = context,
+                        "Kernel tunnel unavailable, falling back to userspace backend: {}",
+                        e
+                    );
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(AvenadError::Tunnel(last_err.unwrap_or_else(|| {
+        avena_overlay::TunnelError::InterfaceCreation(
+            "no tunnel backend could create interface".into(),
+        )
+    })))
+}
+
 impl AvenadInner {
+    async fn ensure_peer_tunnel(
+        &self,
+        peer_id: &DeviceId,
+        local_underlay_hint: &str,
+    ) -> Result<PeerTunnelBinding, AvenadError> {
+        let interface_name =
+            peer_tunnel_interface_name(&self.keypair.device_id(), peer_id, local_underlay_hint);
+        let listen_port = deterministic_tunnel_listen_port(&interface_name);
+
+        let mut tunnels = self.peer_tunnels.lock().await;
+        if let Some(existing) = tunnels.get(&interface_name).cloned() {
+            return Ok(PeerTunnelBinding {
+                interface_name,
+                tunnel: existing,
+                listen_port,
+            });
+        }
+
+        let tunnel =
+            select_tunnel_backend(self.config.tunnel_mode.clone(), &interface_name, "peer").await?;
+
+        self.configure_peer_tunnel_backend(&tunnel, &interface_name, listen_port)
+            .await?;
+
+        tunnels.insert(interface_name.clone(), tunnel.clone());
+
+        Ok(PeerTunnelBinding {
+            interface_name,
+            tunnel,
+            listen_port,
+        })
+    }
+
+    async fn configure_peer_tunnel_backend(
+        &self,
+        tunnel: &Arc<dyn TunnelBackend>,
+        interface_name: &str,
+        listen_port: u16,
+    ) -> Result<(), AvenadError> {
+        let wg_keys = derive_wireguard_keypair(&self.keypair);
+        tunnel.set_private_key(&*wg_keys.private).await?;
+        tunnel.set_listen_port(listen_port).await?;
+
+        let overlay_ip = self.network.device_address(&self.keypair.device_id());
+        assign_interface_address(interface_name, overlay_ip)?;
+
+        let mut routing = self.routing.lock().await;
+        let controller = routing
+            .as_mut()
+            .ok_or_else(|| AvenadError::Routing(RoutingError::not_running()))?;
+        controller.add_interface(interface_name).await?;
+        Ok(())
+    }
+
     async fn announce_presence(&self) -> Result<(), AvenadError> {
         let wg_port = self
-            .tunnel
+            .base_tunnel
             .listen_port()
             .await
             .unwrap_or(self.config.listen_port);
@@ -407,8 +568,11 @@ impl AvenadInner {
 
         {
             let peers = self.peers.read().await;
-            if peers.contains_key(&peer.device_id) {
-                debug!(peer_id = %peer.device_id, "Already connected to peer");
+            if peers.values().any(|state| {
+                state.device_id == peer.device_id
+                    && state.endpoint.map(|endpoint| endpoint.ip()) == Some(peer.endpoint.ip())
+            }) {
+                debug!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Already connected to peer endpoint");
                 return Ok(());
             }
         }
@@ -420,12 +584,13 @@ impl AvenadInner {
             .perform_outgoing_handshake(handshake_addr, &peer)
             .await?;
 
+        let iface = peer_state.tunnel_interface.clone();
         let mut peers = self.peers.write().await;
-        if let Entry::Vacant(entry) = peers.entry(peer.device_id) {
+        if let Entry::Vacant(entry) = peers.entry(iface.clone()) {
             entry.insert(peer_state);
-            info!(peer_id = %peer.device_id, "Peer connected");
+            info!(peer_id = %peer.device_id, iface = %iface, "Peer connected");
         } else {
-            debug!(peer_id = %peer.device_id, "Peer already connected, discarding duplicate handshake result");
+            debug!(peer_id = %peer.device_id, iface = %iface, "Peer tunnel already connected, discarding duplicate handshake result");
         }
         drop(peers);
 
@@ -454,12 +619,18 @@ impl AvenadInner {
     ) -> Result<PeerState, AvenadError> {
         let mut stream = TcpStream::connect(addr).await?;
 
+        let local_underlay_hint = resolve_local_underlay_identifier(stream.local_addr()?.ip())?;
+        let binding = self
+            .ensure_peer_tunnel(&peer.device_id, &local_underlay_hint)
+            .await?;
+
         let local_ephemeral = EphemeralKeypair::generate();
         let local_msg = HandshakeMessage::create(
             &self.keypair,
             &local_ephemeral,
             &peer.device_id,
             self.wg_public,
+            binding.listen_port,
             &self.device_cert,
         );
 
@@ -514,26 +685,41 @@ impl AvenadInner {
         let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer.device_id);
+        let peer_wg_endpoint =
+            SocketAddr::new(canonical_underlay_ip(addr.ip()), peer_msg.wg_listen_port);
 
-        let allowed_ips = direct_peer_allowed_ips(peer_overlay_ip);
+        let allowed_ips = universal_peer_allowed_ips();
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
             .with_allowed_ips(allowed_ips)
-            .with_endpoint(peer.endpoint)
+            .with_endpoint(peer_wg_endpoint)
             .with_keepalive(self.config.persistent_keepalive);
 
-        self.tunnel.add_peer(&peer_config).await?;
+        binding.tunnel.add_peer(&peer_config).await?;
 
         // Always install a direct /128 route for the connected peer.
         // Babel handles multi-hop routes, but direct peer routes are needed
         // immediately after handshake so overlay probes are routable.
-        ensure_direct_peer_route(&self.config.interface_name, peer_overlay_ip)?;
+        if let Err(e) = ensure_direct_peer_route(&binding.interface_name, peer_overlay_ip) {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                warn!(
+                    peer_id = %peer.device_id,
+                    interface = %binding.interface_name,
+                    "failed to install direct peer route: {}",
+                    e
+                );
+            }
+        }
 
-        Ok(
-            PeerState::new(peer.device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
-                .with_endpoint(peer.endpoint),
+        Ok(PeerState::new(
+            peer.device_id,
+            peer_pubkey,
+            peer_wg_pubkey,
+            peer_overlay_ip,
+            binding.interface_name,
         )
+        .with_endpoint(peer_wg_endpoint))
     }
 
     async fn handle_incoming_handshake(
@@ -554,6 +740,8 @@ impl AvenadInner {
         mut stream: TcpStream,
         addr: SocketAddr,
     ) -> Result<PeerState, AvenadError> {
+        let local_underlay_hint = resolve_local_underlay_identifier(stream.local_addr()?.ip())?;
+
         let mut magic = [0u8; 4];
         stream.read_exact(&mut magic).await?;
         if &magic != HANDSHAKE_MAGIC {
@@ -595,12 +783,17 @@ impl AvenadInner {
             return Err(AvenadError::Handshake("replay detected".into()));
         }
 
+        let binding = self
+            .ensure_peer_tunnel(&peer_device_id, &local_underlay_hint)
+            .await?;
+
         let local_ephemeral = EphemeralKeypair::generate();
         let local_msg = HandshakeMessage::create(
             &self.keypair,
             &local_ephemeral,
             &peer_device_id,
             self.wg_public,
+            binding.listen_port,
             &self.device_cert,
         );
 
@@ -618,15 +811,10 @@ impl AvenadInner {
         let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer_device_id);
+        let peer_wg_endpoint =
+            SocketAddr::new(canonical_underlay_ip(addr.ip()), peer_msg.wg_listen_port);
 
-        let peer_wg_endpoint = self.discovery
-            .get_discovered_endpoint(&peer_device_id)
-            .unwrap_or_else(|| {
-                warn!(peer_id = %peer_device_id, "No discovered endpoint, using connection address");
-                SocketAddr::new(addr.ip(), addr.port() - 1)
-            });
-
-        let allowed_ips = direct_peer_allowed_ips(peer_overlay_ip);
+        let allowed_ips = universal_peer_allowed_ips();
 
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
@@ -634,27 +822,80 @@ impl AvenadInner {
             .with_endpoint(peer_wg_endpoint)
             .with_keepalive(self.config.persistent_keepalive);
 
-        self.tunnel.add_peer(&peer_config).await?;
+        binding.tunnel.add_peer(&peer_config).await?;
 
         // Always install a direct /128 route for the connected peer.
         // Babel handles multi-hop routes, but direct peer routes are needed
         // immediately after handshake so overlay probes are routable.
-        ensure_direct_peer_route(&self.config.interface_name, peer_overlay_ip)?;
+        if let Err(e) = ensure_direct_peer_route(&binding.interface_name, peer_overlay_ip) {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                warn!(
+                    peer_id = %peer_device_id,
+                    interface = %binding.interface_name,
+                    "failed to install direct peer route: {}",
+                    e
+                );
+            }
+        }
 
-        Ok(
-            PeerState::new(peer_device_id, peer_pubkey, peer_wg_pubkey, peer_overlay_ip)
-                .with_endpoint(peer_wg_endpoint),
+        Ok(PeerState::new(
+            peer_device_id,
+            peer_pubkey,
+            peer_wg_pubkey,
+            peer_overlay_ip,
+            binding.interface_name,
         )
+        .with_endpoint(peer_wg_endpoint))
+    }
+
+    async fn remove_tunnel_interface(&self, tunnel_interface: &str) -> Option<DeviceId> {
+        let peer = self.peers.write().await.remove(tunnel_interface)?;
+
+        let tunnel = self
+            .peer_tunnels
+            .lock()
+            .await
+            .get(tunnel_interface)
+            .cloned();
+
+        if let Some(tunnel) = tunnel {
+            if let Err(e) = tunnel.remove_peer(&peer.wg_pubkey).await {
+                warn!(peer_id = %peer.device_id, iface = %peer.tunnel_interface, "Failed to remove peer from tunnel: {}", e);
+            }
+            if let Err(e) = tunnel.remove_interface().await {
+                warn!(peer_id = %peer.device_id, iface = %peer.tunnel_interface, "Failed to remove tunnel interface: {}", e);
+            }
+        }
+
+        self.peer_tunnels.lock().await.remove(tunnel_interface);
+
+        let mut routing = self.routing.lock().await;
+        if let Some(ref mut controller) = *routing {
+            if let Err(e) = controller.flush_interface(tunnel_interface).await {
+                warn!(peer_id = %peer.device_id, iface = %tunnel_interface, "Failed to flush interface from babeld: {}", e);
+            }
+        }
+
+        Some(peer.device_id)
     }
 
     async fn handle_peer_lost(&self, device_id: &DeviceId) {
-        let mut peers = self.peers.write().await;
-        if let Some(peer) = peers.remove(device_id) {
-            if let Err(e) = self.tunnel.remove_peer(&peer.wg_pubkey).await {
-                warn!(peer_id = %device_id, "Failed to remove peer from tunnel: {}", e);
-            }
+        let tunnels_to_remove = {
+            let peers = self.peers.read().await;
+            peers
+                .values()
+                .filter(|state| state.device_id == *device_id)
+                .map(|state| state.tunnel_interface.clone())
+                .collect::<Vec<_>>()
+        };
+
+        if tunnels_to_remove.is_empty() {
+            return;
         }
-        drop(peers);
+
+        for tunnel_interface in tunnels_to_remove {
+            self.remove_tunnel_interface(&tunnel_interface).await;
+        }
 
         if let Err(e) = self.reconcile_peer_allowed_ips().await {
             warn!(peer_id = %device_id, "Failed to reconcile peer allowed-ips after peer removal: {}", e);
@@ -664,14 +905,18 @@ impl AvenadInner {
     async fn reconcile_peer_allowed_ips(&self) -> Result<(), AvenadError> {
         let (peer_count, peers) = {
             let peers = self.peers.read().await;
-            let peer_count = peers.len();
+            let peer_count = peers
+                .values()
+                .map(|peer| peer.device_id)
+                .collect::<HashSet<_>>()
+                .len();
             let snapshot = peers
                 .values()
                 .map(|peer| {
                     (
                         peer.device_id,
+                        peer.tunnel_interface.clone(),
                         peer.wg_pubkey,
-                        peer.overlay_ip,
                         peer.endpoint,
                     )
                 })
@@ -681,23 +926,24 @@ impl AvenadInner {
 
         info!(peer_count, "Reconciling peer allowed-ips");
 
-        if peer_count == 1 {
-            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network)
-            {
+        if peer_count == 1 && peers.len() == 1 {
+            let tunnel_interface = &peers[0].1;
+            if let Err(e) = ensure_overlay_prefix_route(tunnel_interface, &self.network) {
                 if e.kind() != std::io::ErrorKind::Unsupported {
                     return Err(e.into());
                 }
             } else {
                 info!(
-                    interface = %self.config.interface_name,
+                    interface = %tunnel_interface,
                     prefix = %format!("{}/{}", self.network.prefix, self.network.prefix_len),
                     "Ensured overlay prefix route"
                 );
             }
         }
 
-        for (device_id, wg_pubkey, overlay_ip, endpoint) in peers {
-            let allowed_ips = peer_allowed_ips(overlay_ip, peer_count, &self.network);
+        let tunnels = self.peer_tunnels.lock().await.clone();
+        for (device_id, tunnel_interface, wg_pubkey, endpoint) in peers {
+            let allowed_ips = universal_peer_allowed_ips();
 
             let mut peer_config = PeerConfig::new(wg_pubkey)
                 .with_allowed_ips(allowed_ips)
@@ -706,10 +952,12 @@ impl AvenadInner {
                 peer_config = peer_config.with_endpoint(endpoint);
             }
 
-            self.tunnel.add_peer(&peer_config).await?;
+            if let Some(tunnel) = tunnels.get(&tunnel_interface).cloned() {
+                tunnel.add_peer(&peer_config).await?;
+            }
             debug!(
                 peer_id = %device_id,
-                peer_count,
+                iface = %tunnel_interface,
                 "reconciled peer allowed-ips for babel routing"
             );
         }
@@ -718,16 +966,34 @@ impl AvenadInner {
     }
 
     async fn maintain_overlay_prefix_route(&self) {
-        let peer_count = self.peers.read().await.len();
+        let (peer_count, tunnel_interface) = {
+            let peers = self.peers.read().await;
+            let peer_count = peers
+                .values()
+                .map(|peer| peer.device_id)
+                .collect::<HashSet<_>>()
+                .len();
+            let tunnel_interface = if peer_count == 1 && peers.len() == 1 {
+                peers
+                    .values()
+                    .next()
+                    .map(|peer| peer.tunnel_interface.clone())
+            } else {
+                None
+            };
+            (peer_count, tunnel_interface)
+        };
+
         if peer_count == 1 {
-            if let Err(e) = ensure_overlay_prefix_route(&self.config.interface_name, &self.network)
-            {
-                if e.kind() != std::io::ErrorKind::Unsupported {
-                    warn!(
-                        interface = %self.config.interface_name,
-                        "failed to maintain overlay prefix route: {}",
-                        e
-                    );
+            if let Some(tunnel_interface) = tunnel_interface {
+                if let Err(e) = ensure_overlay_prefix_route(&tunnel_interface, &self.network) {
+                    if e.kind() != std::io::ErrorKind::Unsupported {
+                        warn!(
+                            interface = %tunnel_interface,
+                            "failed to maintain overlay prefix route: {}",
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -744,7 +1010,10 @@ impl AvenadInner {
                 continue;
             }
 
-            let already_connected = self.peers.read().await.contains_key(&peer.device_id);
+            let already_connected = self.peers.read().await.values().any(|state| {
+                state.device_id == peer.device_id
+                    && state.endpoint.map(|endpoint| endpoint.ip()) == Some(peer.endpoint.ip())
+            });
             if already_connected {
                 continue;
             }
@@ -757,33 +1026,66 @@ impl AvenadInner {
 
     async fn check_dead_peers(&self) {
         let timeout = Duration::from_secs(self.config.dead_peer_timeout_secs);
-        let mut to_remove = Vec::new();
-
-        {
+        let peer_snapshot = {
             let peers = self.peers.read().await;
-            for (id, state) in peers.iter() {
-                match self.tunnel.peer_stats(&state.wg_pubkey).await {
+            peers
+                .values()
+                .map(|state| {
+                    (
+                        state.device_id,
+                        state.wg_pubkey,
+                        state.tunnel_interface.clone(),
+                        state.last_seen,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let tunnels = self.peer_tunnels.lock().await.clone();
+        let mut to_remove = HashSet::new();
+
+        for (device_id, wg_pubkey, tunnel_interface, last_seen) in peer_snapshot {
+            match tunnels.get(&tunnel_interface).cloned() {
+                Some(tunnel) => match tunnel.peer_stats(&wg_pubkey).await {
                     Ok(stats) => {
                         if let Some(last_handshake) = stats.last_handshake {
                             if let Ok(elapsed) = last_handshake.elapsed() {
                                 if elapsed > timeout {
-                                    to_remove.push(*id);
+                                    to_remove.insert((device_id, tunnel_interface.clone()));
                                 }
                             }
                         }
                     }
                     Err(_) => {
-                        if state.time_since_last_seen() > timeout {
-                            to_remove.push(*id);
+                        if last_seen.elapsed() > timeout {
+                            to_remove.insert((device_id, tunnel_interface.clone()));
                         }
+                    }
+                },
+                None => {
+                    if last_seen.elapsed() > timeout {
+                        to_remove.insert((device_id, tunnel_interface.clone()));
                     }
                 }
             }
         }
 
-        for id in to_remove {
-            warn!(peer_id = %id, "Removing dead peer");
-            self.handle_peer_lost(&id).await;
+        let mut removed_any = false;
+        for (device_id, tunnel_interface) in to_remove {
+            warn!(peer_id = %device_id, iface = %tunnel_interface, "Removing dead peer tunnel");
+            removed_any |= self
+                .remove_tunnel_interface(&tunnel_interface)
+                .await
+                .is_some();
+        }
+
+        if removed_any {
+            if let Err(e) = self.reconcile_peer_allowed_ips().await {
+                warn!(
+                    "Failed to reconcile peer allowed-ips after dead-peer cleanup: {}",
+                    e
+                );
+            }
         }
     }
 
@@ -798,11 +1100,23 @@ impl AvenadInner {
             }
         }
         *routing = None;
+        drop(routing);
 
         let peers = self.peers.read().await;
         for (id, peer) in peers.iter() {
-            if let Err(e) = self.tunnel.remove_peer(&peer.wg_pubkey).await {
-                warn!(peer_id = %id, "Failed to remove peer during shutdown: {}", e);
+            if let Some(tunnel) = self
+                .peer_tunnels
+                .lock()
+                .await
+                .get(&peer.tunnel_interface)
+                .cloned()
+            {
+                if let Err(e) = tunnel.remove_peer(&peer.wg_pubkey).await {
+                    warn!(peer_id = %id, iface = %peer.tunnel_interface, "Failed to remove peer during shutdown: {}", e);
+                }
+                if let Err(e) = tunnel.remove_interface().await {
+                    warn!(peer_id = %id, iface = %peer.tunnel_interface, "Failed to remove tunnel interface during shutdown: {}", e);
+                }
             }
         }
     }
@@ -878,6 +1192,35 @@ fn load_or_generate_keypair(config: &AvenadConfig) -> Result<DeviceKeypair, Aven
     }
 
     Ok(keypair)
+}
+
+#[cfg(unix)]
+fn try_raise_nofile_limit() -> Result<(), std::io::Error> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if limit.rlim_cur < limit.rlim_max {
+        let target = libc::rlimit {
+            rlim_cur: limit.rlim_max,
+            rlim_max: limit.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &target) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn try_raise_nofile_limit() -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -967,26 +1310,8 @@ fn ensure_overlay_prefix_route(
     ))
 }
 
-fn direct_peer_allowed_ips(peer_overlay_ip: std::net::Ipv6Addr) -> Vec<IpNet> {
-    vec![IpNet::new(peer_overlay_ip.into(), 128).expect("/128 is always valid")]
-}
-
-fn peer_allowed_ips(
-    peer_overlay_ip: std::net::Ipv6Addr,
-    active_peer_count: usize,
-    network: &NetworkConfig,
-) -> Vec<IpNet> {
-    let mut allowed = direct_peer_allowed_ips(peer_overlay_ip);
-
-    if active_peer_count <= 1 {
-        if let Ok(prefix) = IpNet::new(network.prefix.into(), network.prefix_len) {
-            if !allowed.contains(&prefix) {
-                allowed.push(prefix);
-            }
-        }
-    }
-
-    allowed
+fn universal_peer_allowed_ips() -> Vec<IpNet> {
+    vec![IpNet::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0).expect("::/0 is always valid")]
 }
 
 #[cfg(target_os = "linux")]
@@ -1076,21 +1401,48 @@ mod tests {
     }
 
     #[test]
-    fn peer_allowed_ips_include_overlay_prefix_for_single_peer() {
-        let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
-        let network = NetworkConfig::default();
-        let allowed_ips = peer_allowed_ips(overlay_ip, 1, &network);
-        assert_eq!(allowed_ips.len(), 2);
-        assert!(allowed_ips.contains(&"fd00:a0e0:a000::1/128".parse().unwrap()));
-        assert!(allowed_ips.contains(&"fd00:a0e0:a000::/48".parse().unwrap()));
+    fn peer_allowed_ips_use_universal_ipv6_prefix() {
+        let allowed_ips = universal_peer_allowed_ips();
+        assert_eq!(allowed_ips, vec!["::/0".parse().unwrap()]);
     }
 
     #[test]
-    fn peer_allowed_ips_are_host_routes_when_babel_and_multiple_peers() {
-        let overlay_ip = "fd00:a0e0:a000::1".parse().unwrap();
-        let network = NetworkConfig::default();
-        let allowed_ips = peer_allowed_ips(overlay_ip, 2, &network);
-        assert_eq!(allowed_ips, vec!["fd00:a0e0:a000::1/128".parse().unwrap()]);
+    fn peer_allowed_ips_are_invariant_across_peer_counts() {
+        let for_single = universal_peer_allowed_ips();
+        let for_many = universal_peer_allowed_ips();
+        assert_eq!(for_single, vec!["::/0".parse().unwrap()]);
+        assert_eq!(for_many, vec!["::/0".parse().unwrap()]);
+    }
+
+    #[test]
+    fn peer_tunnel_interface_name_is_deterministic_and_underlay_scoped() {
+        let local = DeviceId::from_bytes([1u8; 16]);
+        let peer = DeviceId::from_bytes([2u8; 16]);
+
+        let a = peer_tunnel_interface_name(&local, &peer, "10.1.0.10");
+        let b = peer_tunnel_interface_name(&local, &peer, "10.1.0.10");
+        let c = peer_tunnel_interface_name(&local, &peer, "10.2.0.10");
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("av-"));
+        assert!(a.len() <= 15);
+    }
+
+    #[test]
+    fn deterministic_tunnel_listen_port_is_stable_and_nonzero() {
+        let iface = "av-deadbeef";
+        let p1 = deterministic_tunnel_listen_port(iface);
+        let p2 = deterministic_tunnel_listen_port(iface);
+        assert_eq!(p1, p2);
+        assert_ne!(p1, 0);
+    }
+
+    #[test]
+    fn canonical_underlay_ip_normalizes_ipv4_mapped_ipv6() {
+        let mapped: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
+        let normalized = canonical_underlay_ip(mapped);
+        assert_eq!(normalized, "10.1.2.3".parse::<IpAddr>().unwrap());
     }
 }
 

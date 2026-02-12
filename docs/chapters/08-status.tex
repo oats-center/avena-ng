@@ -62,13 +62,16 @@ Recent implementation work improved Layer 1 stability in userspace and testbed-d
     \item Scenario-gate improvements across \texttt{two\_node\_basic}, \texttt{linear\_three\_hop}, \texttt{star\_gateway}, and \texttt{mobile\_relay}.
 \end{itemize}
 
-At the time of writing, the following temporary implementation deltas remain relative to the target design in Chapter~2:
+At the time of writing, major Layer 1 deltas from Chapter~2 have been closed:
 
 \begin{itemize}[nosep]
-    \item \textbf{Babel startup behavior:} current code can continue with degraded behavior when \texttt{babeld} startup fails, while the design target states Babel is mandatory.
-    \item \textbf{AllowedIPs policy:} current code uses an adaptive host-route strategy instead of universal \texttt{::/0} on all peer interfaces.
-    \item \textbf{Interface model:} true per-(peer, underlay) WireGuard interface realization is not yet complete.
+    \item \textbf{Babel startup behavior:} \texttt{babeld} startup is now fatal; there is no degraded no-Babel mode.
+    \item \textbf{AllowedIPs policy:} peer tunnels now use universal \texttt{::/0} as specified in Chapter~2.
+    \item \textbf{Interface model:} per-(peer, underlay) WireGuard tunnel realization is now active end-to-end.
+    \item \textbf{Tunnel mode policy:} runtime mode is explicit via \texttt{kernel}, \texttt{userspace}, and \texttt{prefer\_kernel}.
 \end{itemize}
+
+Remaining near-term Layer 1 work is concentrated on validation depth (dual-underlay failover and churn scenario gates), not on changing core tunnel architecture.
 
 % ============================================================
 \section{Resolved Design Decisions}
@@ -98,9 +101,9 @@ CRDT types & OR-Map for registries, OR-Set for interests, LWW-Register for singl
 Workload network mode & Two modes: Messaging (pub/sub only, default) and Addressable (overlay IP via sidecar). \\
 Layer 1 ownership & Host avenad owns all Layer 1 infrastructure. Workloads access network via NATS API or sidecar. \\
 Workload isolation & Messaging workloads isolated via Layer 2 encryption. Addressable workloads isolated via end-to-end Wireguard tunnels. Host cannot decrypt workload traffic. \\
-Wireguard backend & Dual-mode: Kernel backend via Linux netlink (\texttt{netlink-packet-wireguard} crate), userspace backend via \texttt{wireguard-go} subprocess with Unix socket UAPI. Host prefers kernel; sidecar uses userspace. \\
+Wireguard backend & Tri-mode host selection: \texttt{kernel}, \texttt{userspace}, or \texttt{prefer\_kernel} fallback. Kernel backend via Linux netlink (\texttt{netlink-packet-wireguard} crate), userspace backend via \texttt{wireguard-go} subprocess with Unix socket UAPI. \\
 Babel integration & \texttt{babeld} daemon with Unix control socket. Unicast mode for WireGuard compatibility (\texttt{type tunnel unicast true split-horizon true}). Dynamic interface add/remove via socket commands. \\
-WireGuard interface model & One interface per (peer, underlay) tuple. Interface names: \texttt{av-<hash8>}. Enables true multi-path where Babel sees each physical path as distinct link. \\
+WireGuard interface model & One interface per (peer, underlay) tuple. Interface names: \texttt{av-<hash8>} derived from \texttt{(local\_id, peer\_id, underlay\_name)} with strict local underlay-interface resolution. Enables true multi-path where Babel sees each physical path as distinct link. \\
 Underlay filtering & Include/exclude glob patterns to select physical interfaces. Prevents Avena from using Docker bridges, veth pairs, etc. \\
 Port allocation & Deterministic from hash within configured range (default 51820--52820). Consistent across restarts. \\
 Sidecar control channel & NATS. Sidecars connect to host's NATS with JWT issued by avenad. JWTs scope subject permissions per workload spec. \\

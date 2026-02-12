@@ -513,6 +513,60 @@ pub fn get_interface_ipv4(ifname: &str) -> Option<Ipv4Addr> {
     None
 }
 
+pub fn get_interface_name_for_ip(ip: IpAddr) -> Option<String> {
+    let mut message = AddressMessage::default();
+    message.header.family = match ip {
+        IpAddr::V4(_) => AddressFamily::Inet,
+        IpAddr::V6(_) => AddressFamily::Inet6,
+    };
+
+    let responses = netlink_request(
+        RouteNetlinkMessage::GetAddress(message),
+        NLM_F_REQUEST | NLM_F_DUMP,
+        NETLINK_ROUTE,
+    )
+    .ok()?;
+
+    let ifindex = responses.into_iter().find_map(|response| {
+        if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(addr_msg)) =
+            response.payload
+        {
+            for attr in &addr_msg.attributes {
+                match attr {
+                    AddressAttribute::Address(addr) | AddressAttribute::Local(addr)
+                        if *addr == ip =>
+                    {
+                        return Some(addr_msg.header.index);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    })?;
+
+    let link_message = LinkMessage::default();
+    let links = netlink_request(
+        RouteNetlinkMessage::GetLink(link_message),
+        NLM_F_REQUEST | NLM_F_DUMP,
+        NETLINK_ROUTE,
+    )
+    .ok()?;
+
+    links.into_iter().find_map(|response| {
+        if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link)) = response.payload {
+            if link.header.index == ifindex {
+                for attr in &link.attributes {
+                    if let LinkAttribute::IfName(name) = attr {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

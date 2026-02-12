@@ -562,7 +562,7 @@ impl TestTopology {
 
 #[cfg(target_os = "linux")]
 fn default_tunnel_mode_for_testbed() -> TunnelMode {
-    TunnelMode::Userspace
+    TunnelMode::PreferKernel
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -592,7 +592,7 @@ mod tests {
     fn test_default_tunnel_mode_linux() {
         assert!(matches!(
             default_tunnel_mode_for_testbed(),
-            TunnelMode::Userspace
+            TunnelMode::PreferKernel
         ));
     }
 

@@ -268,6 +268,9 @@ fn wireguard_go_command(name: &str) -> Command {
     cmd.arg("-f");
     cmd.arg(name);
     cmd.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
+    // Keep per-interface userspace backend fd/thread footprint bounded when
+    // many interfaces are active in the same namespace.
+    cmd.env("GOMAXPROCS", "1");
     cmd
 }
 
@@ -435,8 +438,14 @@ mod tests {
             .find(|(key, _)| *key == "WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD")
             .and_then(|(_, value)| value)
             .expect("userspace preference env should be set");
+        let gomaxprocs = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "GOMAXPROCS")
+            .and_then(|(_, value)| value)
+            .expect("GOMAXPROCS should be set for bounded fd usage");
 
         assert_eq!(args, vec!["-f", "wg-test"]);
         assert_eq!(env, "1");
+        assert_eq!(gomaxprocs, "1");
     }
 }

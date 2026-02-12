@@ -89,6 +89,7 @@ pub struct PeerStats {
 /// Abstraction over kernel and userspace WireGuard implementations.
 pub trait TunnelBackend: Send + Sync {
     async fn ensure_interface(&self, name: &str) -> Result<(), TunnelError>;
+    async fn remove_interface(&self) -> Result<(), TunnelError>;
     async fn set_private_key(&self, private_key: &[u8; 32]) -> Result<(), TunnelError>;
     async fn add_peer(&self, peer: &PeerConfig) -> Result<(), TunnelError>;
     async fn remove_peer(&self, pubkey: &[u8; 32]) -> Result<(), TunnelError>;

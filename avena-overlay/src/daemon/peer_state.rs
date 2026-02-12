@@ -13,6 +13,7 @@ pub struct PeerState {
     pub wg_pubkey: [u8; 32],
     pub endpoint: Option<SocketAddr>,
     pub overlay_ip: Ipv6Addr,
+    pub tunnel_interface: String,
     pub connected_at: Instant,
     pub last_seen: Instant,
 }
@@ -23,6 +24,7 @@ impl PeerState {
         public_key: VerifyingKey,
         wg_pubkey: [u8; 32],
         overlay_ip: Ipv6Addr,
+        tunnel_interface: String,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -31,6 +33,7 @@ impl PeerState {
             wg_pubkey,
             endpoint: None,
             overlay_ip,
+            tunnel_interface,
             connected_at: now,
             last_seen: now,
         }

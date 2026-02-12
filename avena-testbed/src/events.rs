@@ -7,7 +7,7 @@ use crate::links::{LinkError, LinkManager};
 use crate::metrics::{AvenadEventType, LogParser, MetricsLogger};
 use crate::scenario::{AssertCondition, Assertion, Event, EventAction};
 use crate::topology::{TestTopology, TopologyError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -205,15 +205,9 @@ impl EventExecutor {
                     continue;
                 }
 
-                let connected_a = *tracker
-                    .connection_counts
-                    .get(&state.node_a)
-                    .unwrap_or(&0)
+                let connected_a = *tracker.connection_counts.get(&state.node_a).unwrap_or(&0)
                     > state.baseline_connections_a;
-                let connected_b = *tracker
-                    .connection_counts
-                    .get(&state.node_b)
-                    .unwrap_or(&0)
+                let connected_b = *tracker.connection_counts.get(&state.node_b).unwrap_or(&0)
                     > state.baseline_connections_b;
 
                 if connected_a || connected_b {
@@ -283,9 +277,11 @@ impl EventExecutor {
                             if nodes.len() >= 2 {
                                 let from = &nodes[0];
                                 let to = &nodes[1];
-                                if let Some((_, state)) = link_convergence.iter_mut().find(|(_, s)| {
-                                    same_unordered_pair(&s.node_a, &s.node_b, from, to)
-                                }) {
+                                if let Some((_, state)) =
+                                    link_convergence.iter_mut().find(|(_, s)| {
+                                        same_unordered_pair(&s.node_a, &s.node_b, from, to)
+                                    })
+                                {
                                     if state.first_peer_connected_ms.is_none() {
                                         state.first_peer_connected_ms = Some(elapsed_ms);
                                         let value_ms =
@@ -600,7 +596,7 @@ impl EventExecutor {
         let topology = self.topology.lock().await;
 
         let output = topology
-            .exec_in_node(node, &["wg", "show", &format!("wg-{node}"), "peers"])
+            .exec_in_node(node, &["wg", "show", "all", "peers"])
             .await?;
 
         if !output.status.success() {
@@ -611,7 +607,12 @@ impl EventExecutor {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let peer_count = stdout.lines().filter(|l| !l.is_empty()).count();
+        let peer_count = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .collect::<HashSet<_>>()
+            .len();
 
         if peer_count != expected {
             return Err(EventError::AssertionFailed {

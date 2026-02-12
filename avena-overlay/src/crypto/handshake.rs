@@ -88,6 +88,8 @@ pub struct HandshakeMessage {
     /// WireGuard interface public key this node will use.
     #[serde_as(as = "Bytes")]
     pub wg_pubkey: [u8; 32],
+    /// WireGuard listen port this tunnel interface expects packets on.
+    pub wg_listen_port: u16,
     /// Signature over (ephemeral_pubkey || nonce || timestamp || peer_id || wg_pubkey).
     #[serde_as(as = "Bytes")]
     pub signature: [u8; 64],
@@ -102,6 +104,7 @@ impl HandshakeMessage {
         ephemeral: &EphemeralKeypair,
         peer_id: &DeviceId,
         wg_pubkey: [u8; 32],
+        wg_listen_port: u16,
         device_cert: &str,
     ) -> Self {
         let mut nonce = [0u8; 32];
@@ -114,12 +117,13 @@ impl HandshakeMessage {
 
         let ephemeral_pubkey = ephemeral.public_key_bytes();
 
-        let mut message_to_sign = Vec::with_capacity(32 + 32 + 8 + 16 + 32);
+        let mut message_to_sign = Vec::with_capacity(32 + 32 + 8 + 16 + 32 + 2);
         message_to_sign.extend_from_slice(&ephemeral_pubkey);
         message_to_sign.extend_from_slice(&nonce);
         message_to_sign.extend_from_slice(&timestamp_secs.to_le_bytes());
         message_to_sign.extend_from_slice(peer_id.as_bytes());
         message_to_sign.extend_from_slice(&wg_pubkey);
+        message_to_sign.extend_from_slice(&wg_listen_port.to_le_bytes());
 
         let signature = device.sign(&message_to_sign);
 
@@ -128,6 +132,7 @@ impl HandshakeMessage {
             nonce,
             timestamp_secs,
             wg_pubkey,
+            wg_listen_port,
             signature: signature.to_bytes(),
             device_cert: device_cert.to_string(),
         }
@@ -159,12 +164,13 @@ impl HandshakeMessage {
             });
         }
 
-        let mut message_to_verify = Vec::with_capacity(32 + 32 + 8 + 16 + 32);
+        let mut message_to_verify = Vec::with_capacity(32 + 32 + 8 + 16 + 32 + 2);
         message_to_verify.extend_from_slice(&self.ephemeral_pubkey);
         message_to_verify.extend_from_slice(&self.nonce);
         message_to_verify.extend_from_slice(&self.timestamp_secs.to_le_bytes());
         message_to_verify.extend_from_slice(local_id.as_bytes());
         message_to_verify.extend_from_slice(&self.wg_pubkey);
+        message_to_verify.extend_from_slice(&self.wg_listen_port.to_le_bytes());
 
         let signature = Signature::from_bytes(&self.signature);
         peer_pubkey
@@ -286,6 +292,7 @@ mod tests {
             &alice_ephemeral,
             &bob_id,
             alice_wg.public,
+            51820,
             &alice_cert,
         );
 
@@ -314,6 +321,7 @@ mod tests {
             &alice_ephemeral,
             &bob_id,
             alice_wg.public,
+            51820,
             &alice_cert,
         );
 
@@ -340,6 +348,7 @@ mod tests {
             &alice_ephemeral,
             &bob_id,
             alice_wg.public,
+            51820,
             &alice_cert,
         );
 
@@ -368,6 +377,7 @@ mod tests {
             &alice_ephemeral,
             &bob_id,
             alice_wg.public,
+            51820,
             &alice_cert,
         );
 
@@ -394,6 +404,7 @@ mod tests {
             &alice_ephemeral,
             &bob_id,
             alice_wg.public,
+            51820,
             &charlie_cert,
         );
 
@@ -453,8 +464,14 @@ mod tests {
         let wg_keys = derive_wireguard_keypair(&device);
         let device_cert = create_device_cert(&ca, &device);
 
-        let message =
-            HandshakeMessage::create(&device, &ephemeral, &peer_id, wg_keys.public, &device_cert);
+        let message = HandshakeMessage::create(
+            &device,
+            &ephemeral,
+            &peer_id,
+            wg_keys.public,
+            51820,
+            &device_cert,
+        );
 
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: HandshakeMessage = serde_json::from_str(&json).unwrap();
@@ -485,6 +502,7 @@ mod tests {
             &alice_ephemeral,
             &bob_device.device_id(),
             alice_wg.public,
+            51820,
             &alice_cert,
         );
         let bob_msg = HandshakeMessage::create(
@@ -492,6 +510,7 @@ mod tests {
             &bob_ephemeral,
             &alice_device.device_id(),
             bob_wg.public,
+            51820,
             &bob_cert,
         );
 

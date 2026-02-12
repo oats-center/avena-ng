@@ -109,6 +109,7 @@ dependencies = [
  "hkdf",
  "ipnet",
  "jsonwebtoken",
+ "libc",
  "lru",
  "mdns-sd",
  "netlink-packet-core",

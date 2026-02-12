@@ -11,14 +11,25 @@ use std::net::Ipv6Addr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-fn make_peer_state(seed: u8, device_id: DeviceId, wg_suffix: u8) -> PeerState {
+fn make_peer_state(
+    seed: u8,
+    device_id: DeviceId,
+    wg_suffix: u8,
+    tunnel_interface: &str,
+) -> PeerState {
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
     let public_key = signing_key.verifying_key();
     let mut wg_pubkey = [0u8; 32];
     wg_pubkey[0] = wg_suffix;
     let overlay_ip = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(seed));
 
-    PeerState::new(device_id, public_key, wg_pubkey, overlay_ip)
+    PeerState::new(
+        device_id,
+        public_key,
+        wg_pubkey,
+        overlay_ip,
+        tunnel_interface.to_string(),
+    )
 }
 
 #[tokio::test]
@@ -36,7 +47,7 @@ async fn test_concurrent_handshake_does_not_corrupt_peer_state() {
         let device_id = target_id;
 
         handles.push(tokio::spawn(async move {
-            let peer_state = make_peer_state(i as u8, device_id, i as u8);
+            let peer_state = make_peer_state(i as u8, device_id, i as u8, "av-test");
             let wg_pubkey = peer_state.wg_pubkey;
 
             let mut peers_guard = peers_clone.write().await;
@@ -90,7 +101,7 @@ async fn test_sequential_handshakes_first_wins() {
     let target_keypair = DeviceKeypair::from_seed(&[99u8; 32]);
     let target_id = target_keypair.device_id();
 
-    let first_peer = make_peer_state(1, target_id, 0xAA);
+    let first_peer = make_peer_state(1, target_id, 0xAA, "av-test");
     let first_wg_key = first_peer.wg_pubkey;
 
     if let Entry::Vacant(entry) = peers.entry(target_id) {
@@ -98,7 +109,7 @@ async fn test_sequential_handshakes_first_wins() {
     }
     assert_eq!(peers.len(), 1);
 
-    let second_peer = make_peer_state(2, target_id, 0xBB);
+    let second_peer = make_peer_state(2, target_id, 0xBB, "av-test");
     if let Entry::Vacant(entry) = peers.entry(target_id) {
         entry.insert(second_peer);
     }
@@ -124,7 +135,7 @@ async fn test_different_peers_can_connect_concurrently() {
         handles.push(tokio::spawn(async move {
             let keypair = DeviceKeypair::from_seed(&[i as u8; 32]);
             let device_id = keypair.device_id();
-            let peer_state = make_peer_state(i as u8, device_id, i as u8);
+            let peer_state = make_peer_state(i as u8, device_id, i as u8, "av-test");
 
             let mut peers_guard = peers_clone.write().await;
             if let Entry::Vacant(entry) = peers_guard.entry(device_id) {
@@ -154,4 +165,27 @@ async fn test_different_peers_can_connect_concurrently() {
         num_peers,
         "Should have all {num_peers} peers"
     );
+}
+
+#[tokio::test]
+async fn test_same_peer_can_hold_multiple_underlay_tunnels() {
+    let mut peers: HashMap<String, PeerState> = HashMap::new();
+
+    let target_keypair = DeviceKeypair::from_seed(&[55u8; 32]);
+    let target_id = target_keypair.device_id();
+
+    let wifi_tunnel = make_peer_state(1, target_id, 0xA1, "av-wifi01");
+    let cell_tunnel = make_peer_state(2, target_id, 0xB2, "av-cell02");
+
+    if let Entry::Vacant(entry) = peers.entry(wifi_tunnel.tunnel_interface.clone()) {
+        entry.insert(wifi_tunnel);
+    }
+    if let Entry::Vacant(entry) = peers.entry(cell_tunnel.tunnel_interface.clone()) {
+        entry.insert(cell_tunnel);
+    }
+
+    assert_eq!(peers.len(), 2, "same peer should keep both tunnels");
+    assert!(peers.contains_key("av-wifi01"));
+    assert!(peers.contains_key("av-cell02"));
+    assert!(peers.values().all(|state| state.device_id == target_id));
 }

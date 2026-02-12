@@ -1,7 +1,7 @@
 //! Configuration types for the `avenad` daemon.
 //!
 //! Settings include network prefix, discovery backends, interface name, and
-//! backend selection (kernel vs userspace).
+//! backend selection (kernel, userspace, or prefer-kernel fallback).
 
 use crate::crypto::{CertError, CertValidator};
 use crate::discovery::StaticPeerConfig;
@@ -16,6 +16,8 @@ use std::path::PathBuf;
 pub enum TunnelMode {
     Kernel,
     Userspace,
+    #[serde(rename = "prefer_kernel")]
+    PreferKernel,
 }
 
 impl Default for TunnelMode {
@@ -32,7 +34,7 @@ pub struct AvenadConfig {
     pub interface_name: String,
 
     #[serde(default)]
-    /// Choose kernel WireGuard or userspace backend.
+    /// Choose kernel, userspace, or prefer-kernel WireGuard backend mode.
     pub tunnel_mode: TunnelMode,
 
     #[serde(default)]
@@ -300,5 +302,17 @@ mod tests {
         assert_eq!(config.discovery.static_peers.len(), 1);
         assert_eq!(config.discovery.presence_reannounce_interval_ms, 1000);
         assert_eq!(config.discovery.peer_retry_interval_ms, 250);
+    }
+
+    #[test]
+    fn parse_prefer_kernel_tunnel_mode() {
+        let toml = r#"
+            interface_name = "avena1"
+            tunnel_mode = "prefer_kernel"
+            trusted_root_cert = "/etc/avena/root.cert"
+            device_cert = "/etc/avena/device.cert"
+        "#;
+        let config: AvenadConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(config.tunnel_mode, TunnelMode::PreferKernel));
     }
 }

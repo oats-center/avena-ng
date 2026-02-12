@@ -54,6 +54,7 @@ directories = "5"
 
 # Error handling
 thiserror = "1"
+libc = "0.2"
 
 # Data structures
 lru = "0.12"
