@@ -206,6 +206,9 @@ async fn main() -> ExitCode {
             println!("  linear_three_hop.toml   - Three nodes in a line (A-B-C)");
             println!("  star_gateway.toml       - Star topology with central gateway");
             println!("  mobile_relay.toml       - DTN store-and-forward via mobile relay");
+            println!("  dual_underlay_same_peer.toml - Parallel links between same peer pair");
+            println!("  dual_underlay_failover.toml  - Parallel-link failover validation");
+            println!("  dual_underlay_churn_cleanup.toml - Churn teardown/rebuild leak check");
             ExitCode::SUCCESS
         }
     }

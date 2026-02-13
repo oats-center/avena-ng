@@ -62,7 +62,11 @@ struct LinkConvergenceState {
 
 #[derive(Debug, Clone)]
 enum ExecutedEvent {
-    LinkConnected { link_id: String },
+    LinkConnected {
+        link_id: String,
+        node_a: String,
+        node_b: String,
+    },
 }
 
 const ASSERTION_PING_ATTEMPTS: usize = 5;
@@ -97,11 +101,6 @@ impl EventTracker {
             }
         }
     }
-}
-
-fn link_nodes_from_link_id(link_id: &str) -> Option<(String, String)> {
-    let (a, b) = link_id.split_once('-')?;
-    Some((a.to_string(), b.to_string()))
 }
 
 fn same_unordered_pair(a1: &str, b1: &str, a2: &str, b2: &str) -> bool {
@@ -170,27 +169,29 @@ impl EventExecutor {
                 let event = event_iter.next().unwrap();
                 if let Some(executed) = self.execute_event(event).await? {
                     match executed {
-                        ExecutedEvent::LinkConnected { link_id } => {
-                            if let Some((node_a, node_b)) = link_nodes_from_link_id(&link_id) {
-                                let baseline_connections_a =
-                                    *tracker.connection_counts.get(&node_a).unwrap_or(&0);
-                                let baseline_connections_b =
-                                    *tracker.connection_counts.get(&node_b).unwrap_or(&0);
-                                link_convergence.insert(
-                                    link_id.clone(),
-                                    LinkConvergenceState {
-                                        link_id: link_id.clone(),
-                                        node_a,
-                                        node_b,
-                                        underlay_up_ms: (elapsed * 1000.0) as u64,
-                                        baseline_connections_a,
-                                        baseline_connections_b,
-                                        first_peer_connected_ms: None,
-                                        first_overlay_ping_ms: None,
-                                    },
-                                );
-                                latest_link_up = Some(link_id);
-                            }
+                        ExecutedEvent::LinkConnected {
+                            link_id,
+                            node_a,
+                            node_b,
+                        } => {
+                            let baseline_connections_a =
+                                *tracker.connection_counts.get(&node_a).unwrap_or(&0);
+                            let baseline_connections_b =
+                                *tracker.connection_counts.get(&node_b).unwrap_or(&0);
+                            link_convergence.insert(
+                                link_id.clone(),
+                                LinkConvergenceState {
+                                    link_id: link_id.clone(),
+                                    node_a,
+                                    node_b,
+                                    underlay_up_ms: (elapsed * 1000.0) as u64,
+                                    baseline_connections_a,
+                                    baseline_connections_b,
+                                    first_peer_connected_ms: None,
+                                    first_overlay_ping_ms: None,
+                                },
+                            );
+                            latest_link_up = Some(link_id);
                         }
                     }
                 }
@@ -348,8 +349,16 @@ impl EventExecutor {
                     .link_id_from_ref(link)
                     .ok_or_else(|| EventError::UnknownLink(link.clone()))?;
                 links.set_link_enabled(&link_id, true).await?;
+                let link_state = links
+                    .link(&link_id)
+                    .cloned()
+                    .ok_or_else(|| EventError::UnknownLink(link.clone()))?;
                 self.metrics.log_link_changed(&link_id, true);
-                return Ok(Some(ExecutedEvent::LinkConnected { link_id }));
+                return Ok(Some(ExecutedEvent::LinkConnected {
+                    link_id,
+                    node_a: link_state.node_a,
+                    node_b: link_state.node_b,
+                }));
             }
             EventAction::ModifyLink {
                 link,
@@ -391,6 +400,10 @@ impl EventExecutor {
             }
             AssertCondition::PeerCount { node, count } => {
                 self.check_peer_count(node, *count, assertion.at_secs).await
+            }
+            AssertCondition::TunnelInterfaceCount { node, count } => {
+                self.check_tunnel_interface_count(node, *count, assertion.at_secs)
+                    .await
             }
         }
     }
@@ -620,6 +633,50 @@ impl EventExecutor {
                 message: format!("node {node} has {peer_count} peers, expected {expected}"),
             });
         }
+        Ok(())
+    }
+
+    async fn check_tunnel_interface_count(
+        &self,
+        node: &str,
+        expected: usize,
+        at_secs: f64,
+    ) -> Result<(), EventError> {
+        let topology = self.topology.lock().await;
+
+        let output = topology
+            .exec_in_node(node, &["ip", "-o", "link", "show"])
+            .await?;
+
+        if !output.status.success() {
+            return Err(EventError::AssertionFailed {
+                at_secs,
+                message: format!("failed to inspect interfaces for node {node}"),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let av_interface_count = stdout
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, ':');
+                let _ = parts.next();
+                let iface = parts.next()?.trim();
+                let iface = iface.split('@').next().unwrap_or(iface);
+                Some(iface)
+            })
+            .filter(|iface| iface.starts_with("av-"))
+            .count();
+
+        if av_interface_count != expected {
+            return Err(EventError::AssertionFailed {
+                at_secs,
+                message: format!(
+                    "node {node} has {av_interface_count} av-* interfaces, expected {expected}"
+                ),
+            });
+        }
+
         Ok(())
     }
 }

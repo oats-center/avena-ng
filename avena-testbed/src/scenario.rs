@@ -54,6 +54,8 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LinkConfig {
+    #[serde(default)]
+    pub id: Option<String>,
     pub endpoints: (String, String),
     pub latency_ms: u32,
     pub bandwidth_kbps: u32,
@@ -65,6 +67,22 @@ pub struct LinkConfig {
 
 fn default_enabled() -> bool {
     true
+}
+
+impl LinkConfig {
+    pub fn resolved_link_id(&self) -> String {
+        self.id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", self.endpoints.0, self.endpoints.1))
+    }
+}
+
+fn normalized_link_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +134,10 @@ pub enum AssertCondition {
         node: String,
         count: usize,
     },
+    TunnelInterfaceCount {
+        node: String,
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -138,6 +160,13 @@ impl AssertCondition {
                     node: node.clone(),
                     event_type: RequiredEventType::PeerConnected,
                     count: *count,
+                }]
+            }
+            AssertCondition::TunnelInterfaceCount { node, .. } => {
+                vec![RequiredEvent {
+                    node: node.clone(),
+                    event_type: RequiredEventType::PeerConnected,
+                    count: 1,
                 }]
             }
             AssertCondition::Ping { from, to, .. } => {
@@ -206,6 +235,8 @@ impl Scenario {
             }
         }
 
+        self.validate_link_identity_rules()?;
+
         for bridge in &self.bridges {
             for node in &bridge.nodes {
                 if !node_ids.contains(node) {
@@ -264,23 +295,77 @@ impl Scenario {
     }
 
     fn validate_link_ref(&self, link_ref: &str) -> Result<(), ScenarioError> {
-        let parts: Vec<&str> = link_ref.split('-').collect();
-        if parts.len() != 2 {
-            return Err(ScenarioError::Validation(format!(
-                "invalid link reference format: {link_ref} (expected 'nodeA-nodeB')"
-            )));
+        if self
+            .links
+            .iter()
+            .any(|link| link.resolved_link_id() == link_ref)
+        {
+            return Ok(());
         }
 
-        let link_exists = self.links.iter().any(|l| {
-            (l.endpoints.0 == parts[0] && l.endpoints.1 == parts[1])
-                || (l.endpoints.0 == parts[1] && l.endpoints.1 == parts[0])
-        });
-
-        if !link_exists {
+        let Some((node_a, node_b)) = link_ref.split_once('-') else {
             return Err(ScenarioError::Validation(format!(
                 "event references unknown link: {link_ref}"
             )));
+        };
+
+        let matching_links = self
+            .links
+            .iter()
+            .filter(|link| {
+                let (a, b) = (&link.endpoints.0, &link.endpoints.1);
+                (a == node_a && b == node_b) || (a == node_b && b == node_a)
+            })
+            .count();
+
+        match matching_links {
+            1 => Ok(()),
+            n if n > 1 => Err(ScenarioError::Validation(format!(
+                "event link reference '{link_ref}' is ambiguous; use an explicit link id"
+            ))),
+            _ => Err(ScenarioError::Validation(format!(
+                "event references unknown link: {link_ref}"
+            ))),
         }
+    }
+
+    fn validate_link_identity_rules(&self) -> Result<(), ScenarioError> {
+        let mut resolved_ids = std::collections::HashSet::new();
+        let mut pair_stats: std::collections::HashMap<(String, String), (usize, usize)> =
+            std::collections::HashMap::new();
+
+        for link in &self.links {
+            if let Some(id) = &link.id {
+                if id.trim().is_empty() {
+                    return Err(ScenarioError::Validation(
+                        "link id must not be empty".to_string(),
+                    ));
+                }
+            }
+
+            let resolved_id = link.resolved_link_id();
+            if !resolved_ids.insert(resolved_id.clone()) {
+                return Err(ScenarioError::Validation(format!(
+                    "duplicate link id: {resolved_id}"
+                )));
+            }
+
+            let pair = normalized_link_pair(&link.endpoints.0, &link.endpoints.1);
+            let entry = pair_stats.entry(pair).or_insert((0, 0));
+            entry.0 += 1;
+            if link.id.is_some() {
+                entry.1 += 1;
+            }
+        }
+
+        for ((node_a, node_b), (total, explicit_count)) in pair_stats {
+            if total > 1 && explicit_count < total {
+                return Err(ScenarioError::Validation(format!(
+                    "parallel links between '{node_a}' and '{node_b}' require explicit unique link ids"
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -312,6 +397,13 @@ impl Scenario {
                 }
             }
             AssertCondition::PeerCount { node, .. } => {
+                if !node_ids.contains(node) {
+                    return Err(ScenarioError::Validation(format!(
+                        "assertion references unknown node: {node}"
+                    )));
+                }
+            }
+            AssertCondition::TunnelInterfaceCount { node, .. } => {
                 if !node_ids.contains(node) {
                     return Err(ScenarioError::Validation(format!(
                         "assertion references unknown node: {node}"
@@ -453,5 +545,160 @@ action = { type = "DisconnectLink", link = "nodeA-nodeB" }
 "#;
         let result = Scenario::from_toml(toml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_parallel_links_without_explicit_ids_fail() {
+        let toml = r#"
+name = "parallel-bad"
+duration_secs = 10
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+
+[[links]]
+endpoints = ["nodeB", "nodeA"]
+latency_ms = 20
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("require explicit unique link ids"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_parallel_links_with_explicit_ids_pass() {
+        let toml = r#"
+name = "parallel-good"
+duration_secs = 10
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+id = "ab-wifi"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+
+[[links]]
+id = "ab-cell"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 20
+bandwidth_kbps = 1000
+
+[[events]]
+at_secs = 5.0
+action = { type = "DisconnectLink", link = "ab-wifi" }
+"#;
+
+        assert!(Scenario::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn endpoint_ref_is_rejected_when_parallel_links_exist() {
+        let toml = r#"
+name = "parallel-ambiguous"
+duration_secs = 10
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+id = "ab-wifi"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+
+[[links]]
+id = "ab-cell"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 20
+bandwidth_kbps = 1000
+
+[[events]]
+at_secs = 5.0
+action = { type = "DisconnectLink", link = "nodeA-nodeB" }
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_resolved_link_ids_fail() {
+        let toml = r#"
+name = "dup-id"
+duration_secs = 10
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+id = "dup"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+
+[[links]]
+id = "dup"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 20
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate link id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_tunnel_interface_count_assertion() {
+        let toml = r#"
+name = "ifcount"
+duration_secs = 20
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+
+[[assertions]]
+at_secs = 10.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 1 }
+"#;
+
+        assert!(Scenario::from_toml(toml).is_ok());
     }
 }

@@ -1,0 +1,113 @@
+name = "dual-underlay-churn-cleanup"
+description = "Repeated dual-underlay churn validates tunnel teardown/rebuild without interface leaks"
+duration_secs = 270
+
+[[nodes]]
+id = "nodeA"
+capabilities = ["relay"]
+
+[[nodes]]
+id = "nodeB"
+capabilities = ["relay"]
+
+[[links]]
+id = "ab-wifi"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 5
+bandwidth_kbps = 100000
+loss_percent = 0.0
+enabled = true
+
+[[links]]
+id = "ab-cell"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 50
+bandwidth_kbps = 10000
+loss_percent = 2.0
+enabled = true
+
+[[assertions]]
+at_secs = 25.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 2 }
+
+[[assertions]]
+at_secs = 25.0
+condition = { type = "TunnelInterfaceCount", node = "nodeB", count = 2 }
+
+[[assertions]]
+at_secs = 30.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 5000 }
+
+# Cycle 1: force full teardown by keeping both underlays down > dead-peer timeout
+[[events]]
+at_secs = 35.0
+action = { type = "DisconnectLink", link = "ab-wifi" }
+
+[[events]]
+at_secs = 35.0
+action = { type = "DisconnectLink", link = "ab-cell" }
+
+[[assertions]]
+at_secs = 105.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 0 }
+
+[[assertions]]
+at_secs = 105.0
+condition = { type = "TunnelInterfaceCount", node = "nodeB", count = 0 }
+
+[[events]]
+at_secs = 110.0
+action = { type = "ConnectLink", link = "ab-wifi" }
+
+[[events]]
+at_secs = 110.0
+action = { type = "ConnectLink", link = "ab-cell" }
+
+[[assertions]]
+at_secs = 140.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 2 }
+
+[[assertions]]
+at_secs = 140.0
+condition = { type = "TunnelInterfaceCount", node = "nodeB", count = 2 }
+
+[[assertions]]
+at_secs = 145.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 5000 }
+
+# Cycle 2: repeat churn to catch accumulation/leak behavior
+[[events]]
+at_secs = 150.0
+action = { type = "DisconnectLink", link = "ab-wifi" }
+
+[[events]]
+at_secs = 150.0
+action = { type = "DisconnectLink", link = "ab-cell" }
+
+[[assertions]]
+at_secs = 220.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 0 }
+
+[[assertions]]
+at_secs = 220.0
+condition = { type = "TunnelInterfaceCount", node = "nodeB", count = 0 }
+
+[[events]]
+at_secs = 225.0
+action = { type = "ConnectLink", link = "ab-wifi" }
+
+[[events]]
+at_secs = 225.0
+action = { type = "ConnectLink", link = "ab-cell" }
+
+[[assertions]]
+at_secs = 250.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 2 }
+
+[[assertions]]
+at_secs = 250.0
+condition = { type = "TunnelInterfaceCount", node = "nodeB", count = 2 }
+
+[[assertions]]
+at_secs = 255.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 5000 }

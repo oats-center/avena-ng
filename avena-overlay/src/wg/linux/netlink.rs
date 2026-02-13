@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use netlink_packet_core::{
     NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable, NLM_F_ACK,
-    NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+    NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST,
 };
 use netlink_packet_generic::{
     ctrl::{nlas::GenlCtrlAttrs, GenlCtrl, GenlCtrlCmd},
@@ -459,6 +459,53 @@ pub fn add_ipv6_route(ifname: &str, dest: Ipv6Addr, prefix_len: u8) -> Result<()
     netlink_request(
         RouteNetlinkMessage::NewRoute(message),
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        NETLINK_ROUTE,
+    )?;
+
+    Ok(())
+}
+
+pub fn replace_ipv6_route(ifname: &str, dest: Ipv6Addr, prefix_len: u8) -> Result<(), WgError> {
+    let ifindex = get_interface_index(ifname)?;
+
+    let mut message = RouteMessage::default();
+    message.header.address_family = AddressFamily::Inet6;
+    message.header.destination_prefix_length = prefix_len;
+    message.header.table = RT_TABLE_MAIN;
+    message.header.protocol = RouteProtocol::Boot;
+    message.header.scope = RouteScope::Universe;
+    message.header.kind = RouteType::Unicast;
+
+    message
+        .attributes
+        .push(RouteAttribute::Destination(IpAddr::V6(dest).into()));
+    message.attributes.push(RouteAttribute::Oif(ifindex));
+
+    netlink_request(
+        RouteNetlinkMessage::NewRoute(message),
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        NETLINK_ROUTE,
+    )?;
+
+    Ok(())
+}
+
+pub fn delete_ipv6_route(dest: Ipv6Addr, prefix_len: u8) -> Result<(), WgError> {
+    let mut message = RouteMessage::default();
+    message.header.address_family = AddressFamily::Inet6;
+    message.header.destination_prefix_length = prefix_len;
+    message.header.table = RT_TABLE_MAIN;
+    message.header.protocol = RouteProtocol::Boot;
+    message.header.scope = RouteScope::Universe;
+    message.header.kind = RouteType::Unicast;
+
+    message
+        .attributes
+        .push(RouteAttribute::Destination(IpAddr::V6(dest).into()));
+
+    netlink_request(
+        RouteNetlinkMessage::DelRoute(message),
+        NLM_F_REQUEST | NLM_F_ACK,
         NETLINK_ROUTE,
     )?;
 

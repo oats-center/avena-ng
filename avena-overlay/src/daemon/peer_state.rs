@@ -16,6 +16,8 @@ pub struct PeerState {
     pub tunnel_interface: String,
     pub connected_at: Instant,
     pub last_seen: Instant,
+    pub last_rx_bytes: u64,
+    pub last_tx_bytes: u64,
 }
 
 impl PeerState {
@@ -36,6 +38,8 @@ impl PeerState {
             tunnel_interface,
             connected_at: now,
             last_seen: now,
+            last_rx_bytes: 0,
+            last_tx_bytes: 0,
         }
     }
 

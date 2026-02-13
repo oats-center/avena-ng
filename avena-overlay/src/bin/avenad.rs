@@ -1,6 +1,7 @@
 use avena_overlay::{
     derive_session_keys, derive_wireguard_keypair,
     routing::{BabeldController, RoutingError},
+    wg::WgError,
     AvenadConfig, CertValidator, DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent,
     DiscoveryService, EphemeralKeypair, HandshakeMessage, KernelBackend, LocalAnnouncement,
     NetworkConfig, PeerConfig, PeerState, TunnelBackend, TunnelMode, UserspaceBackend,
@@ -115,6 +116,7 @@ struct AvenadInner {
     cert_validator: CertValidator,
     device_cert: String,
     routing: Mutex<Option<BabeldController>>,
+    overlay_route_rx_bytes: Mutex<HashMap<String, u64>>,
 }
 
 struct Avenad {
@@ -247,6 +249,7 @@ impl Avenad {
             cert_validator,
             device_cert,
             routing: Mutex::new(routing),
+            overlay_route_rx_bytes: Mutex::new(HashMap::new()),
         });
 
         Ok(Self {
@@ -698,20 +701,6 @@ impl AvenadInner {
 
         binding.tunnel.add_peer(&peer_config).await?;
 
-        // Always install a direct /128 route for the connected peer.
-        // Babel handles multi-hop routes, but direct peer routes are needed
-        // immediately after handshake so overlay probes are routable.
-        if let Err(e) = ensure_direct_peer_route(&binding.interface_name, peer_overlay_ip) {
-            if e.kind() != std::io::ErrorKind::Unsupported {
-                warn!(
-                    peer_id = %peer.device_id,
-                    interface = %binding.interface_name,
-                    "failed to install direct peer route: {}",
-                    e
-                );
-            }
-        }
-
         Ok(PeerState::new(
             peer.device_id,
             peer_pubkey,
@@ -824,20 +813,6 @@ impl AvenadInner {
 
         binding.tunnel.add_peer(&peer_config).await?;
 
-        // Always install a direct /128 route for the connected peer.
-        // Babel handles multi-hop routes, but direct peer routes are needed
-        // immediately after handshake so overlay probes are routable.
-        if let Err(e) = ensure_direct_peer_route(&binding.interface_name, peer_overlay_ip) {
-            if e.kind() != std::io::ErrorKind::Unsupported {
-                warn!(
-                    peer_id = %peer_device_id,
-                    interface = %binding.interface_name,
-                    "failed to install direct peer route: {}",
-                    e
-                );
-            }
-        }
-
         Ok(PeerState::new(
             peer_device_id,
             peer_pubkey,
@@ -926,20 +901,9 @@ impl AvenadInner {
 
         info!(peer_count, "Reconciling peer allowed-ips");
 
-        if peer_count == 1 && peers.len() == 1 {
-            let tunnel_interface = &peers[0].1;
-            if let Err(e) = ensure_overlay_prefix_route(tunnel_interface, &self.network) {
-                if e.kind() != std::io::ErrorKind::Unsupported {
-                    return Err(e.into());
-                }
-            } else {
-                info!(
-                    interface = %tunnel_interface,
-                    prefix = %format!("{}/{}", self.network.prefix, self.network.prefix_len),
-                    "Ensured overlay prefix route"
-                );
-            }
-        }
+        let desired_overlay_prefix_iface = self.select_overlay_prefix_interface().await;
+        self.sync_overlay_prefix_route(desired_overlay_prefix_iface)
+            .await;
 
         let tunnels = self.peer_tunnels.lock().await.clone();
         for (device_id, tunnel_interface, wg_pubkey, endpoint) in peers {
@@ -966,35 +930,126 @@ impl AvenadInner {
     }
 
     async fn maintain_overlay_prefix_route(&self) {
-        let (peer_count, tunnel_interface) = {
+        let tunnel_interface = self.select_overlay_prefix_interface().await;
+
+        self.sync_overlay_prefix_route(tunnel_interface).await;
+    }
+
+    async fn select_overlay_prefix_interface(&self) -> Option<String> {
+        let peer_snapshot = {
             let peers = self.peers.read().await;
-            let peer_count = peers
+            peers
                 .values()
-                .map(|peer| peer.device_id)
-                .collect::<HashSet<_>>()
-                .len();
-            let tunnel_interface = if peer_count == 1 && peers.len() == 1 {
-                peers
-                    .values()
-                    .next()
-                    .map(|peer| peer.tunnel_interface.clone())
-            } else {
-                None
-            };
-            (peer_count, tunnel_interface)
+                .map(|state| {
+                    (
+                        state.device_id,
+                        state.tunnel_interface.clone(),
+                        state.wg_pubkey,
+                    )
+                })
+                .collect::<Vec<_>>()
         };
 
-        if peer_count == 1 {
-            if let Some(tunnel_interface) = tunnel_interface {
-                if let Err(e) = ensure_overlay_prefix_route(&tunnel_interface, &self.network) {
-                    if e.kind() != std::io::ErrorKind::Unsupported {
-                        warn!(
-                            interface = %tunnel_interface,
-                            "failed to maintain overlay prefix route: {}",
-                            e
-                        );
-                    }
+        if peer_snapshot.is_empty() {
+            return None;
+        }
+
+        let unique_devices = peer_snapshot
+            .iter()
+            .map(|(device_id, _, _)| *device_id)
+            .collect::<HashSet<_>>();
+        if unique_devices.len() != 1 {
+            return None;
+        }
+
+        if peer_snapshot.len() == 1 {
+            return Some(peer_snapshot[0].1.clone());
+        }
+
+        let tunnels = self.peer_tunnels.lock().await.clone();
+        let mut observations = Vec::new();
+        for (_, tunnel_interface, wg_pubkey) in &peer_snapshot {
+            if let Some(tunnel) = tunnels.get(tunnel_interface).cloned() {
+                if let Ok(stats) = tunnel.peer_stats(wg_pubkey).await {
+                    observations.push((tunnel_interface.clone(), stats.rx_bytes));
                 }
+            }
+        }
+
+        let mut fallback = peer_snapshot
+            .iter()
+            .map(|(_, tunnel_interface, _)| tunnel_interface.clone())
+            .collect::<Vec<_>>();
+        fallback.sort();
+
+        if observations.is_empty() {
+            return fallback.into_iter().next();
+        }
+
+        let observed_ifaces = observations
+            .iter()
+            .map(|(tunnel_interface, _)| tunnel_interface.clone())
+            .collect::<HashSet<_>>();
+
+        let mut rx_cache = self.overlay_route_rx_bytes.lock().await;
+        rx_cache.retain(|iface, _| observed_ifaces.contains(iface));
+
+        let mut best: Option<(u8, u64, String)> = None;
+        for (tunnel_interface, rx_bytes) in observations {
+            let previous = rx_cache
+                .insert(tunnel_interface.clone(), rx_bytes)
+                .unwrap_or(rx_bytes);
+            let delta = rx_bytes.saturating_sub(previous);
+            let class = if delta > 0 {
+                2
+            } else if rx_bytes > 0 {
+                1
+            } else {
+                0
+            };
+            let score = if class == 2 { delta } else { rx_bytes };
+
+            let candidate = (class, score, tunnel_interface);
+            if best
+                .as_ref()
+                .map(|current| candidate > *current)
+                .unwrap_or(true)
+            {
+                best = Some(candidate);
+            }
+        }
+
+        best.map(|(_, _, tunnel_interface)| tunnel_interface)
+            .or_else(|| fallback.into_iter().next())
+    }
+
+    async fn sync_overlay_prefix_route(&self, tunnel_interface: Option<String>) {
+        if let Some(tunnel_interface) = tunnel_interface {
+            if let Err(e) = ensure_overlay_prefix_route(&tunnel_interface, &self.network) {
+                if e.kind() != std::io::ErrorKind::Unsupported {
+                    warn!(
+                        interface = %tunnel_interface,
+                        "failed to ensure overlay prefix route: {}",
+                        e
+                    );
+                }
+            } else {
+                debug!(
+                    interface = %tunnel_interface,
+                    prefix = %format!("{}/{}", self.network.prefix, self.network.prefix_len),
+                    "ensured overlay prefix route"
+                );
+            }
+            return;
+        }
+
+        if let Err(e) = remove_overlay_prefix_route(&self.network) {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                warn!(
+                    prefix = %format!("{}/{}", self.network.prefix, self.network.prefix_len),
+                    "failed to clear overlay prefix route: {}",
+                    e
+                );
             }
         }
     }
@@ -1036,6 +1091,8 @@ impl AvenadInner {
                         state.wg_pubkey,
                         state.tunnel_interface.clone(),
                         state.last_seen,
+                        state.last_rx_bytes,
+                        state.last_tx_bytes,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1043,17 +1100,32 @@ impl AvenadInner {
 
         let tunnels = self.peer_tunnels.lock().await.clone();
         let mut to_remove = HashSet::new();
+        let mut stats_updates = Vec::new();
 
-        for (device_id, wg_pubkey, tunnel_interface, last_seen) in peer_snapshot {
+        for (device_id, wg_pubkey, tunnel_interface, last_seen, last_rx_bytes, _last_tx_bytes) in
+            peer_snapshot
+        {
             match tunnels.get(&tunnel_interface).cloned() {
                 Some(tunnel) => match tunnel.peer_stats(&wg_pubkey).await {
                     Ok(stats) => {
-                        if let Some(last_handshake) = stats.last_handshake {
-                            if let Ok(elapsed) = last_handshake.elapsed() {
-                                if elapsed > timeout {
-                                    to_remove.insert((device_id, tunnel_interface.clone()));
-                                }
-                            }
+                        let rx_changed = stats.rx_bytes != last_rx_bytes;
+                        let handshake_recent = stats
+                            .last_handshake
+                            .and_then(|last_handshake| last_handshake.elapsed().ok())
+                            .map(|elapsed| elapsed <= timeout)
+                            .unwrap_or(false);
+
+                        let has_activity = rx_changed || handshake_recent;
+
+                        stats_updates.push((
+                            tunnel_interface.clone(),
+                            stats.rx_bytes,
+                            stats.tx_bytes,
+                            has_activity,
+                        ));
+
+                        if !has_activity && last_seen.elapsed() > timeout {
+                            to_remove.insert((device_id, tunnel_interface.clone()));
                         }
                     }
                     Err(_) => {
@@ -1065,6 +1137,19 @@ impl AvenadInner {
                 None => {
                     if last_seen.elapsed() > timeout {
                         to_remove.insert((device_id, tunnel_interface.clone()));
+                    }
+                }
+            }
+        }
+
+        if !stats_updates.is_empty() {
+            let mut peers = self.peers.write().await;
+            for (tunnel_interface, rx_bytes, tx_bytes, has_activity) in stats_updates {
+                if let Some(peer) = peers.get_mut(&tunnel_interface) {
+                    peer.last_rx_bytes = rx_bytes;
+                    peer.last_tx_bytes = tx_bytes;
+                    if has_activity {
+                        peer.update_last_seen();
                     }
                 }
             }
@@ -1251,50 +1336,16 @@ fn assign_interface_address(
 }
 
 #[cfg(target_os = "linux")]
-fn add_peer_route(
-    interface_name: &str,
-    peer_addr: std::net::Ipv6Addr,
-) -> Result<(), std::io::Error> {
-    use avena_overlay::wg::linux::netlink;
-
-    netlink::add_ipv6_route(interface_name, peer_addr, 128)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add route: {e}")))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn add_peer_route(
-    _interface_name: &str,
-    _peer_addr: std::net::Ipv6Addr,
-) -> Result<(), std::io::Error> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "requires Linux",
-    ))
-}
-
-fn ensure_direct_peer_route(
-    interface_name: &str,
-    peer_addr: std::net::Ipv6Addr,
-) -> Result<(), std::io::Error> {
-    match add_peer_route(interface_name, peer_addr) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn ensure_overlay_prefix_route(
     interface_name: &str,
     network: &NetworkConfig,
 ) -> Result<(), std::io::Error> {
     use avena_overlay::wg::linux::netlink;
 
-    netlink::add_ipv6_route(interface_name, network.prefix, network.prefix_len).map_err(|e| {
+    netlink::replace_ipv6_route(interface_name, network.prefix, network.prefix_len).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("add overlay prefix route: {e}"),
+            format!("replace overlay prefix route: {e}"),
         )
     })
 }
@@ -1304,6 +1355,29 @@ fn ensure_overlay_prefix_route(
     _interface_name: &str,
     _network: &NetworkConfig,
 ) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "requires Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_overlay_prefix_route(network: &NetworkConfig) -> Result<(), std::io::Error> {
+    use avena_overlay::wg::linux::netlink;
+
+    match netlink::delete_ipv6_route(network.prefix, network.prefix_len) {
+        Ok(()) => Ok(()),
+        Err(WgError::InterfaceNotFound(_)) => Ok(()),
+        Err(WgError::NetlinkError(message)) if message.contains("code: Some(-3)") => Ok(()),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("delete overlay prefix route: {e}"),
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_overlay_prefix_route(_network: &NetworkConfig) -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "requires Linux",

@@ -108,7 +108,7 @@ impl TestTopology {
 
         for link_config in &scenario.links {
             let (node_a, node_b) = &link_config.endpoints;
-            let link_id = format!("{}-{}", node_a, node_b);
+            let link_id = link_config.resolved_link_id();
 
             let veth_a = format!("v{}a", subnet_counter);
             let veth_b = format!("v{}b", subnet_counter);

@@ -196,9 +196,13 @@ With derived keys, both devices create a dedicated Wireguard interface for this 
 
 With \texttt{::/0} on each per-(peer, underlay) interface, WireGuard admits encrypted traffic from authenticated peers, while Babel alone selects next hops and interfaces. In other words, AllowedIPs is not used for route selection; Babel metrics and feasibility rules decide path choice.
 
-For startup and single-neighbor topologies, avenad may also install an overlay-prefix route toward the only active peer as a bootstrap optimization. This does not change path selection semantics because no alternate next hop exists in that state.
+Avena does not install per-peer kernel host routes (\texttt{/128}) during handshake. Per-peer host routes pin forwarding to a single interface and can break multi-underlay failover when the pinned interface degrades. Route ownership is intentionally kept in Babel to preserve dynamic path switching.
 
-If the peer is discovered over multiple underlay interfaces (e.g., WiFi and cellular), a separate Wireguard interface is created for each. Babel sees these as distinct links and can route traffic over whichever has better metrics, or failover automatically if one path degrades.
+For startup and single-neighbor topologies, avenad maintains a kernel route for the overlay prefix as a bootstrap/forwarding path to the active peer tunnel.
+
+If the peer is discovered over multiple underlay interfaces (e.g., WiFi and cellular), a separate Wireguard interface is created for each. In this single-peer state, avenad continuously re-targets the bootstrap prefix route to the tunnel showing recent receive-side activity and clears stale prefix routes when no eligible tunnel exists, preventing route pinning to a failed underlay.
+
+Discovery state retains multiple endpoints per peer identity. Reconnection and retry logic operate per endpoint (not just per device ID), so dual-underlay peers are re-established on all known underlays after outages.
 
 Underlay identity binding is strict: if local underlay interface resolution fails for a handshake, tunnel activation is aborted and retried later via normal discovery/handshake retry flow.
 
@@ -212,7 +216,7 @@ Immediately after tunnel establishment, devices perform full gossip synchronizat
 
 Tunnels are torn down when peers become unreachable or explicitly disconnect.
 
-\textbf{Dead Peer Detection:} Wireguard maintains a last-handshake timestamp for each peer. If no successful handshake occurs within a configurable timeout (default: 180 seconds), the peer is considered potentially dead. Avena additionally sends lightweight keepalive probes over established tunnels.
+\textbf{Dead Peer Detection:} Wireguard maintains a last-handshake timestamp for each peer. If no successful handshake occurs within a configurable timeout (default: 180 seconds), the peer is considered potentially dead. A handshake timestamp of zero from backend telemetry is treated as ``no successful handshake yet'' (not as an ancient epoch timestamp), avoiding false dead-peer removal. Avena additionally sends lightweight keepalive probes over established tunnels.
 
 When a peer is unresponsive:
 \begin{enumerate}

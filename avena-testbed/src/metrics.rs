@@ -131,6 +131,7 @@ impl MetricsLogger {
             crate::scenario::AssertCondition::NodesConnected { .. } => "NodesConnected",
             crate::scenario::AssertCondition::Ping { .. } => "Ping",
             crate::scenario::AssertCondition::PeerCount { .. } => "PeerCount",
+            crate::scenario::AssertCondition::TunnelInterfaceCount { .. } => "TunnelInterfaceCount",
         };
 
         self.log(MetricEvent {

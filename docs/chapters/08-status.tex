@@ -36,11 +36,11 @@ Userspace WireGuard & \texttt{wireguard-go} subprocess, Unix socket UAPI & Compl
 Tunnel Backend Trait & Abstraction over kernel/userspace implementations & Complete \\
 avenad Daemon & TCP handshake server, discovery integration, peer management & Complete \\
 Rate Limiting & Per-IP limits, concurrent handshake limits, nonce replay cache & Complete \\
-Dead Peer Detection & Configurable timeout based on WireGuard handshake timestamps & Complete \\
+Dead Peer Detection & Configurable timeout using handshake recency plus receive-side traffic activity to avoid false liveness on transmit-only links & Complete \\
 \midrule
 Babel Routing & \texttt{babeld} controller integration in avenad; full unicast tunnel-mode policy and production hardening still pending & Partial \\
 Underlay Manager & Netlink monitoring for physical interface changes & Not started \\
-Multi-path WireGuard & Per-(peer, underlay) interface creation & Not started \\
+Multi-path WireGuard & Per-(peer, underlay) interface creation with dual-underlay failover/churn scenario validation & Complete \\
 LoRa Discovery & Low-rate presence beacons and gossip & Not started \\
 Gossip Protocol & CRDT state synchronization & Not started \\
 NATS Messaging & Pub/sub API, interest management & Not started \\
@@ -71,7 +71,11 @@ At the time of writing, major Layer 1 deltas from Chapter~2 have been closed:
     \item \textbf{Tunnel mode policy:} runtime mode is explicit via \texttt{kernel}, \texttt{userspace}, and \texttt{prefer\_kernel}.
 \end{itemize}
 
-Remaining near-term Layer 1 work is concentrated on validation depth (dual-underlay failover and churn scenario gates), not on changing core tunnel architecture.
+Dual-underlay validation gates now pass (
+\texttt{dual\_underlay\_same\_peer},
+\texttt{dual\_underlay\_failover},
+\texttt{dual\_underlay\_churn\_cleanup}
+), including repeated teardown/rebuild cycles.
 
 % ============================================================
 \section{Resolved Design Decisions}

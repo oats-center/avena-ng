@@ -137,7 +137,7 @@ pub struct DiscoveryService {
     mdns: Option<MdnsDiscovery>,
     static_peers: StaticPeers,
     tx: broadcast::Sender<DiscoveryEvent>,
-    discovered_peers: RwLock<HashMap<DeviceId, DiscoveredPeer>>,
+    discovered_peers: RwLock<HashMap<(DeviceId, SocketAddr), DiscoveredPeer>>,
 }
 
 impl DiscoveryService {
@@ -208,16 +208,19 @@ impl DiscoveryService {
 
     /// Get the most recently cached endpoint for a peer.
     pub fn get_discovered_endpoint(&self, device_id: &DeviceId) -> Option<SocketAddr> {
-        self.discovered_peers
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(device_id).map(|p| p.endpoint))
+        self.discovered_peers.read().ok().and_then(|guard| {
+            guard
+                .iter()
+                .filter_map(|((id, _), peer)| (id == device_id).then_some(peer))
+                .max_by_key(|peer| peer.discovered_at)
+                .map(|peer| peer.endpoint)
+        })
     }
 
     /// Cache a peer record discovered through any channel.
     pub fn cache_discovered_peer(&self, peer: &DiscoveredPeer) {
         if let Ok(mut guard) = self.discovered_peers.write() {
-            guard.insert(peer.device_id, peer.clone());
+            guard.insert((peer.device_id, peer.endpoint), peer.clone());
         }
     }
 
@@ -271,5 +274,42 @@ mod tests {
         assert!(peer.has_capability(&Capability::Relay));
         assert!(peer.has_capability(&Capability::Gateway));
         assert!(!peer.has_capability(&Capability::WorkloadSpawn));
+    }
+
+    #[test]
+    fn cache_retains_multiple_endpoints_per_device() {
+        let service = DiscoveryService::new(DiscoveryConfig {
+            enable_mdns: false,
+            mdns_interfaces: Vec::new(),
+            static_peers: Vec::new(),
+        })
+        .expect("discovery service should initialize without mdns");
+
+        let device_id = DeviceId::from_bytes([7u8; 16]);
+        let peer_a = DiscoveredPeer::new(
+            device_id,
+            "10.1.0.2:51820".parse().unwrap(),
+            HashSet::new(),
+            DiscoverySource::Static,
+        );
+        let peer_b = DiscoveredPeer::new(
+            device_id,
+            "10.2.0.2:51820".parse().unwrap(),
+            HashSet::new(),
+            DiscoverySource::Static,
+        );
+
+        service.cache_discovered_peer(&peer_a);
+        service.cache_discovered_peer(&peer_b);
+
+        let cached = service.cached_peers();
+        assert_eq!(cached.len(), 2);
+        assert!(cached.iter().any(|p| p.endpoint == peer_a.endpoint));
+        assert!(cached.iter().any(|p| p.endpoint == peer_b.endpoint));
+
+        let selected = service
+            .get_discovered_endpoint(&device_id)
+            .expect("device endpoint should be available");
+        assert!(selected == peer_a.endpoint || selected == peer_b.endpoint);
     }
 }

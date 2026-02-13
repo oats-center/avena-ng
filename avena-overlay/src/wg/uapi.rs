@@ -80,16 +80,36 @@ impl Host {
                     }
                     "last_handshake_time_sec" => {
                         if let Some(ref mut peer) = current_peer {
-                            let handshake =
-                                peer.last_handshake.get_or_insert(SystemTime::UNIX_EPOCH);
-                            *handshake += Duration::from_secs(value.parse().unwrap_or_default());
+                            let sec: u64 = value.parse().unwrap_or_default();
+                            if sec > 0 {
+                                let nanos = peer
+                                    .last_handshake
+                                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                                    .map(|d| d.subsec_nanos())
+                                    .unwrap_or(0);
+                                peer.last_handshake = Some(
+                                    SystemTime::UNIX_EPOCH
+                                        + Duration::from_secs(sec)
+                                        + Duration::from_nanos(nanos as u64),
+                                );
+                            }
                         }
                     }
                     "last_handshake_time_nsec" => {
                         if let Some(ref mut peer) = current_peer {
-                            let handshake =
-                                peer.last_handshake.get_or_insert(SystemTime::UNIX_EPOCH);
-                            *handshake += Duration::from_nanos(value.parse().unwrap_or_default());
+                            let nsec: u64 = value.parse().unwrap_or_default();
+                            if nsec > 0 {
+                                let sec = peer
+                                    .last_handshake
+                                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                peer.last_handshake = Some(
+                                    SystemTime::UNIX_EPOCH
+                                        + Duration::from_secs(sec)
+                                        + Duration::from_nanos(nsec),
+                                );
+                            }
                         }
                     }
                     "rx_bytes" => {
@@ -263,6 +283,7 @@ mod tests {
         let peer1 = host.peers.get(&peer1_key).unwrap();
         assert_eq!(peer1.allowed_ips.len(), 1);
         assert!(peer1.preshared_key.is_some());
+        assert!(peer1.last_handshake.is_none());
 
         let peer2_key =
             Key::from_hex("200102030405060708090a0b0c0d0e0ff0e1d2c3b4a5968778695a4b3c2d1e0f")
@@ -271,6 +292,7 @@ mod tests {
         assert!(peer2.endpoint.is_some());
         assert_eq!(peer2.tx_bytes, 52_759_980);
         assert_eq!(peer2.rx_bytes, 3_683_056);
+        assert!(peer2.last_handshake.is_some());
     }
 
     #[test]

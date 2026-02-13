@@ -1,0 +1,75 @@
+name = "dual-underlay-failover"
+description = "Two parallel underlays between same peer pair; verifies failover when one link drops"
+duration_secs = 95
+
+[[nodes]]
+id = "nodeA"
+capabilities = ["relay"]
+
+[[nodes]]
+id = "nodeB"
+capabilities = ["relay"]
+
+[[links]]
+id = "ab-wifi"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 5
+bandwidth_kbps = 100000
+loss_percent = 0.0
+enabled = true
+
+[[links]]
+id = "ab-cell"
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 50
+bandwidth_kbps = 10000
+loss_percent = 2.0
+enabled = true
+
+[[assertions]]
+at_secs = 20.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 2 }
+
+[[assertions]]
+at_secs = 20.0
+condition = { type = "TunnelInterfaceCount", node = "nodeB", count = 2 }
+
+[[assertions]]
+at_secs = 25.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 5000 }
+
+[[assertions]]
+at_secs = 26.0
+condition = { type = "Ping", from = "nodeB", to = "nodeA", timeout_ms = 5000 }
+
+[[events]]
+at_secs = 30.0
+action = { type = "DisconnectLink", link = "ab-wifi" }
+
+[[assertions]]
+at_secs = 40.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 5000 }
+
+[[assertions]]
+at_secs = 42.0
+condition = { type = "Ping", from = "nodeB", to = "nodeA", timeout_ms = 5000 }
+
+[[events]]
+at_secs = 55.0
+action = { type = "ConnectLink", link = "ab-wifi" }
+
+[[events]]
+at_secs = 65.0
+action = { type = "DisconnectLink", link = "ab-cell" }
+
+[[assertions]]
+at_secs = 75.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 5000 }
+
+[[assertions]]
+at_secs = 77.0
+condition = { type = "Ping", from = "nodeB", to = "nodeA", timeout_ms = 5000 }
+
+[[events]]
+at_secs = 85.0
+action = { type = "ConnectLink", link = "ab-cell" }

@@ -27,6 +27,8 @@ pub enum LinkError {
 #[derive(Debug, Clone)]
 pub struct LinkState {
     pub link_id: String,
+    pub node_a: String,
+    pub node_b: String,
     pub latency_ms: u32,
     pub bandwidth_kbps: u32,
     pub loss_percent: f32,
@@ -67,7 +69,7 @@ impl LinkManager {
         bridge_configs: &[BridgeConfig],
     ) {
         for config in link_configs {
-            let link_id = format!("{}-{}", config.endpoints.0, config.endpoints.1);
+            let link_id = config.resolved_link_id();
 
             if let Some(veth_pair) = topology.veth_pair(&link_id) {
                 let node_a = topology.node(&config.endpoints.0);
@@ -78,6 +80,8 @@ impl LinkManager {
                         link_id.clone(),
                         LinkState {
                             link_id,
+                            node_a: config.endpoints.0.clone(),
+                            node_b: config.endpoints.1.clone(),
                             latency_ms: config.latency_ms,
                             bandwidth_kbps: config.bandwidth_kbps,
                             loss_percent: config.loss_percent,
@@ -110,14 +114,11 @@ impl LinkManager {
 
     pub fn update_pids(&mut self, topology: &TestTopology) {
         for state in self.links.values_mut() {
-            let parts: Vec<&str> = state.link_id.split('-').collect();
-            if parts.len() == 2 {
-                if let Some(node_a) = topology.node(parts[0]) {
-                    state.pid_a = node_a.pid;
-                }
-                if let Some(node_b) = topology.node(parts[1]) {
-                    state.pid_b = node_b.pid;
-                }
+            if let Some(node_a) = topology.node(&state.node_a) {
+                state.pid_a = node_a.pid;
+            }
+            if let Some(node_b) = topology.node(&state.node_b) {
+                state.pid_b = node_b.pid;
             }
         }
     }
@@ -230,15 +231,18 @@ impl LinkManager {
             return Some(link_ref.to_string());
         }
 
-        let parts: Vec<&str> = link_ref.split('-').collect();
-        if parts.len() == 2 {
-            let reversed = format!("{}-{}", parts[1], parts[0]);
-            if self.links.contains_key(&reversed) {
-                return Some(reversed);
-            }
+        let (node_a, node_b) = link_ref.split_once('-')?;
+        let mut matches = self
+            .links
+            .values()
+            .filter(|state| same_unordered_pair(&state.node_a, &state.node_b, node_a, node_b));
+
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
         }
 
-        None
+        Some(first.link_id.clone())
     }
 
     async fn apply_netem(&self, state: &LinkState) -> Result<(), LinkError> {
@@ -343,6 +347,10 @@ impl LinkManager {
     }
 }
 
+fn same_unordered_pair(a1: &str, b1: &str, a2: &str, b2: &str) -> bool {
+    (a1 == a2 && b1 == b2) || (a1 == b2 && b1 == a2)
+}
+
 impl Default for LinkManager {
     fn default() -> Self {
         Self::new()
@@ -357,5 +365,104 @@ mod tests {
     fn test_link_manager_new() {
         let manager = LinkManager::new();
         assert!(manager.links.is_empty());
+    }
+
+    #[test]
+    fn link_id_from_ref_matches_explicit_id() {
+        let mut manager = LinkManager::new();
+        manager.links.insert(
+            "ab-wifi".to_string(),
+            LinkState {
+                link_id: "ab-wifi".to_string(),
+                node_a: "nodeA".to_string(),
+                node_b: "nodeB".to_string(),
+                latency_ms: 10,
+                bandwidth_kbps: 1000,
+                loss_percent: 0.0,
+                enabled: true,
+                pid_a: None,
+                pid_b: None,
+                veth_a: "v1a".to_string(),
+                veth_b: "v1b".to_string(),
+            },
+        );
+
+        assert_eq!(
+            manager.link_id_from_ref("ab-wifi"),
+            Some("ab-wifi".to_string())
+        );
+    }
+
+    #[test]
+    fn link_id_from_ref_resolves_unique_endpoint_pair() {
+        let mut manager = LinkManager::new();
+        manager.links.insert(
+            "ab-link".to_string(),
+            LinkState {
+                link_id: "ab-link".to_string(),
+                node_a: "nodeA".to_string(),
+                node_b: "nodeB".to_string(),
+                latency_ms: 10,
+                bandwidth_kbps: 1000,
+                loss_percent: 0.0,
+                enabled: true,
+                pid_a: None,
+                pid_b: None,
+                veth_a: "v1a".to_string(),
+                veth_b: "v1b".to_string(),
+            },
+        );
+
+        assert_eq!(
+            manager.link_id_from_ref("nodeA-nodeB"),
+            Some("ab-link".to_string())
+        );
+        assert_eq!(
+            manager.link_id_from_ref("nodeB-nodeA"),
+            Some("ab-link".to_string())
+        );
+    }
+
+    #[test]
+    fn link_id_from_ref_returns_none_when_endpoint_ref_is_ambiguous() {
+        let mut manager = LinkManager::new();
+        manager.links.insert(
+            "ab-wifi".to_string(),
+            LinkState {
+                link_id: "ab-wifi".to_string(),
+                node_a: "nodeA".to_string(),
+                node_b: "nodeB".to_string(),
+                latency_ms: 10,
+                bandwidth_kbps: 1000,
+                loss_percent: 0.0,
+                enabled: true,
+                pid_a: None,
+                pid_b: None,
+                veth_a: "v1a".to_string(),
+                veth_b: "v1b".to_string(),
+            },
+        );
+        manager.links.insert(
+            "ab-cell".to_string(),
+            LinkState {
+                link_id: "ab-cell".to_string(),
+                node_a: "nodeA".to_string(),
+                node_b: "nodeB".to_string(),
+                latency_ms: 20,
+                bandwidth_kbps: 1000,
+                loss_percent: 0.0,
+                enabled: true,
+                pid_a: None,
+                pid_b: None,
+                veth_a: "v2a".to_string(),
+                veth_b: "v2b".to_string(),
+            },
+        );
+
+        assert_eq!(manager.link_id_from_ref("nodeA-nodeB"), None);
+        assert_eq!(
+            manager.link_id_from_ref("ab-wifi"),
+            Some("ab-wifi".to_string())
+        );
     }
 }
