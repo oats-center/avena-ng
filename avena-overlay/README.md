@@ -44,6 +44,8 @@ avena-overlay creates a WireGuard-based mesh network where devices:
 
 ## Usage
 
+Quick start on physical hosts: `GETTING_STARTED_PHYSICAL.md`
+
 ### Library
 
 ```rust
