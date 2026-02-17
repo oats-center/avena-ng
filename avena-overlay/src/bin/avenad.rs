@@ -113,6 +113,7 @@ struct AvenadInner {
     rate_limiter: RateLimiter,
     handshake_semaphore: Arc<Semaphore>,
     outgoing_semaphore: Arc<Semaphore>,
+    outgoing_handshake_inflight: Mutex<HashSet<(DeviceId, IpAddr)>>,
     cert_validator: CertValidator,
     device_cert: String,
     routing: Mutex<Option<BabeldController>>,
@@ -246,6 +247,7 @@ impl Avenad {
             rate_limiter: RateLimiter::new(Duration::from_secs(60)),
             handshake_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
             outgoing_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTGOING_HANDSHAKES)),
+            outgoing_handshake_inflight: Mutex::new(HashSet::new()),
             cert_validator,
             device_cert,
             routing: Mutex::new(routing),
@@ -580,12 +582,29 @@ impl AvenadInner {
             }
         }
 
+        let canonical_peer_ip = canonical_underlay_ip(peer.endpoint.ip());
+        let inflight_key = (peer.device_id, canonical_peer_ip);
+        {
+            let mut inflight = self.outgoing_handshake_inflight.lock().await;
+            if !inflight.insert(inflight_key) {
+                debug!(
+                    peer_id = %peer.device_id,
+                    endpoint = %peer.endpoint,
+                    "Outgoing handshake already in flight for peer endpoint"
+                );
+                return Ok(());
+            }
+        }
+
         info!(peer_id = %peer.device_id, "Initiating handshake");
 
         let handshake_addr = SocketAddr::new(peer.endpoint.ip(), peer.endpoint.port() + 1);
-        let peer_state = self
-            .perform_outgoing_handshake(handshake_addr, &peer)
-            .await?;
+        let handshake_result = self.perform_outgoing_handshake(handshake_addr, &peer).await;
+        {
+            let mut inflight = self.outgoing_handshake_inflight.lock().await;
+            inflight.remove(&inflight_key);
+        }
+        let peer_state = handshake_result?;
 
         let iface = peer_state.tunnel_interface.clone();
         let mut peers = self.peers.write().await;
@@ -823,7 +842,10 @@ impl AvenadInner {
         .with_endpoint(peer_wg_endpoint))
     }
 
-    async fn remove_tunnel_interface(&self, tunnel_interface: &str) -> Option<DeviceId> {
+    async fn remove_tunnel_interface(
+        &self,
+        tunnel_interface: &str,
+    ) -> Option<(DeviceId, std::net::Ipv6Addr)> {
         let peer = self.peers.write().await.remove(tunnel_interface)?;
 
         let tunnel = self
@@ -851,7 +873,18 @@ impl AvenadInner {
             }
         }
 
-        Some(peer.device_id)
+        if let Err(e) = remove_direct_peer_route(peer.overlay_ip) {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                warn!(
+                    peer_id = %peer.device_id,
+                    overlay_ip = %peer.overlay_ip,
+                    "Failed to clear direct peer route: {}",
+                    e
+                );
+            }
+        }
+
+        Some((peer.device_id, peer.overlay_ip))
     }
 
     async fn handle_peer_lost(&self, device_id: &DeviceId) {
@@ -893,6 +926,7 @@ impl AvenadInner {
                         peer.tunnel_interface.clone(),
                         peer.wg_pubkey,
                         peer.endpoint,
+                        peer.overlay_ip,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -904,9 +938,10 @@ impl AvenadInner {
         let desired_overlay_prefix_iface = self.select_overlay_prefix_interface().await;
         self.sync_overlay_prefix_route(desired_overlay_prefix_iface)
             .await;
+        self.sync_direct_peer_routes(&peers);
 
         let tunnels = self.peer_tunnels.lock().await.clone();
-        for (device_id, tunnel_interface, wg_pubkey, endpoint) in peers {
+        for (device_id, tunnel_interface, wg_pubkey, endpoint, _overlay_ip) in peers {
             let allowed_ips = universal_peer_allowed_ips();
 
             let mut peer_config = PeerConfig::new(wg_pubkey)
@@ -1021,6 +1056,55 @@ impl AvenadInner {
 
         best.map(|(_, _, tunnel_interface)| tunnel_interface)
             .or_else(|| fallback.into_iter().next())
+    }
+
+    fn sync_direct_peer_routes(
+        &self,
+        peers: &[(
+            DeviceId,
+            String,
+            [u8; 32],
+            Option<SocketAddr>,
+            std::net::Ipv6Addr,
+        )],
+    ) {
+        let mut per_device: HashMap<DeviceId, Vec<(String, std::net::Ipv6Addr)>> = HashMap::new();
+        for (device_id, tunnel_interface, _, _, overlay_ip) in peers {
+            per_device
+                .entry(*device_id)
+                .or_default()
+                .push((tunnel_interface.clone(), *overlay_ip));
+        }
+
+        for (device_id, entries) in per_device {
+            if entries.len() == 1 {
+                let (tunnel_interface, overlay_ip) = &entries[0];
+                if let Err(e) = ensure_direct_peer_route(tunnel_interface, *overlay_ip) {
+                    if e.kind() != std::io::ErrorKind::Unsupported {
+                        warn!(
+                            peer_id = %device_id,
+                            interface = %tunnel_interface,
+                            overlay_ip = %overlay_ip,
+                            "Failed to ensure direct peer route: {}",
+                            e
+                        );
+                    }
+                }
+            } else {
+                let overlay_ip = entries[0].1;
+                if let Err(e) = remove_direct_peer_route(overlay_ip) {
+                    if e.kind() != std::io::ErrorKind::Unsupported {
+                        warn!(
+                            peer_id = %device_id,
+                            overlay_ip = %overlay_ip,
+                            tunnels = entries.len(),
+                            "Failed to clear direct route for multi-underlay peer: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
     }
 
     async fn sync_overlay_prefix_route(&self, tunnel_interface: Option<String>) {
@@ -1378,6 +1462,55 @@ fn remove_overlay_prefix_route(network: &NetworkConfig) -> Result<(), std::io::E
 
 #[cfg(not(target_os = "linux"))]
 fn remove_overlay_prefix_route(_network: &NetworkConfig) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "requires Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_direct_peer_route(
+    interface_name: &str,
+    peer_addr: std::net::Ipv6Addr,
+) -> Result<(), std::io::Error> {
+    use avena_overlay::wg::linux::netlink;
+
+    netlink::replace_ipv6_route(interface_name, peer_addr, 128).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("replace direct peer route: {e}"),
+        )
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_direct_peer_route(
+    _interface_name: &str,
+    _peer_addr: std::net::Ipv6Addr,
+) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "requires Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_direct_peer_route(peer_addr: std::net::Ipv6Addr) -> Result<(), std::io::Error> {
+    use avena_overlay::wg::linux::netlink;
+
+    match netlink::delete_ipv6_route(peer_addr, 128) {
+        Ok(()) => Ok(()),
+        Err(WgError::InterfaceNotFound(_)) => Ok(()),
+        Err(WgError::NetlinkError(message)) if message.contains("code: Some(-3)") => Ok(()),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("delete direct peer route: {e}"),
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_direct_peer_route(_peer_addr: std::net::Ipv6Addr) -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "requires Linux",

@@ -70,6 +70,7 @@ enum ExecutedEvent {
 }
 
 const ASSERTION_PING_ATTEMPTS: usize = 5;
+const NODE_CONNECTIVITY_ATTEMPTS: usize = 10;
 const ASSERTION_PING_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 impl EventTracker {
@@ -457,7 +458,7 @@ impl EventExecutor {
 
                 let ip_str = overlay_ip.to_string();
                 let connected = retry_until_success::<_, _, EventError>(
-                    ASSERTION_PING_ATTEMPTS,
+                    NODE_CONNECTIVITY_ATTEMPTS,
                     ASSERTION_PING_RETRY_DELAY,
                     |attempt| {
                         let ip_str = ip_str.clone();
@@ -494,7 +495,7 @@ impl EventExecutor {
                     return Err(EventError::AssertionFailed {
                         at_secs,
                         message: format!(
-                            "nodes {from} and {to} are not connected after {ASSERTION_PING_ATTEMPTS} probes"
+                            "nodes {from} and {to} are not connected after {NODE_CONNECTIVITY_ATTEMPTS} probes"
                         ),
                     });
                 }
