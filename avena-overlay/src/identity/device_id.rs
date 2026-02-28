@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use thiserror::Error;
@@ -12,8 +13,94 @@ pub enum DecodeError {
 }
 
 /// Stable identifier derived from an Ed25519 public key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId([u8; 16]);
+
+impl Serialize for DeviceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_base32())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DeviceIdVisitor;
+
+        impl<'de> Visitor<'de> for DeviceIdVisitor {
+            type Value = DeviceId;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "a base32 device id string (preferred) or a 16-byte array"
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                DeviceId::from_base32(v).map_err(|e| E::custom(e.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                self.visit_str(&v)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                if v.len() != 16 {
+                    return Err(E::custom(format!(
+                        "invalid length: expected 16 bytes, got {}",
+                        v.len()
+                    )));
+                }
+                let mut id = [0u8; 16];
+                id.copy_from_slice(v);
+                Ok(DeviceId(id))
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                self.visit_bytes(&v)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut out = [0u8; 16];
+                for i in 0..16 {
+                    out[i] = seq
+                        .next_element::<u8>()?
+                        .ok_or_else(|| A::Error::custom("invalid length: expected 16 bytes"))?;
+                }
+                // Reject extra elements.
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom(
+                        "invalid length: expected 16 bytes, got more",
+                    ));
+                }
+                Ok(DeviceId(out))
+            }
+        }
+
+        deserializer.deserialize_any(DeviceIdVisitor)
+    }
+}
 
 impl DeviceId {
     pub fn from_public_key(pk: &ed25519_dalek::VerifyingKey) -> Self {
@@ -170,6 +257,7 @@ mod tests {
         let id = DeviceId::from_public_key(&key.verifying_key());
 
         let json = serde_json::to_string(&id).unwrap();
+        assert!(json.starts_with('"') && json.ends_with('"'));
         let deserialized: DeviceId = serde_json::from_str(&json).unwrap();
 
         assert_eq!(id, deserialized);

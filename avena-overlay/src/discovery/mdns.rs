@@ -5,9 +5,10 @@
 
 use crate::DeviceId;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use super::{Capability, DiscoveredPeer, DiscoveryError, DiscoverySource, LocalAnnouncement};
 
@@ -22,6 +23,7 @@ const TXT_CAPABILITIES: &str = "cap";
 )]
 pub struct MdnsDiscovery {
     daemon: ServiceDaemon,
+    shutdown: AtomicBool,
 }
 
 impl MdnsDiscovery {
@@ -39,7 +41,10 @@ impl MdnsDiscovery {
             debug!("mDNS using system default interfaces");
         }
 
-        Ok(Self { daemon })
+        Ok(Self {
+            daemon,
+            shutdown: AtomicBool::new(false),
+        })
     }
 
     pub async fn advertise(&self, announcement: &LocalAnnouncement) -> Result<(), DiscoveryError> {
@@ -168,6 +173,15 @@ impl MdnsDiscovery {
         }
     }
 
+    pub fn shutdown(&self) {
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.stop_browse();
+        // mdns_sd shutdown is synchronous; ignore errors on teardown.
+        let _ = self.daemon.shutdown();
+    }
+
     pub fn unregister(&self, device_id: &DeviceId) -> Result<(), DiscoveryError> {
         let instance_name = device_id.to_base32();
         let full_name = format!("{}.{}", instance_name, SERVICE_TYPE);
@@ -182,9 +196,9 @@ impl MdnsDiscovery {
 
 impl Drop for MdnsDiscovery {
     fn drop(&mut self) {
-        if let Err(e) = self.daemon.shutdown() {
-            error!("failed to shutdown mDNS daemon: {}", e);
-        }
+        // Prefer an explicit call to `shutdown()` while the runtime is still up,
+        // but keep Drop as a best-effort fallback.
+        self.shutdown();
     }
 }
 

@@ -22,7 +22,10 @@ pub enum TunnelMode {
 
 impl Default for TunnelMode {
     fn default() -> Self {
-        TunnelMode::Kernel
+        // Prefer the kernel backend when available, but transparently fall back
+        // to userspace when the WireGuard kernel module/capabilities are not
+        // present (common in containers and some CI environments).
+        TunnelMode::PreferKernel
     }
 }
 

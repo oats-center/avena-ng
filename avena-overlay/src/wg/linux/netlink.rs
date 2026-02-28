@@ -32,6 +32,37 @@ const SOCKET_BUFFER_LENGTH: usize = 12288;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
+fn netlink_errno_hint(errno: i32) -> Option<&'static str> {
+    match errno {
+        x if x == libc::EOPNOTSUPP => Some(
+            "kernel WireGuard interface type is not supported. This usually means the WireGuard kernel module is missing/disabled (try `modprobe wireguard` on the host) or you're running in an environment that doesn't expose it (e.g. some containers/WSL). Workaround: set `tunnel_mode = \"prefer_kernel\"` or `tunnel_mode = \"userspace\"`.",
+        ),
+        x if x == libc::EPERM || x == libc::EACCES => Some(
+            "missing privileges. Creating/configuring a WireGuard interface requires CAP_NET_ADMIN (and typically root) in the current network namespace.",
+        ),
+        x if x == libc::ENODEV => Some(
+            "device type not available. Ensure the WireGuard kernel module is present/loaded on the host.",
+        ),
+        _ => None,
+    }
+}
+
+fn format_netlink_error(msg: &netlink_packet_core::ErrorMessage) -> String {
+    let io = msg.to_io();
+    let base = io.to_string();
+    match io.raw_os_error() {
+        Some(errno) => {
+            let mut out = format!("{} (errno {})", base, errno);
+            if let Some(hint) = netlink_errno_hint(errno) {
+                out.push_str(": ");
+                out.push_str(hint);
+            }
+            out
+        }
+        None => base,
+    }
+}
+
 fn netlink_request<I>(
     message: I,
     flags: u16,
@@ -114,7 +145,7 @@ where
                         ErrorKind::PermissionDenied => {
                             Err(WgError::PermissionDenied("operation not permitted".into()))
                         }
-                        _ => Err(WgError::NetlinkError(format!("netlink error: {:?}", msg))),
+                        _ => Err(WgError::NetlinkError(format_netlink_error(msg))),
                     };
                 }
                 _ => {}
@@ -188,7 +219,21 @@ pub fn create_interface(ifname: &str) -> Result<(), WgError> {
         RouteNetlinkMessage::NewLink(message),
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
         NETLINK_ROUTE,
-    )?;
+    )
+    .map_err(|e| match e {
+        WgError::PermissionDenied(msg) => {
+            WgError::PermissionDenied(format!("creating interface {ifname}: {msg}"))
+        }
+        WgError::NetlinkError(msg) => WgError::InterfaceCreation(format!(
+            "creating WireGuard interface {ifname} failed: {msg}"
+        )),
+        WgError::InterfaceCreation(msg) => WgError::InterfaceCreation(format!(
+            "creating WireGuard interface {ifname} failed: {msg}"
+        )),
+        other => WgError::InterfaceCreation(format!(
+            "creating WireGuard interface {ifname} failed: {other}"
+        )),
+    })?;
     Ok(())
 }
 
@@ -414,6 +459,10 @@ fn get_interface_index(ifname: &str) -> Result<u32, WgError> {
     }
 
     Err(WgError::InterfaceNotFound(ifname.into()))
+}
+
+pub fn interface_exists(ifname: &str) -> bool {
+    get_interface_index(ifname).is_ok()
 }
 
 pub fn add_ipv6_address(ifname: &str, addr: Ipv6Addr, prefix_len: u8) -> Result<(), WgError> {

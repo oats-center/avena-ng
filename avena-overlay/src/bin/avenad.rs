@@ -32,6 +32,8 @@ const MAX_HANDSHAKES_PER_IP: u32 = 5;
 const MAX_NONCE_CACHE_SIZE: usize = 10_000;
 const MAX_RATE_LIMITER_SIZE: usize = 10_000;
 const MAX_CONCURRENT_OUTGOING_HANDSHAKES: usize = 16;
+const OUTGOING_HANDSHAKE_COOLDOWN: Duration = Duration::from_secs(10);
+const OUTGOING_HANDSHAKE_REFRESH_AFTER: Duration = Duration::from_secs(5);
 const TUNNEL_PORT_BASE: u16 = 20000;
 const TUNNEL_PORT_SPAN: u16 = 40000;
 
@@ -114,6 +116,7 @@ struct AvenadInner {
     handshake_semaphore: Arc<Semaphore>,
     outgoing_semaphore: Arc<Semaphore>,
     outgoing_handshake_inflight: Mutex<HashSet<(DeviceId, IpAddr)>>,
+    outgoing_handshake_last_attempt: Mutex<HashMap<DeviceId, Instant>>,
     cert_validator: CertValidator,
     device_cert: String,
     routing: Mutex<Option<BabeldController>>,
@@ -209,30 +212,62 @@ impl Avenad {
                 .await?;
         info!(mode = ?config.tunnel_mode, "Tunnel backend selected");
 
-        base_tunnel.set_private_key(&*wg_keys.private).await?;
-        base_tunnel.set_listen_port(config.listen_port).await?;
+        // If initialization fails after we've created/attached to a tunnel
+        // interface (especially in userspace mode where this spawns
+        // `wireguard-go`), make a best-effort attempt to clean up so we don't
+        // leave a stray process/interface behind.
+        let init_result: Result<
+            (
+                DiscoveryService,
+                tokio::sync::broadcast::Receiver<DiscoveryEvent>,
+                TcpListener,
+                Option<BabeldController>,
+            ),
+            AvenadError,
+        > = async {
+            base_tunnel.set_private_key(&*wg_keys.private).await?;
+            base_tunnel.set_listen_port(config.listen_port).await?;
 
-        assign_interface_address(&config.interface_name, overlay_ip)?;
-        info!(interface = %config.interface_name, addr = %overlay_ip, "Assigned overlay address to interface");
+            assign_interface_address(&config.interface_name, overlay_ip)?;
+            info!(interface = %config.interface_name, addr = %overlay_ip, "Assigned overlay address to interface");
 
-        let discovery_config = config.to_discovery_config();
+        let mut discovery_config = config.to_discovery_config();
+
+        // If no mDNS interfaces are explicitly configured, avoid binding mDNS
+        // to the overlay interface by default. Some kernels reject sending
+        // multicast from tunnel interfaces (e.g. ENOKEY / "Required key not available").
+        if discovery_config.enable_mdns && discovery_config.mdns_interfaces.is_empty() {
+            discovery_config.mdns_interfaces = default_mdns_interfaces(&config.interface_name);
+        }
         let discovery = DiscoveryService::new(discovery_config)?;
         let discovery_rx = discovery.subscribe();
         discovery.start_mdns_browse()?;
         info!("Discovery service initialized");
 
-        let wg_port = base_tunnel
-            .listen_port()
-            .await
-            .unwrap_or(config.listen_port);
-        let handshake_port = wg_port + 1;
-        let listen_addr: SocketAddr = config
-            .listen_address
-            .unwrap_or_else(|| format!("[::]:{}", handshake_port).parse().unwrap());
-        let handshake_listener = TcpListener::bind(listen_addr).await?;
-        info!(addr = %listen_addr, "Handshake listener bound");
+            let wg_port = base_tunnel
+                .listen_port()
+                .await
+                .unwrap_or(config.listen_port);
+            let handshake_port = wg_port + 1;
+            let listen_addr: SocketAddr = config
+                .listen_address
+                .unwrap_or_else(|| format!("[::]:{}", handshake_port).parse().unwrap());
+            let handshake_listener = TcpListener::bind(listen_addr).await?;
+            info!(addr = %listen_addr, "Handshake listener bound");
 
-        let routing = Some(start_routing_controller(&config).await?);
+            let routing = Some(start_routing_controller(&config).await?);
+
+            Ok((discovery, discovery_rx, handshake_listener, routing))
+        }
+        .await;
+
+        let (discovery, discovery_rx, handshake_listener, routing) = match init_result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = base_tunnel.remove_interface().await;
+                return Err(e);
+            }
+        };
 
         let inner = Arc::new(AvenadInner {
             config,
@@ -248,6 +283,7 @@ impl Avenad {
             handshake_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
             outgoing_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTGOING_HANDSHAKES)),
             outgoing_handshake_inflight: Mutex::new(HashSet::new()),
+            outgoing_handshake_last_attempt: Mutex::new(HashMap::new()),
             cert_validator,
             device_cert,
             routing: Mutex::new(routing),
@@ -368,12 +404,16 @@ impl Avenad {
                                         let iface = peer_state.tunnel_interface.clone();
                                         let mut peers = inner_clone.peers.write().await;
                                         let mut inserted = false;
-                                        if let Entry::Vacant(entry) = peers.entry(iface.clone()) {
-                                            entry.insert(peer_state);
-                                            inserted = true;
-                                            info!(peer_id = %device_id, iface = %iface, "Peer connected via incoming handshake");
-                                        } else {
-                                            debug!(peer_id = %device_id, iface = %iface, "Peer tunnel already connected, discarding duplicate handshake result");
+                                        match peers.entry(iface.clone()) {
+                                            Entry::Vacant(entry) => {
+                                                entry.insert(peer_state);
+                                                inserted = true;
+                                                info!(peer_id = %device_id, iface = %iface, "Peer connected via incoming handshake");
+                                            }
+                                            Entry::Occupied(mut entry) => {
+                                                *entry.get_mut() = peer_state;
+                                                info!(peer_id = %device_id, iface = %iface, "Peer refreshed via incoming handshake");
+                                            }
                                         }
                                         drop(peers);
 
@@ -421,6 +461,44 @@ impl Avenad {
         inner.shutdown().await;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn default_mdns_interfaces(overlay_iface: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let dir = match std::fs::read_dir("/sys/class/net") {
+        Ok(d) => d,
+        Err(_) => return out,
+    };
+
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "lo" || name == overlay_iface {
+            continue;
+        }
+        // Skip typical Avena tunnel interface prefixes.
+        if name.starts_with("av-") {
+            continue;
+        }
+        // Only include interfaces that are likely usable.
+        let operstate_path = entry.path().join("operstate");
+        let operstate = std::fs::read_to_string(operstate_path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !(operstate == "up" || operstate == "unknown") {
+            continue;
+        }
+        out.push(name);
+    }
+
+    out.sort();
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_mdns_interfaces(_overlay_iface: &str) -> Vec<String> {
+    Vec::new()
 }
 
 async fn start_routing_controller(config: &AvenadConfig) -> Result<BabeldController, AvenadError> {
@@ -557,12 +635,12 @@ impl AvenadInner {
                     capabilities: std::collections::HashSet::new(),
                     interface_suffix: Some(idx as u8),
                 };
-                info!(interface = %iface, endpoint = %announcement.wg_endpoint, "Announcing on interface");
-                self.discovery.announce(&announcement).await?;
-            }
-        }
-        Ok(())
-    }
+                 debug!(interface = %iface, endpoint = %announcement.wg_endpoint, "Announcing on interface");
+                 self.discovery.announce(&announcement).await?;
+             }
+         }
+         Ok(())
+     }
 
     async fn handle_discovered_peer(&self, peer: DiscoveredPeer) -> Result<(), AvenadError> {
         let should_initiate = self.keypair.device_id() > peer.device_id;
@@ -571,15 +649,47 @@ impl AvenadInner {
             return Ok(());
         }
 
-        {
+        // Decide whether this discovery event should trigger a (re)handshake.
+        // We use a short cooldown because mDNS can emit frequent resolves.
+        let (already_connected, last_seen_elapsed) = {
             let peers = self.peers.read().await;
-            if peers.values().any(|state| {
-                state.device_id == peer.device_id
-                    && state.endpoint.map(|endpoint| endpoint.ip()) == Some(peer.endpoint.ip())
-            }) {
-                debug!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Already connected to peer endpoint");
-                return Ok(());
+            let existing = peers.values().find(|state| {
+                state.device_id == peer.device_id && state.endpoint == Some(peer.endpoint)
+            });
+            match existing {
+                Some(state) => (true, Some(state.time_since_last_seen())),
+                None => (false, None),
             }
+        };
+
+        if already_connected {
+            if let Some(elapsed) = last_seen_elapsed {
+                if elapsed < OUTGOING_HANDSHAKE_REFRESH_AFTER {
+                    debug!(
+                        peer_id = %peer.device_id,
+                        endpoint = %peer.endpoint,
+                        last_seen_ms = elapsed.as_millis(),
+                        "Peer endpoint already connected and recently active"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        {
+            let mut last_attempt = self.outgoing_handshake_last_attempt.lock().await;
+            if let Some(prev) = last_attempt.get(&peer.device_id) {
+                if prev.elapsed() < OUTGOING_HANDSHAKE_COOLDOWN {
+                    debug!(
+                        peer_id = %peer.device_id,
+                        endpoint = %peer.endpoint,
+                        cooldown_ms = OUTGOING_HANDSHAKE_COOLDOWN.as_millis(),
+                        "Skipping outgoing handshake due to cooldown"
+                    );
+                    return Ok(());
+                }
+            }
+            last_attempt.insert(peer.device_id, Instant::now());
         }
 
         let canonical_peer_ip = canonical_underlay_ip(peer.endpoint.ip());
@@ -608,11 +718,15 @@ impl AvenadInner {
 
         let iface = peer_state.tunnel_interface.clone();
         let mut peers = self.peers.write().await;
-        if let Entry::Vacant(entry) = peers.entry(iface.clone()) {
-            entry.insert(peer_state);
-            info!(peer_id = %peer.device_id, iface = %iface, "Peer connected");
-        } else {
-            debug!(peer_id = %peer.device_id, iface = %iface, "Peer tunnel already connected, discarding duplicate handshake result");
+        match peers.entry(iface.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(peer_state);
+                info!(peer_id = %peer.device_id, iface = %iface, "Peer connected");
+            }
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() = peer_state;
+                info!(peer_id = %peer.device_id, iface = %iface, "Peer refreshed");
+            }
         }
         drop(peers);
 
@@ -1151,7 +1265,7 @@ impl AvenadInner {
 
             let already_connected = self.peers.read().await.values().any(|state| {
                 state.device_id == peer.device_id
-                    && state.endpoint.map(|endpoint| endpoint.ip()) == Some(peer.endpoint.ip())
+                    && state.endpoint == Some(peer.endpoint)
             });
             if already_connected {
                 continue;
@@ -1288,6 +1402,10 @@ impl AvenadInner {
                 }
             }
         }
+
+        // Stop discovery last (best-effort). This reduces noisy shutdown logs
+        // from the underlying mdns daemon when the process exits.
+        self.discovery.shutdown();
     }
 }
 
@@ -1452,7 +1570,12 @@ fn remove_overlay_prefix_route(network: &NetworkConfig) -> Result<(), std::io::E
     match netlink::delete_ipv6_route(network.prefix, network.prefix_len) {
         Ok(()) => Ok(()),
         Err(WgError::InterfaceNotFound(_)) => Ok(()),
-        Err(WgError::NetlinkError(message)) if message.contains("code: Some(-3)") => Ok(()),
+        // When the route doesn't exist, Linux often returns ESRCH (errno 3).
+        Err(WgError::NetlinkError(message))
+            if message.contains("(errno 3)") || message.contains("os error 3") =>
+        {
+            Ok(())
+        }
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("delete overlay prefix route: {e}"),
@@ -1501,7 +1624,11 @@ fn remove_direct_peer_route(peer_addr: std::net::Ipv6Addr) -> Result<(), std::io
     match netlink::delete_ipv6_route(peer_addr, 128) {
         Ok(()) => Ok(()),
         Err(WgError::InterfaceNotFound(_)) => Ok(()),
-        Err(WgError::NetlinkError(message)) if message.contains("code: Some(-3)") => Ok(()),
+        Err(WgError::NetlinkError(message))
+            if message.contains("(errno 3)") || message.contains("os error 3") =>
+        {
+            Ok(())
+        }
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("delete direct peer route: {e}"),
@@ -1655,12 +1782,12 @@ mod tests {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into())
+        // Suppress noisy warnings from netlink-packet-route on newer kernels.
+        .add_directive("netlink_packet_route=error".parse().unwrap());
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config_path = std::env::args()
         .nth(1)

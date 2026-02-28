@@ -7,12 +7,15 @@ mod socket;
 
 use std::fs;
 use std::io::ErrorKind;
+use std::io::{BufRead, BufReader};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::process::Stdio;
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 use crate::wg::error::WgError;
 use crate::wg::types::{Host, Key, Peer, PeerStats};
@@ -71,6 +74,23 @@ impl UserspaceBackend {
             .lock()
             .map_err(|e| WgError::InterfaceCreation(format!("lock poisoned: {}", e)))?;
 
+        #[cfg(target_os = "linux")]
+        {
+            // If the link already exists but there's no userspace UAPI socket,
+            // this is very likely a kernel WireGuard interface (or a leftover
+            // device from a previous run). Userspace backend cannot safely
+            // take it over.
+            if crate::wg::linux::netlink::interface_exists(name) {
+                let sock_path = socket_path(name);
+                if !sock_path.exists() {
+                    return Err(WgError::InterfaceCreation(format!(
+                        "interface {name} already exists but userspace UAPI socket {} is missing. Another instance may be running or this is a kernel-managed interface. Use `tunnel_mode = \"kernel\"`/`prefer_kernel` or delete the interface (`ip link del {name}`) before starting in userspace mode.",
+                        sock_path.display()
+                    )));
+                }
+            }
+        }
+
         if let Some(ref existing) = *ifname_guard {
             if existing == name {
                 if let Some(process) = process_guard.as_mut() {
@@ -97,15 +117,36 @@ impl UserspaceBackend {
             }
         }
 
+        // If a socket already exists and is connectable, then another
+        // wireguard-go instance is already managing this interface.
+        // Refuse to start a second instance to avoid two daemons fighting.
+        let sock_path = socket_path(name);
+        if sock_path.exists() {
+            match socket::WgSocket::connect(name) {
+                Ok(_) => {
+                    return Err(WgError::InterfaceCreation(format!(
+                        "interface {name} is already in use (existing WireGuard userspace control socket at {}). Stop the other `wireguard-go`/`avenad` instance or delete the interface before retrying.",
+                        sock_path.display()
+                    )));
+                }
+                Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                    // Stale socket from a crash; remove and continue.
+                    let _ = fs::remove_file(&sock_path);
+                }
+                Err(_) => {}
+            }
+        }
+
         let mut process = wireguard_go_command(name)
             .spawn()
             .map_err(|e| WgError::ProcessError(format!("failed to run wireguard-go: {}", e)))?;
+
+        spawn_wireguard_go_log_threads(name, &mut process);
 
         // wireguard-go may print an informational banner about kernel WireGuard
         // availability. Treat process exit status + UAPI socket readiness as the
         // source of truth for userspace backend health.
 
-        let sock_path = socket_path(name);
         for attempt in 0..SOCKET_POLL_ATTEMPTS {
             match process.try_wait() {
                 Ok(Some(status)) => {
@@ -271,7 +312,52 @@ fn wireguard_go_command(name: &str) -> Command {
     // Keep per-interface userspace backend fd/thread footprint bounded when
     // many interfaces are active in the same namespace.
     cmd.env("GOMAXPROCS", "1");
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     cmd
+}
+
+fn spawn_wireguard_go_log_threads(ifname: &str, child: &mut Child) {
+    let ifname = ifname.to_string();
+
+    if let Some(stdout) = child.stdout.take() {
+        let ifname_clone = ifname.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                debug!(iface = %ifname_clone, line = trimmed, "wireguard-go");
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // wireguard-go uses stderr for both noisy informational output
+                // and actual errors.
+                let lower = trimmed.to_ascii_lowercase();
+                let is_error = lower.contains("error")
+                    || lower.contains("failed")
+                    || lower.contains("fatal")
+                    || lower.contains("panic");
+                if is_error {
+                    warn!(iface = %ifname, line = trimmed, "wireguard-go");
+                } else {
+                    debug!(iface = %ifname, line = trimmed, "wireguard-go");
+                }
+            }
+        });
+    }
 }
 
 fn with_retry<T, F>(mut operation: F) -> Result<T, WgError>

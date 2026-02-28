@@ -231,6 +231,13 @@ impl DiscoveryService {
             .map(|guard| guard.values().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Best-effort shutdown of discovery backends.
+    pub fn shutdown(&self) {
+        if let Some(ref mdns) = self.mdns {
+            mdns.shutdown();
+        }
+    }
 }
 
 #[cfg(test)]
