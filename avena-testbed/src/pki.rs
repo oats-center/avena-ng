@@ -125,11 +125,19 @@ mod tests {
             NodeConfig {
                 id: "gateway".into(),
                 capabilities: vec!["relay".into()],
+                mobility_trace: None,
+                position: None,
+                radio_profile: None,
+                radios: vec![],
                 start_delay_secs: None,
             },
             NodeConfig {
                 id: "sensor".into(),
                 capabilities: vec![],
+                mobility_trace: None,
+                position: None,
+                radio_profile: None,
+                radios: vec![],
                 start_delay_secs: None,
             },
         ]

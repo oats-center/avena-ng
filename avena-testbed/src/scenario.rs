@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 
@@ -17,6 +18,8 @@ pub struct Scenario {
     pub name: String,
     pub description: Option<String>,
     pub duration_secs: u64,
+    #[serde(default)]
+    pub emulation: EmulationConfig,
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub links: Vec<LinkConfig>,
@@ -28,9 +31,72 @@ pub struct Scenario {
     pub assertions: Vec<Assertion>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EmulationConfig {
+    #[serde(default)]
+    pub backend: EmulationBackend,
+    #[serde(default)]
+    pub ns3: Ns3Config,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EmulationBackend {
+    #[default]
+    Netem,
+    Ns3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ns3Config {
+    #[serde(default = "default_realtime_hard_limit_ms")]
+    pub realtime_hard_limit_ms: u32,
+    #[serde(default)]
+    pub emit_pcap: bool,
+    #[serde(default)]
+    pub radio_profiles: HashMap<String, RadioProfileConfig>,
+}
+
+impl Default for Ns3Config {
+    fn default() -> Self {
+        Self {
+            realtime_hard_limit_ms: default_realtime_hard_limit_ms(),
+            emit_pcap: false,
+            radio_profiles: HashMap::new(),
+        }
+    }
+}
+
+fn default_realtime_hard_limit_ms() -> u32 {
+    250
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RadioProfileConfig {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub phy_backend: Option<String>,
+    #[serde(default)]
+    pub standard: Option<String>,
+    #[serde(default)]
+    pub band: Option<String>,
+    #[serde(default)]
+    pub channel: Option<u32>,
+    #[serde(default)]
+    pub channel_width_mhz: Option<u32>,
+    #[serde(default)]
+    pub tx_power_dbm: Option<f32>,
+    #[serde(default)]
+    pub rx_noise_figure_db: Option<f32>,
+    #[serde(default)]
+    pub propagation: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgeConfig {
     pub id: String,
+    #[serde(alias = "members")]
     pub nodes: Vec<String>,
     #[serde(default)]
     pub latency_ms: u32,
@@ -49,7 +115,48 @@ pub struct NodeConfig {
     pub id: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub mobility_trace: Option<String>,
+    #[serde(default)]
+    pub position: Option<NodePosition>,
+    #[serde(default)]
+    pub radio_profile: Option<String>,
+    #[serde(default)]
+    pub radios: Vec<NodeRadioConfig>,
     pub start_delay_secs: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodePosition {
+    pub x_m: f64,
+    pub y_m: f64,
+    #[serde(default)]
+    pub z_m: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeRadioConfig {
+    pub id: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub phy_backend: Option<String>,
+    #[serde(default)]
+    pub standard: Option<String>,
+    #[serde(default)]
+    pub band: Option<String>,
+    #[serde(default)]
+    pub channel: Option<u32>,
+    #[serde(default)]
+    pub channel_width_mhz: Option<u32>,
+    #[serde(default)]
+    pub tx_power_dbm: Option<f32>,
+    #[serde(default)]
+    pub rx_noise_figure_db: Option<f32>,
+    #[serde(default)]
+    pub propagation: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +170,8 @@ pub struct LinkConfig {
     pub loss_percent: f32,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub medium: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -83,6 +192,15 @@ fn normalized_link_pair(a: &str, b: &str) -> (String, String) {
     } else {
         (b.to_string(), a.to_string())
     }
+}
+
+fn parse_radio_ref(value: &str) -> Option<(&str, &str)> {
+    let (node_id, radio_id) = value.split_once(':')?;
+    if node_id.is_empty() || radio_id.is_empty() || radio_id.contains(':') {
+        return None;
+    }
+
+    Some((node_id, radio_id))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,30 +338,37 @@ impl Scenario {
             return Err(ScenarioError::Validation("duplicate node IDs".into()));
         }
 
-        for link in &self.links {
-            if !node_ids.contains(&link.endpoints.0) {
-                return Err(ScenarioError::Validation(format!(
-                    "link references unknown node: {}",
-                    link.endpoints.0
-                )));
-            }
-            if !node_ids.contains(&link.endpoints.1) {
-                return Err(ScenarioError::Validation(format!(
-                    "link references unknown node: {}",
-                    link.endpoints.1
-                )));
+        self.validate_ns3_node_mobility()?;
+        self.validate_ns3_radio_configuration()?;
+
+        if self.emulation.backend != EmulationBackend::Ns3 {
+            for link in &self.links {
+                if !node_ids.contains(&link.endpoints.0) {
+                    return Err(ScenarioError::Validation(format!(
+                        "link references unknown node: {}",
+                        link.endpoints.0
+                    )));
+                }
+                if !node_ids.contains(&link.endpoints.1) {
+                    return Err(ScenarioError::Validation(format!(
+                        "link references unknown node: {}",
+                        link.endpoints.1
+                    )));
+                }
             }
         }
 
         self.validate_link_identity_rules()?;
 
-        for bridge in &self.bridges {
-            for node in &bridge.nodes {
-                if !node_ids.contains(node) {
-                    return Err(ScenarioError::Validation(format!(
-                        "bridge '{}' references unknown node: {}",
-                        bridge.id, node
-                    )));
+        if self.emulation.backend != EmulationBackend::Ns3 {
+            for bridge in &self.bridges {
+                for node in &bridge.nodes {
+                    if !node_ids.contains(node) {
+                        return Err(ScenarioError::Validation(format!(
+                            "bridge '{}' references unknown node: {}",
+                            bridge.id, node
+                        )));
+                    }
                 }
             }
         }
@@ -278,9 +403,24 @@ impl Scenario {
     ) -> Result<(), ScenarioError> {
         match action {
             EventAction::DisconnectLink { link } | EventAction::ConnectLink { link } => {
+                if self.emulation.backend == EmulationBackend::Ns3 {
+                    return Err(ScenarioError::Validation(format!(
+                        "event action '{}' is invalid for ns3 backend",
+                        match action {
+                            EventAction::DisconnectLink { .. } => "DisconnectLink",
+                            EventAction::ConnectLink { .. } => "ConnectLink",
+                            _ => unreachable!(),
+                        }
+                    )));
+                }
                 self.validate_link_ref(link)?;
             }
             EventAction::ModifyLink { link, .. } => {
+                if self.emulation.backend == EmulationBackend::Ns3 {
+                    return Err(ScenarioError::Validation(
+                        "event action 'ModifyLink' is invalid for ns3 backend".to_string(),
+                    ));
+                }
                 self.validate_link_ref(link)?;
             }
             EventAction::StopNode { node } | EventAction::StartNode { node } => {
@@ -291,6 +431,177 @@ impl Scenario {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_ns3_node_mobility(&self) -> Result<(), ScenarioError> {
+        if self.emulation.backend != EmulationBackend::Ns3 {
+            return Ok(());
+        }
+
+        for node in &self.nodes {
+            let has_trace = node
+                .mobility_trace
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_position = node.position.is_some();
+
+            match (has_trace, has_position) {
+                (false, false) => {
+                    return Err(ScenarioError::Validation(format!(
+                        "node '{}' must set exactly one of mobility_trace or position for ns3 backend",
+                        node.id
+                    )));
+                }
+                (true, true) => {
+                    return Err(ScenarioError::Validation(format!(
+                        "node '{}' must not set both mobility_trace and position for ns3 backend",
+                        node.id
+                    )));
+                }
+                (true, false) | (false, true) => {}
+            }
+
+            if node
+                .mobility_trace
+                .as_ref()
+                .is_some_and(|trace| trace.trim().is_empty())
+            {
+                return Err(ScenarioError::Validation(format!(
+                    "node '{}' has an empty mobility_trace path",
+                    node.id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_ns3_radio_configuration(&self) -> Result<(), ScenarioError> {
+        if self.emulation.backend != EmulationBackend::Ns3 {
+            return Ok(());
+        }
+
+        for node in &self.nodes {
+            if node.radios.is_empty() {
+                return Err(ScenarioError::Validation(format!(
+                    "node '{}' must declare at least one radio for ns3 backend",
+                    node.id
+                )));
+            }
+
+            if let Some(node_profile) = node.radio_profile.as_ref() {
+                if node_profile.trim().is_empty() {
+                    return Err(ScenarioError::Validation(format!(
+                        "node '{}' has an empty radio_profile",
+                        node.id
+                    )));
+                }
+
+                if !self.emulation.ns3.radio_profiles.contains_key(node_profile) {
+                    return Err(ScenarioError::Validation(format!(
+                        "node '{}' references unknown radio_profile '{}'",
+                        node.id, node_profile
+                    )));
+                }
+            }
+
+            let mut radio_ids = HashSet::new();
+            for radio in &node.radios {
+                if radio.id.trim().is_empty() {
+                    return Err(ScenarioError::Validation(format!(
+                        "node '{}' contains a radio with an empty id",
+                        node.id
+                    )));
+                }
+
+                if !radio_ids.insert(radio.id.clone()) {
+                    return Err(ScenarioError::Validation(format!(
+                        "node '{}' contains duplicate radio id '{}'",
+                        node.id, radio.id
+                    )));
+                }
+
+                if let Some(profile) = radio.profile.as_ref() {
+                    if profile.trim().is_empty() {
+                        return Err(ScenarioError::Validation(format!(
+                            "node '{}' radio '{}' has an empty profile",
+                            node.id, radio.id
+                        )));
+                    }
+
+                    if !self.emulation.ns3.radio_profiles.contains_key(profile) {
+                        return Err(ScenarioError::Validation(format!(
+                            "node '{}' radio '{}' references unknown profile '{}'",
+                            node.id, radio.id, profile
+                        )));
+                    }
+                }
+            }
+        }
+
+        let node_radio_ids: HashMap<String, HashSet<String>> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.id.clone(),
+                    node.radios.iter().map(|radio| radio.id.clone()).collect(),
+                )
+            })
+            .collect();
+
+        for link in &self.links {
+            let link_id = link.resolved_link_id();
+            for endpoint in [&link.endpoints.0, &link.endpoints.1] {
+                let (node_id, radio_id) = parse_radio_ref(endpoint).ok_or_else(|| {
+                    ScenarioError::Validation(format!(
+                        "link endpoint '{}' must reference radios as '<node_id>:<radio_id>' in ns3 backend",
+                        endpoint
+                    ))
+                })?;
+
+                let radios = node_radio_ids.get(node_id).ok_or_else(|| {
+                    ScenarioError::Validation(format!(
+                        "link '{}' references unknown node '{}'",
+                        link_id, node_id
+                    ))
+                })?;
+
+                if !radios.contains(radio_id) {
+                    return Err(ScenarioError::Validation(format!(
+                        "link '{}' references unknown radio '{}' on node '{}'",
+                        link_id, radio_id, node_id
+                    )));
+                }
+            }
+        }
+
+        for bridge in &self.bridges {
+            for member in &bridge.nodes {
+                let (node_id, radio_id) = parse_radio_ref(member).ok_or_else(|| {
+                    ScenarioError::Validation(format!(
+                        "bridge '{}' member '{}' must reference radios as '<node_id>:<radio_id>' in ns3 backend",
+                        bridge.id, member
+                    ))
+                })?;
+
+                let radios = node_radio_ids.get(node_id).ok_or_else(|| {
+                    ScenarioError::Validation(format!(
+                        "bridge '{}' references unknown node '{}'",
+                        bridge.id, node_id
+                    ))
+                })?;
+
+                if !radios.contains(radio_id) {
+                    return Err(ScenarioError::Validation(format!(
+                        "bridge '{}' references unknown radio '{}' on node '{}'",
+                        bridge.id, radio_id, node_id
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -700,5 +1011,422 @@ condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 1 }
 "#;
 
         assert!(Scenario::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn ns3_requires_node_mobility_source() {
+        let toml = r#"
+name = "ns3-no-mobility"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must set exactly one of mobility_trace or position"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ns3_rejects_both_trace_and_position() {
+        let toml = r#"
+name = "ns3-both"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[[nodes]]
+id = "nodeA"
+mobility_trace = "traces/nodeA.csv"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must not set both mobility_trace and position"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ns3_rejects_link_timeline_events() {
+        let toml = r#"
+name = "ns3-link-events"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+
+[emulation.ns3.radio_profiles.vehicle_wifi]
+kind = "wifi"
+
+[[nodes]]
+id = "nodeA"
+mobility_trace = "traces/nodeA.csv"
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[nodes]]
+id = "nodeB"
+mobility_trace = "traces/nodeB.csv"
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[links]]
+id = "ab"
+endpoints = ["nodeA:wifi0", "nodeB:wifi0"]
+latency_ms = 10
+bandwidth_kbps = 1000
+
+[[events]]
+at_secs = 2.0
+action = { type = "DisconnectLink", link = "ab" }
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("event action 'DisconnectLink' is invalid for ns3 backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ns3_allows_start_stop_events() {
+        let toml = r#"
+name = "ns3-start-stop"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+
+[emulation.ns3.radio_profiles.vehicle_wifi]
+kind = "wifi"
+
+[[nodes]]
+id = "nodeA"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[links]]
+endpoints = ["nodeA:wifi0", "nodeB:wifi0"]
+latency_ms = 10
+bandwidth_kbps = 1000
+
+[[events]]
+at_secs = 2.0
+action = { type = "StopNode", node = "nodeB" }
+
+[[events]]
+at_secs = 4.0
+action = { type = "StartNode", node = "nodeB" }
+"#;
+
+        assert!(Scenario::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn bridge_members_alias_parses() {
+        let toml = r#"
+name = "bridge-members-alias"
+duration_secs = 10
+
+[[nodes]]
+id = "gateway"
+
+[[nodes]]
+id = "sensor"
+
+[[bridges]]
+id = "farm-wifi"
+members = ["gateway", "sensor"]
+"#;
+
+        let scenario = Scenario::from_toml(toml).unwrap();
+        assert_eq!(scenario.bridges.len(), 1);
+        assert_eq!(scenario.bridges[0].nodes, vec!["gateway", "sensor"]);
+    }
+
+    #[test]
+    fn ns3_parses_radio_profiles() {
+        let toml = r#"
+name = "ns3-profiles"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+realtime_hard_limit_ms = 500
+emit_pcap = true
+
+[emulation.ns3.radio_profiles.vehicle_wifi]
+kind = "wifi"
+phy_backend = "spectrum"
+standard = "802.11n"
+band = "5ghz"
+channel_width_mhz = 20
+tx_power_dbm = 18
+rx_noise_figure_db = 7
+propagation = "log-distance"
+
+[[nodes]]
+id = "nodeA"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+channel = 36
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+channel = 36
+
+[[links]]
+endpoints = ["nodeA:wifi0", "nodeB:wifi0"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let scenario = Scenario::from_toml(toml).unwrap();
+        assert_eq!(scenario.emulation.ns3.realtime_hard_limit_ms, 500);
+        assert!(scenario.emulation.ns3.emit_pcap);
+        let profile = scenario
+            .emulation
+            .ns3
+            .radio_profiles
+            .get("vehicle_wifi")
+            .expect("missing radio profile");
+        assert_eq!(profile.kind.as_deref(), Some("wifi"));
+        assert_eq!(profile.phy_backend.as_deref(), Some("spectrum"));
+    }
+
+    #[test]
+    fn ns3_rejects_unknown_node_radio_profile() {
+        let toml = r#"
+name = "ns3-unknown-node-profile"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+
+[emulation.ns3.radio_profiles.vehicle_wifi]
+kind = "wifi"
+
+[[nodes]]
+id = "nodeA"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "does_not_exist"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[links]]
+endpoints = ["nodeA:wifi0", "nodeB:wifi0"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references unknown radio_profile 'does_not_exist'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ns3_rejects_link_endpoint_without_radio_ref() {
+        let toml = r#"
+name = "ns3-no-radio-ref"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+
+[emulation.ns3.radio_profiles.vehicle_wifi]
+kind = "wifi"
+
+[[nodes]]
+id = "nodeA"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must reference radios as '<node_id>:<radio_id>'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ns3_rejects_duplicate_radio_ids_per_node() {
+        let toml = r#"
+name = "ns3-dup-radios"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+
+[emulation.ns3.radio_profiles.vehicle_wifi]
+kind = "wifi"
+
+[[nodes]]
+id = "nodeA"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[links]]
+endpoints = ["nodeA:wifi0", "nodeB:wifi0"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contains duplicate radio id 'wifi0'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ns3_rejects_unknown_bridge_radio_member() {
+        let toml = r#"
+name = "ns3-bridge-unknown-radio"
+duration_secs = 10
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+
+[emulation.ns3.radio_profiles.vehicle_wifi]
+kind = "wifi"
+
+[[nodes]]
+id = "nodeA"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "vehicle_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[bridges]]
+id = "farm"
+members = ["nodeA:wifi0", "nodeB:wifiX"]
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references unknown radio 'wifiX' on node 'nodeB'"),
+            "unexpected error: {err}"
+        );
     }
 }
