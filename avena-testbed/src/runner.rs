@@ -6,6 +6,7 @@
 use crate::events::{EventError, EventExecutor, TestResult};
 use crate::links::LinkManager;
 use crate::metrics::{LogParser, MetricsLogger};
+use crate::ns3_driver::Ns3DriverProcess;
 use crate::pki::TestPki;
 use crate::scenario::{EmulationBackend, Scenario};
 use crate::status::Status;
@@ -35,6 +36,9 @@ pub enum RunnerError {
 
     #[error("event error: {0}")]
     Event(#[from] EventError),
+
+    #[error("ns3 driver error: {0}")]
+    Ns3Driver(#[from] crate::ns3_driver::Ns3DriverError),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -100,9 +104,22 @@ impl TestRunner {
         topology.setup(scenario, &pki).await?;
         phase.done();
 
+        let mut ns3_driver = Ns3DriverProcess::start_if_needed(scenario, pki.temp_dir()).await?;
+        if let Some(driver) = ns3_driver.as_ref() {
+            tracing::info!(
+                config = %driver.config_path.display(),
+                "ns3 driver started and ready"
+            );
+        }
+
         let phase = status.phase(&format!("Starting {} nodes", scenario.nodes.len()));
         let log_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
-        topology.start_nodes(&pki, scenario, log_dir).await?;
+        if let Err(err) = topology.start_nodes(&pki, scenario, log_dir).await {
+            if let Some(driver) = ns3_driver.as_mut() {
+                let _ = driver.shutdown().await;
+            }
+            return Err(err.into());
+        }
 
         let mut links = LinkManager::new();
         if backend_uses_netem(scenario.emulation.backend) {
@@ -137,6 +154,9 @@ impl TestRunner {
         phase.done_with(&format!("{running_count} running"));
 
         if !not_ready_nodes.is_empty() {
+            if let Some(driver) = ns3_driver.as_mut() {
+                let _ = driver.shutdown().await;
+            }
             if !self.keep_namespaces {
                 let phase = status.phase("Cleaning up");
                 topology.teardown().await?;
@@ -174,6 +194,12 @@ impl TestRunner {
             )
             .await;
         phase.done();
+
+        if let Some(driver) = ns3_driver.as_mut() {
+            if let Err(err) = driver.shutdown().await {
+                tracing::warn!(error = %err, "failed to shutdown ns3 driver cleanly");
+            }
+        }
 
         let mut topo = topology.lock().await;
 

@@ -1,6 +1,7 @@
 pub mod events;
 pub mod links;
 pub mod metrics;
+pub mod ns3_driver;
 pub mod ns3_plumbing;
 pub mod pki;
 pub mod runner;

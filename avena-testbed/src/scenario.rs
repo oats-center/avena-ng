@@ -54,6 +54,12 @@ pub struct Ns3Config {
     #[serde(default)]
     pub emit_pcap: bool,
     #[serde(default)]
+    pub driver_bin: Option<String>,
+    #[serde(default)]
+    pub driver_args: Vec<String>,
+    #[serde(default = "default_ns3_ready_timeout_secs")]
+    pub ready_timeout_secs: u64,
+    #[serde(default)]
     pub radio_profiles: HashMap<String, RadioProfileConfig>,
 }
 
@@ -62,6 +68,9 @@ impl Default for Ns3Config {
         Self {
             realtime_hard_limit_ms: default_realtime_hard_limit_ms(),
             emit_pcap: false,
+            driver_bin: None,
+            driver_args: Vec::new(),
+            ready_timeout_secs: default_ns3_ready_timeout_secs(),
             radio_profiles: HashMap::new(),
         }
     }
@@ -69,6 +78,10 @@ impl Default for Ns3Config {
 
 fn default_realtime_hard_limit_ms() -> u32 {
     250
+}
+
+fn default_ns3_ready_timeout_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +111,8 @@ pub struct BridgeConfig {
     pub id: String,
     #[serde(alias = "members")]
     pub nodes: Vec<String>,
+    #[serde(default)]
+    pub medium: Option<String>,
     #[serde(default)]
     pub latency_ms: u32,
     #[serde(default = "default_bridge_bandwidth")]
@@ -1204,6 +1219,9 @@ backend = "ns3"
 [emulation.ns3]
 realtime_hard_limit_ms = 500
 emit_pcap = true
+driver_bin = "/tmp/ns3-driver"
+driver_args = ["--foo", "bar"]
+ready_timeout_secs = 22
 
 [emulation.ns3.radio_profiles.vehicle_wifi]
 kind = "wifi"
@@ -1242,6 +1260,15 @@ bandwidth_kbps = 1000
         let scenario = Scenario::from_toml(toml).unwrap();
         assert_eq!(scenario.emulation.ns3.realtime_hard_limit_ms, 500);
         assert!(scenario.emulation.ns3.emit_pcap);
+        assert_eq!(
+            scenario.emulation.ns3.driver_bin.as_deref(),
+            Some("/tmp/ns3-driver")
+        );
+        assert_eq!(
+            scenario.emulation.ns3.driver_args,
+            vec!["--foo".to_string(), "bar".to_string()]
+        );
+        assert_eq!(scenario.emulation.ns3.ready_timeout_secs, 22);
         let profile = scenario
             .emulation
             .ns3

@@ -848,6 +848,7 @@ mod tests {
                 "sensorA:wifi0".to_string(),
                 "sensorB:wifi0".to_string(),
             ],
+            medium: Some("wifi".to_string()),
             latency_ms: 0,
             bandwidth_kbps: 1_000_000,
             loss_percent: 0.0,
