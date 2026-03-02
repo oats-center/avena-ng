@@ -6,6 +6,7 @@ use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
@@ -36,6 +37,7 @@ pub struct Ns3DriverProcess {
     child: Child,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    event_rx: UnboundedReceiver<Ns3DriverEvent>,
     pub config_path: PathBuf,
 }
 
@@ -56,6 +58,11 @@ pub struct Ns3RuntimeConfig {
     pub nodes: Vec<Ns3RuntimeNode>,
     pub links: Vec<Ns3RuntimeLink>,
     pub bridges: Vec<Ns3RuntimeBridge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Ns3DriverEvent {
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,6 +152,7 @@ impl Ns3DriverProcess {
         cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
+        let (event_tx, event_rx) = unbounded_channel();
 
         let stdout = child.stdout.take().ok_or_else(|| {
             Ns3DriverError::Io(std::io::Error::other("failed to capture ns3 stdout"))
@@ -161,6 +169,7 @@ impl Ns3DriverProcess {
                 match stdout_lines.next_line().await? {
                     Some(line) => {
                         tracing::debug!(line = %line, "ns3 stdout");
+                        maybe_emit_event(&line, &event_tx);
                         if line.contains(READY_MARKER) {
                             return Ok::<(), Ns3DriverError>(());
                         }
@@ -187,9 +196,11 @@ impl Ns3DriverProcess {
             }
         }
 
+        let stdout_event_tx = event_tx.clone();
         let stdout_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stdout_lines.next_line().await {
                 tracing::debug!(line = %line, "ns3 stdout");
+                maybe_emit_event(&line, &stdout_event_tx);
             }
         });
 
@@ -204,6 +215,7 @@ impl Ns3DriverProcess {
             child,
             stdout_task,
             stderr_task,
+            event_rx,
             config_path,
         }))
     }
@@ -218,6 +230,14 @@ impl Ns3DriverProcess {
         self.stderr_task.abort();
 
         Ok(())
+    }
+
+    pub fn drain_events(&mut self) -> Vec<Ns3DriverEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
+        }
+        events
     }
 }
 
@@ -353,6 +373,22 @@ fn parse_radio_ref(value: &str) -> Result<(&str, &str), Ns3DriverError> {
     }
 
     Ok((node_id, radio_id))
+}
+
+fn parse_event_line(line: &str) -> Option<Ns3DriverEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.contains(READY_MARKER) {
+        return None;
+    }
+
+    let payload = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    Some(Ns3DriverEvent { payload })
+}
+
+fn maybe_emit_event(line: &str, tx: &UnboundedSender<Ns3DriverEvent>) {
+    if let Some(event) = parse_event_line(line) {
+        let _ = tx.send(event);
+    }
 }
 
 fn mobility_for_node(node: &crate::scenario::NodeConfig) -> Ns3Mobility {
@@ -520,5 +556,44 @@ bandwidth_kbps = 1000
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn parse_event_line_parses_valid_json() {
+        let event = parse_event_line(r#"{"type":"realtime","lag_ms":3}"#)
+            .expect("event should parse");
+        assert_eq!(event.payload["type"], "realtime");
+        assert_eq!(event.payload["lag_ms"], 3);
+    }
+
+    #[test]
+    fn parse_event_line_ignores_ready_and_invalid_lines() {
+        assert!(parse_event_line("ns3_ready").is_none());
+        assert!(parse_event_line("not-json").is_none());
+        assert!(parse_event_line("   ").is_none());
+    }
+
+    #[tokio::test]
+    async fn start_collects_stdout_json_events() {
+        let toml = ns3_scenario_toml(
+            "[\"-c\", \"echo ns3_ready; echo '{\\\"type\\\":\\\"realtime\\\",\\\"lag_ms\\\":7}'; sleep 0.2\"]",
+            5,
+        );
+        let scenario = Scenario::from_toml(&toml).expect("valid scenario");
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        let mut handle = Ns3DriverProcess::start_if_needed(&scenario, temp.path())
+            .await
+            .expect("ns3 should start")
+            .expect("handle expected");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = handle.drain_events();
+        assert!(
+            events.iter().any(|event| event.payload["type"] == "realtime"),
+            "expected realtime event"
+        );
+
+        handle.shutdown().await.expect("shutdown");
     }
 }

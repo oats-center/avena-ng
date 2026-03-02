@@ -183,6 +183,15 @@ impl MetricsLogger {
         }
     }
 
+    pub fn log_ns3_event(&self, data: serde_json::Value) {
+        self.log(MetricEvent {
+            timestamp_ms: self.elapsed_ms(),
+            event_type: "ns3_event".to_string(),
+            node: None,
+            data,
+        });
+    }
+
     pub fn flush(&self) {
         if let Ok(mut output) = self.output.lock() {
             let _ = output.flush();
@@ -492,16 +501,18 @@ mod tests {
             250,
             150,
         );
+        logger.log_ns3_event(serde_json::json!({"type":"realtime","lag_ms":5}));
         logger.flush();
 
         let content = std::fs::read_to_string(temp.path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].contains("scenario_started"));
         assert!(lines[1].contains("node_started"));
         assert!(lines[2].contains("link_changed"));
         assert!(lines[3].contains("convergence_metric"));
+        assert!(lines[4].contains("ns3_event"));
     }
 
     #[test]

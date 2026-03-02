@@ -196,6 +196,9 @@ impl TestRunner {
         phase.done();
 
         if let Some(driver) = ns3_driver.as_mut() {
+            for event in driver.drain_events() {
+                metrics.log_ns3_event(event.payload);
+            }
             if let Err(err) = driver.shutdown().await {
                 tracing::warn!(error = %err, "failed to shutdown ns3 driver cleanly");
             }
