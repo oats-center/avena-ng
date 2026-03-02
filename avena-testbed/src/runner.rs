@@ -10,6 +10,7 @@ use crate::ns3_driver::Ns3DriverProcess;
 use crate::pki::TestPki;
 use crate::scenario::{EmulationBackend, Scenario};
 use crate::status::Status;
+use crate::telemetry::new_run_id;
 use crate::topology::TestTopology;
 use std::path::Path;
 use std::sync::Arc;
@@ -88,6 +89,9 @@ impl TestRunner {
         let status = Status::new();
 
         status.message(&format!("Running scenario: {}", scenario.name));
+
+        let run_id = new_run_id();
+        tracing::info!(run_id = %run_id, "starting testbed run");
 
         tracing::debug!("creating metrics logger at {:?}", output_path);
         let metrics = Arc::new(MetricsLogger::new(output_path)?);
@@ -197,7 +201,7 @@ impl TestRunner {
 
         if let Some(driver) = ns3_driver.as_mut() {
             for event in driver.drain_events() {
-                metrics.log_ns3_event(event.payload);
+                metrics.log_ns3_event_with_run_id(&run_id, event.payload);
             }
             if let Err(err) = driver.shutdown().await {
                 tracing::warn!(error = %err, "failed to shutdown ns3 driver cleanly");

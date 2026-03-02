@@ -7,6 +7,7 @@ pub mod pki;
 pub mod runner;
 pub mod scenario;
 pub mod status;
+pub mod telemetry;
 pub mod topology;
 
 pub use events::{EventError, EventExecutor, TestResult};

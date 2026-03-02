@@ -4,6 +4,7 @@
 //! results to a jsonl file for post-hoc analysis.
 
 use crate::scenario::Assertion;
+use crate::telemetry::{subject_for_ns3_payload, TELEMETRY_SCHEMA_VERSION};
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -184,11 +185,21 @@ impl MetricsLogger {
     }
 
     pub fn log_ns3_event(&self, data: serde_json::Value) {
+        self.log_ns3_event_with_run_id("legacy", data);
+    }
+
+    pub fn log_ns3_event_with_run_id(&self, run_id: &str, payload: serde_json::Value) {
+        let subject = subject_for_ns3_payload(run_id, &payload);
         self.log(MetricEvent {
             timestamp_ms: self.elapsed_ms(),
             event_type: "ns3_event".to_string(),
             node: None,
-            data,
+            data: serde_json::json!({
+                "schema_version": TELEMETRY_SCHEMA_VERSION,
+                "run_id": run_id,
+                "subject": subject,
+                "payload": payload,
+            }),
         });
     }
 
@@ -501,7 +512,8 @@ mod tests {
             250,
             150,
         );
-        logger.log_ns3_event(serde_json::json!({"type":"realtime","lag_ms":5}));
+        logger
+            .log_ns3_event_with_run_id("run123", serde_json::json!({"type":"realtime","lag_ms":5}));
         logger.flush();
 
         let content = std::fs::read_to_string(temp.path()).unwrap();
@@ -513,6 +525,8 @@ mod tests {
         assert!(lines[2].contains("link_changed"));
         assert!(lines[3].contains("convergence_metric"));
         assert!(lines[4].contains("ns3_event"));
+        assert!(lines[4].contains("avena.v1.run123.ns3.realtime"));
+        assert!(lines[4].contains("schema_version"));
     }
 
     #[test]
