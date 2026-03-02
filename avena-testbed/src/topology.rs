@@ -4,7 +4,10 @@
 //! connects them with veth pairs, and manages avenad process lifecycle.
 
 use crate::pki::{NodePaths, TestPki};
-use crate::scenario::{NodeConfig, Scenario};
+use crate::ns3_plumbing::{
+    apply_plan, endpoint_setup_plan_root_only, teardown_endpoint_port, Ns3EndpointNames,
+};
+use crate::scenario::{BridgeConfig, EmulationBackend, LinkConfig, NodeConfig, Scenario};
 use avena_overlay::{
     AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, RoutingConfig, StaticPeerConfig, TunnelMode,
 };
@@ -24,6 +27,12 @@ pub enum TopologyError {
 
     #[error("link not found: {0}")]
     LinkNotFound(String),
+
+    #[error("invalid ns3 radio reference '{value}', expected '<node_id>:<radio_id>'")]
+    InvalidRadioRef { value: String },
+
+    #[error("ns3 plumbing error: {0}")]
+    Ns3Plumbing(String),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -62,6 +71,18 @@ pub struct TestTopology {
     nodes: HashMap<String, NodeInstance>,
     veth_pairs: Vec<VethPair>,
     bridges: Vec<BridgeInstance>,
+    ns3_ports: Vec<Ns3EndpointPortPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct Ns3EndpointPortPlan {
+    node_id: String,
+    radio_id: String,
+    if_ns: String,
+    if_root: String,
+    if_tap: String,
+    if_bridge: String,
+    underlay_ip: std::net::Ipv4Addr,
 }
 
 impl std::fmt::Debug for TestTopology {
@@ -70,6 +91,7 @@ impl std::fmt::Debug for TestTopology {
             .field("nodes", &self.nodes.keys().collect::<Vec<_>>())
             .field("veth_pairs", &self.veth_pairs)
             .field("bridges", &self.bridges)
+            .field("ns3_ports", &self.ns3_ports)
             .finish()
     }
 }
@@ -80,6 +102,7 @@ impl TestTopology {
             nodes: HashMap::new(),
             veth_pairs: Vec::new(),
             bridges: Vec::new(),
+            ns3_ports: Vec::new(),
         }
     }
 
@@ -106,42 +129,145 @@ impl TestTopology {
             );
         }
 
-        for link_config in &scenario.links {
-            let (node_a, node_b) = &link_config.endpoints;
-            let link_id = link_config.resolved_link_id();
+        match scenario.emulation.backend {
+            EmulationBackend::Netem => {
+                for link_config in &scenario.links {
+                    let (node_a, node_b) = &link_config.endpoints;
+                    let link_id = link_config.resolved_link_id();
 
-            let veth_a = format!("v{}a", subnet_counter);
-            let veth_b = format!("v{}b", subnet_counter);
+                    let veth_a = format!("v{}a", subnet_counter);
+                    let veth_b = format!("v{}b", subnet_counter);
 
-            self.create_veth_pair(&veth_a, &veth_b).await?;
+                    self.create_veth_pair(&veth_a, &veth_b).await?;
 
-            let ip_a = std::net::Ipv4Addr::new(10, subnet_counter, 0, 1);
-            let ip_b = std::net::Ipv4Addr::new(10, subnet_counter, 0, 2);
+                    let ip_a = std::net::Ipv4Addr::new(10, subnet_counter, 0, 1);
+                    let ip_b = std::net::Ipv4Addr::new(10, subnet_counter, 0, 2);
 
-            if let Some(node) = self.nodes.get_mut(node_a) {
-                node.underlay_ips.push((veth_a.clone(), ip_a));
+                    if let Some(node) = self.nodes.get_mut(node_a) {
+                        node.underlay_ips.push((veth_a.clone(), ip_a));
+                    }
+                    if let Some(node) = self.nodes.get_mut(node_b) {
+                        node.underlay_ips.push((veth_b.clone(), ip_b));
+                    }
+
+                    self.veth_pairs.push(VethPair {
+                        link_id,
+                        veth_a,
+                        veth_b,
+                        node_a: node_a.clone(),
+                        node_b: node_b.clone(),
+                    });
+
+                    subnet_counter = subnet_counter.wrapping_add(1);
+                }
+
+                for bridge_config in &scenario.bridges {
+                    self.setup_bridge(bridge_config, &mut subnet_counter).await?;
+                }
             }
-            if let Some(node) = self.nodes.get_mut(node_b) {
-                node.underlay_ips.push((veth_b.clone(), ip_b));
+            EmulationBackend::Ns3 => {
+                for link_config in &scenario.links {
+                    self.setup_ns3_link(link_config, &mut subnet_counter).await?;
+                }
+
+                for bridge_config in &scenario.bridges {
+                    self.setup_ns3_bridge(bridge_config, &mut subnet_counter)
+                        .await?;
+                }
             }
-
-            self.veth_pairs.push(VethPair {
-                link_id,
-                veth_a,
-                veth_b,
-                node_a: node_a.clone(),
-                node_b: node_b.clone(),
-            });
-
-            subnet_counter = subnet_counter.wrapping_add(1);
-        }
-
-        for bridge_config in &scenario.bridges {
-            self.setup_bridge(bridge_config, &mut subnet_counter)
-                .await?;
         }
 
         Ok(())
+    }
+
+    async fn setup_ns3_link(
+        &mut self,
+        config: &LinkConfig,
+        subnet_counter: &mut u8,
+    ) -> Result<(), TopologyError> {
+        let subnet = *subnet_counter;
+        *subnet_counter = subnet_counter.wrapping_add(1);
+
+        let [a_plan, b_plan] = ns3_port_plan_for_link(config, subnet)?;
+        self.setup_ns3_port(&a_plan).await?;
+        self.setup_ns3_port(&b_plan).await?;
+
+        let link_id = config.resolved_link_id();
+
+        let node_a = self
+            .nodes
+            .get_mut(&a_plan.node_id)
+            .ok_or_else(|| TopologyError::NodeNotFound(a_plan.node_id.clone()))?;
+        node_a
+            .underlay_ips
+            .push((a_plan.if_ns.clone(), a_plan.underlay_ip));
+
+        let node_b = self
+            .nodes
+            .get_mut(&b_plan.node_id)
+            .ok_or_else(|| TopologyError::NodeNotFound(b_plan.node_id.clone()))?;
+        node_b
+            .underlay_ips
+            .push((b_plan.if_ns.clone(), b_plan.underlay_ip));
+
+        self.veth_pairs.push(VethPair {
+            link_id,
+            veth_a: a_plan.if_ns.clone(),
+            veth_b: b_plan.if_ns.clone(),
+            node_a: a_plan.node_id.clone(),
+            node_b: b_plan.node_id.clone(),
+        });
+
+        self.ns3_ports.push(a_plan);
+        self.ns3_ports.push(b_plan);
+
+        Ok(())
+    }
+
+    async fn setup_ns3_bridge(
+        &mut self,
+        config: &BridgeConfig,
+        subnet_counter: &mut u8,
+    ) -> Result<(), TopologyError> {
+        let subnet = *subnet_counter;
+        *subnet_counter = subnet_counter.wrapping_add(1);
+
+        let plans = ns3_port_plan_for_bridge(config, subnet)?;
+        for plan in plans {
+            self.setup_ns3_port(&plan).await?;
+            let node = self
+                .nodes
+                .get_mut(&plan.node_id)
+                .ok_or_else(|| TopologyError::NodeNotFound(plan.node_id.clone()))?;
+            node.underlay_ips.push((plan.if_ns.clone(), plan.underlay_ip));
+            self.ns3_ports.push(plan);
+        }
+
+        Ok(())
+    }
+
+    async fn setup_ns3_port(&self, port: &Ns3EndpointPortPlan) -> Result<(), TopologyError> {
+        tracing::debug!(
+            node = %port.node_id,
+            radio = %port.radio_id,
+            if_ns = %port.if_ns,
+            if_root = %port.if_root,
+            if_tap = %port.if_tap,
+            if_bridge = %port.if_bridge,
+            "creating ns3 endpoint plumbing"
+        );
+
+        let names = Ns3EndpointNames {
+            ns_if: port.if_ns.clone(),
+            root_if: port.if_root.clone(),
+            tap_if: port.if_tap.clone(),
+            bridge_if: port.if_bridge.clone(),
+        };
+
+        let plan = endpoint_setup_plan_root_only(&names);
+        apply_plan(&plan)
+            .await
+            .map_err(|e| TopologyError::Ns3Plumbing(e.to_string()))
     }
 
     async fn setup_bridge(
@@ -270,6 +396,16 @@ impl TestTopology {
             let _ = self.run_cmd("ip", &["link", "del", &veth.veth_a]).await;
         }
 
+        for port in &self.ns3_ports {
+            let names = Ns3EndpointNames {
+                ns_if: port.if_ns.clone(),
+                root_if: port.if_root.clone(),
+                tap_if: port.if_tap.clone(),
+                bridge_if: port.if_bridge.clone(),
+            };
+            let _ = teardown_endpoint_port(&names).await;
+        }
+
         for bridge in &self.bridges {
             for (veth_br, _) in &bridge.veth_pairs {
                 let _ = self.run_cmd("ip", &["link", "del", veth_br]).await;
@@ -282,6 +418,7 @@ impl TestTopology {
         self.nodes.clear();
         self.veth_pairs.clear();
         self.bridges.clear();
+        self.ns3_ports.clear();
 
         Ok(())
     }
@@ -560,6 +697,79 @@ impl TestTopology {
     }
 }
 
+fn parse_radio_ref(value: &str) -> Result<(&str, &str), TopologyError> {
+    let Some((node_id, radio_id)) = value.split_once(':') else {
+        return Err(TopologyError::InvalidRadioRef {
+            value: value.to_string(),
+        });
+    };
+
+    if node_id.is_empty() || radio_id.is_empty() || radio_id.contains(':') {
+        return Err(TopologyError::InvalidRadioRef {
+            value: value.to_string(),
+        });
+    }
+
+    Ok((node_id, radio_id))
+}
+
+fn ns3_port_plan_for_link(
+    link: &LinkConfig,
+    subnet: u8,
+) -> Result<[Ns3EndpointPortPlan; 2], TopologyError> {
+    let link_id = link.resolved_link_id();
+    let (node_a, radio_a) = parse_radio_ref(&link.endpoints.0)?;
+    let (node_b, radio_b) = parse_radio_ref(&link.endpoints.1)?;
+
+    let names_a = Ns3EndpointNames::from_ids(&link_id, node_a, radio_a);
+    let names_b = Ns3EndpointNames::from_ids(&link_id, node_b, radio_b);
+
+    Ok([
+        Ns3EndpointPortPlan {
+            node_id: node_a.to_string(),
+            radio_id: radio_a.to_string(),
+            if_ns: names_a.ns_if,
+            if_root: names_a.root_if,
+            if_tap: names_a.tap_if,
+            if_bridge: names_a.bridge_if,
+            underlay_ip: std::net::Ipv4Addr::new(10, subnet, 0, 1),
+        },
+        Ns3EndpointPortPlan {
+            node_id: node_b.to_string(),
+            radio_id: radio_b.to_string(),
+            if_ns: names_b.ns_if,
+            if_root: names_b.root_if,
+            if_tap: names_b.tap_if,
+            if_bridge: names_b.bridge_if,
+            underlay_ip: std::net::Ipv4Addr::new(10, subnet, 0, 2),
+        },
+    ])
+}
+
+fn ns3_port_plan_for_bridge(
+    bridge: &BridgeConfig,
+    subnet: u8,
+) -> Result<Vec<Ns3EndpointPortPlan>, TopologyError> {
+    bridge
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, member)| {
+            let (node_id, radio_id) = parse_radio_ref(member)?;
+            let names = Ns3EndpointNames::from_ids(&bridge.id, node_id, radio_id);
+            Ok(Ns3EndpointPortPlan {
+                node_id: node_id.to_string(),
+                radio_id: radio_id.to_string(),
+                if_ns: names.ns_if,
+                if_root: names.root_if,
+                if_tap: names.tap_if,
+                if_bridge: names.bridge_if,
+                underlay_ip: std::net::Ipv4Addr::new(10, subnet, 0, (idx as u8) + 1),
+            })
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 fn default_tunnel_mode_for_testbed() -> TunnelMode {
     TunnelMode::PreferKernel
@@ -579,12 +789,75 @@ impl Default for TestTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenario::LinkConfig;
 
     #[test]
     fn test_topology_new() {
         let topo = TestTopology::new();
         assert!(topo.nodes.is_empty());
         assert!(topo.veth_pairs.is_empty());
+    }
+
+    #[test]
+    fn parse_radio_ref_accepts_node_radio_format() {
+        let (node, radio) = parse_radio_ref("nodeA:wifi0").expect("valid radio ref");
+        assert_eq!(node, "nodeA");
+        assert_eq!(radio, "wifi0");
+    }
+
+    #[test]
+    fn parse_radio_ref_rejects_invalid_values() {
+        for value in ["nodeA", "nodeA:", ":wifi0", "nodeA:wifi0:extra"] {
+            assert!(parse_radio_ref(value).is_err(), "value should fail: {value}");
+        }
+    }
+
+    #[test]
+    fn ns3_link_port_plan_assigns_expected_ips_and_names() {
+        let link = LinkConfig {
+            id: Some("ab-wifi".to_string()),
+            endpoints: ("nodeA:wifi0".to_string(), "nodeB:wifi1".to_string()),
+            latency_ms: 10,
+            bandwidth_kbps: 1000,
+            loss_percent: 0.0,
+            enabled: true,
+            medium: Some("wifi".to_string()),
+        };
+
+        let [a, b] = ns3_port_plan_for_link(&link, 42).expect("link plan");
+        assert_eq!(a.node_id, "nodeA");
+        assert_eq!(a.radio_id, "wifi0");
+        assert_eq!(a.underlay_ip, std::net::Ipv4Addr::new(10, 42, 0, 1));
+        assert!(a.if_ns.starts_with('n'));
+        assert!(a.if_root.starts_with('r'));
+        assert!(a.if_tap.starts_with('t'));
+        assert!(a.if_bridge.starts_with('b'));
+
+        assert_eq!(b.node_id, "nodeB");
+        assert_eq!(b.radio_id, "wifi1");
+        assert_eq!(b.underlay_ip, std::net::Ipv4Addr::new(10, 42, 0, 2));
+        assert_ne!(a.if_ns, b.if_ns);
+    }
+
+    #[test]
+    fn ns3_bridge_port_plan_assigns_member_ips() {
+        let bridge = BridgeConfig {
+            id: "farm".to_string(),
+            nodes: vec![
+                "gateway:wifi0".to_string(),
+                "sensorA:wifi0".to_string(),
+                "sensorB:wifi0".to_string(),
+            ],
+            latency_ms: 0,
+            bandwidth_kbps: 1_000_000,
+            loss_percent: 0.0,
+        };
+
+        let plans = ns3_port_plan_for_bridge(&bridge, 43).expect("bridge plan");
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].underlay_ip, std::net::Ipv4Addr::new(10, 43, 0, 1));
+        assert_eq!(plans[1].underlay_ip, std::net::Ipv4Addr::new(10, 43, 0, 2));
+        assert_eq!(plans[2].underlay_ip, std::net::Ipv4Addr::new(10, 43, 0, 3));
     }
 
     #[cfg(target_os = "linux")]

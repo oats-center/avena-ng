@@ -95,6 +95,13 @@ pub enum Ns3PlumbingError {
 
 #[must_use]
 pub fn endpoint_setup_plan(names: &Ns3EndpointNames, node_pid: u32) -> Vec<PlannedCommand> {
+    let mut plan = endpoint_setup_plan_root_only(names);
+    plan.insert(4, attach_ns_interface_to_pid_plan(names, node_pid));
+    plan
+}
+
+#[must_use]
+pub fn endpoint_setup_plan_root_only(names: &Ns3EndpointNames) -> Vec<PlannedCommand> {
     vec![
         PlannedCommand::best_effort(
             "ip",
@@ -134,16 +141,6 @@ pub fn endpoint_setup_plan(names: &Ns3EndpointNames, node_pid: u32) -> Vec<Plann
                 "peer".to_string(),
                 "name".to_string(),
                 names.ns_if.clone(),
-            ],
-        ),
-        PlannedCommand::required(
-            "ip",
-            &[
-                "link".to_string(),
-                "set".to_string(),
-                names.ns_if.clone(),
-                "netns".to_string(),
-                node_pid.to_string(),
             ],
         ),
         PlannedCommand::required(
@@ -215,6 +212,20 @@ pub fn endpoint_setup_plan(names: &Ns3EndpointNames, node_pid: u32) -> Vec<Plann
             ],
         ),
     ]
+}
+
+#[must_use]
+pub fn attach_ns_interface_to_pid_plan(names: &Ns3EndpointNames, node_pid: u32) -> PlannedCommand {
+    PlannedCommand::required(
+        "ip",
+        &[
+            "link".to_string(),
+            "set".to_string(),
+            names.ns_if.clone(),
+            "netns".to_string(),
+            node_pid.to_string(),
+        ],
+    )
 }
 
 #[must_use]
@@ -412,5 +423,30 @@ mod tests {
 
         let err = names.validate().unwrap_err();
         assert!(err.to_string().contains("exceeds IFNAMSIZ"));
+    }
+
+    #[test]
+    fn setup_root_only_plan_has_no_netns_move_step() {
+        let names = Ns3EndpointNames::from_ids("ab-wifi", "nodeA", "wifi0");
+        let plan = endpoint_setup_plan_root_only(&names);
+
+        assert_eq!(plan.len(), 11);
+        assert!(plan.iter().all(|step| !step.args.iter().any(|arg| arg == "netns")));
+        assert_eq!(
+            plan[3].display(),
+            format!(
+                "ip link add {} type veth peer name {}",
+                names.root_if, names.ns_if
+            )
+        );
+    }
+
+    #[test]
+    fn attach_plan_moves_ns_interface_to_pid() {
+        let names = Ns3EndpointNames::from_ids("ab-wifi", "nodeA", "wifi0");
+        let step = attach_ns_interface_to_pid_plan(&names, 1234);
+
+        assert_eq!(step.display(), format!("ip link set {} netns 1234", names.ns_if));
+        assert!(!step.allow_failure);
     }
 }

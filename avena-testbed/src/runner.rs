@@ -7,7 +7,7 @@ use crate::events::{EventError, EventExecutor, TestResult};
 use crate::links::LinkManager;
 use crate::metrics::{LogParser, MetricsLogger};
 use crate::pki::TestPki;
-use crate::scenario::Scenario;
+use crate::scenario::{EmulationBackend, Scenario};
 use crate::status::Status;
 use crate::topology::TestTopology;
 use std::path::Path;
@@ -105,8 +105,10 @@ impl TestRunner {
         topology.start_nodes(&pki, scenario, log_dir).await?;
 
         let mut links = LinkManager::new();
-        links.initialize_from_topology(&topology, &scenario.links, &scenario.bridges);
-        links.apply_initial_state().await?;
+        if backend_uses_netem(scenario.emulation.backend) {
+            links.initialize_from_topology(&topology, &scenario.links, &scenario.bridges);
+            links.apply_initial_state().await?;
+        }
 
         for node in &scenario.nodes {
             let config_path = pki.temp_dir().join(format!("{}.toml", node.id));
@@ -216,6 +218,10 @@ impl TestRunner {
     }
 }
 
+fn backend_uses_netem(backend: EmulationBackend) -> bool {
+    matches!(backend, EmulationBackend::Netem)
+}
+
 async fn wait_for_node_ready(
     topology: &mut TestTopology,
     node_id: &str,
@@ -298,6 +304,7 @@ impl Default for TestRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenario::EmulationBackend;
 
     #[test]
     fn test_runner_builder() {
@@ -324,5 +331,11 @@ mod tests {
     fn node_startup_failed_detects_init_failure_marker() {
         let log = "ERROR avenad: Failed to initialize avenad: tunnel error\n";
         assert!(node_startup_failed(log));
+    }
+
+    #[test]
+    fn backend_uses_netem_only_for_netem_backend() {
+        assert!(backend_uses_netem(EmulationBackend::Netem));
+        assert!(!backend_uses_netem(EmulationBackend::Ns3));
     }
 }
