@@ -37,6 +37,8 @@ pub struct EmulationConfig {
     pub backend: EmulationBackend,
     #[serde(default)]
     pub ns3: Ns3Config,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -45,6 +47,27 @@ pub enum EmulationBackend {
     #[default]
     Netem,
     Ns3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryConfig {
+    #[serde(default = "default_publish_nats")]
+    pub publish_nats: bool,
+    #[serde(default)]
+    pub nats_url: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            publish_nats: default_publish_nats(),
+            nats_url: None,
+        }
+    }
+}
+
+fn default_publish_nats() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -355,6 +378,7 @@ impl Scenario {
 
         self.validate_ns3_node_mobility()?;
         self.validate_ns3_radio_configuration()?;
+        self.validate_telemetry_configuration()?;
 
         if self.emulation.backend != EmulationBackend::Ns3 {
             for link in &self.links {
@@ -615,6 +639,22 @@ impl Scenario {
                     )));
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    fn validate_telemetry_configuration(&self) -> Result<(), ScenarioError> {
+        if self
+            .emulation
+            .telemetry
+            .nats_url
+            .as_ref()
+            .is_some_and(|url| url.trim().is_empty())
+        {
+            return Err(ScenarioError::Validation(
+                "emulation.telemetry.nats_url must not be empty".to_string(),
+            ));
         }
 
         Ok(())
@@ -1453,6 +1493,71 @@ members = ["nodeA:wifi0", "nodeB:wifiX"]
         assert!(
             err.to_string()
                 .contains("references unknown radio 'wifiX' on node 'nodeB'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn telemetry_config_parses_and_validates() {
+        let toml = r#"
+name = "telemetry"
+duration_secs = 10
+
+[emulation]
+backend = "netem"
+
+[emulation.telemetry]
+publish_nats = true
+nats_url = "nats://127.0.0.1:4222"
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let scenario = Scenario::from_toml(toml).unwrap();
+        assert!(scenario.emulation.telemetry.publish_nats);
+        assert_eq!(
+            scenario.emulation.telemetry.nats_url.as_deref(),
+            Some("nats://127.0.0.1:4222")
+        );
+    }
+
+    #[test]
+    fn telemetry_rejects_empty_nats_url() {
+        let toml = r#"
+name = "telemetry-empty"
+duration_secs = 10
+
+[emulation]
+backend = "netem"
+
+[emulation.telemetry]
+nats_url = "   "
+
+[[nodes]]
+id = "nodeA"
+
+[[nodes]]
+id = "nodeB"
+
+[[links]]
+endpoints = ["nodeA", "nodeB"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let err = Scenario::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("emulation.telemetry.nats_url must not be empty"),
             "unexpected error: {err}"
         );
     }

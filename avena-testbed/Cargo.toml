@@ -10,6 +10,7 @@ name = "avena-testbed"
 path = "src/bin/avena-testbed.rs"
 
 [dependencies]
+async-nats = "0.39"
 avena-overlay = { path = "../avena-overlay" }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }

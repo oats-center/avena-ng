@@ -11,12 +11,14 @@ use crate::pki::TestPki;
 use crate::scenario::{EmulationBackend, Scenario};
 use crate::status::Status;
 use crate::telemetry::new_run_id;
+use crate::telemetry_bus::TelemetryBus;
 use crate::topology::TestTopology;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 const NODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const NODE_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -40,6 +42,9 @@ pub enum RunnerError {
 
     #[error("ns3 driver error: {0}")]
     Ns3Driver(#[from] crate::ns3_driver::Ns3DriverError),
+
+    #[error("telemetry bus error: {0}")]
+    TelemetryBus(#[from] crate::telemetry_bus::TelemetryBusError),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -92,6 +97,14 @@ impl TestRunner {
 
         let run_id = new_run_id();
         tracing::info!(run_id = %run_id, "starting testbed run");
+        let telemetry_bus = Arc::new(TelemetryBus::from_config(
+            &run_id,
+            &scenario.emulation.telemetry,
+        )
+        .await?);
+        if let Err(err) = telemetry_bus.publish_scenario_inventory(scenario).await {
+            tracing::warn!(error = %err, "failed to publish scenario inventory telemetry");
+        }
 
         tracing::debug!("creating metrics logger at {:?}", output_path);
         let metrics = Arc::new(MetricsLogger::new(output_path)?);
@@ -109,6 +122,7 @@ impl TestRunner {
         phase.done();
 
         let mut ns3_driver = Ns3DriverProcess::start_if_needed(scenario, pki.temp_dir()).await?;
+        let mut ns3_event_task: Option<JoinHandle<()>> = None;
         if let Some(driver) = ns3_driver.as_ref() {
             tracing::info!(
                 config = %driver.config_path.display(),
@@ -116,12 +130,35 @@ impl TestRunner {
             );
         }
 
+        if backend_streams_ns3_events(scenario.emulation.backend) {
+            if let Some(driver) = ns3_driver.as_mut() {
+                if let Some(mut event_rx) = driver.take_event_receiver() {
+                    let metrics = Arc::clone(&metrics);
+                    let telemetry_bus = Arc::clone(&telemetry_bus);
+                    let run_id = run_id.clone();
+                    let emit_nats = backend_emits_ns3_telemetry(scenario.emulation.backend);
+                    ns3_event_task = Some(tokio::spawn(async move {
+                        while let Some(event) = event_rx.recv().await {
+                            metrics.log_ns3_event_with_run_id(&run_id, event.payload.clone());
+                            if emit_nats {
+                                if let Err(err) = telemetry_bus.publish_ns3_payload(&event.payload).await
+                                {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "failed to publish ns3 telemetry event"
+                                    );
+                                }
+                            }
+                        }
+                    }));
+                }
+            }
+        }
+
         let phase = status.phase(&format!("Starting {} nodes", scenario.nodes.len()));
         let log_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
         if let Err(err) = topology.start_nodes(&pki, scenario, log_dir).await {
-            if let Some(driver) = ns3_driver.as_mut() {
-                let _ = driver.shutdown().await;
-            }
+            shutdown_ns3_driver(&mut ns3_driver, &mut ns3_event_task).await;
             return Err(err.into());
         }
 
@@ -158,9 +195,7 @@ impl TestRunner {
         phase.done_with(&format!("{running_count} running"));
 
         if !not_ready_nodes.is_empty() {
-            if let Some(driver) = ns3_driver.as_mut() {
-                let _ = driver.shutdown().await;
-            }
+            shutdown_ns3_driver(&mut ns3_driver, &mut ns3_event_task).await;
             if !self.keep_namespaces {
                 let phase = status.phase("Cleaning up");
                 topology.teardown().await?;
@@ -180,6 +215,7 @@ impl TestRunner {
             Arc::clone(&topology),
             Arc::clone(&links),
             Arc::clone(&metrics),
+            Arc::clone(&telemetry_bus),
             log_dir.to_path_buf(),
             node_ids,
         );
@@ -199,14 +235,7 @@ impl TestRunner {
             .await;
         phase.done();
 
-        if let Some(driver) = ns3_driver.as_mut() {
-            for event in driver.drain_events() {
-                metrics.log_ns3_event_with_run_id(&run_id, event.payload);
-            }
-            if let Err(err) = driver.shutdown().await {
-                tracing::warn!(error = %err, "failed to shutdown ns3 driver cleanly");
-            }
-        }
+        shutdown_ns3_driver(&mut ns3_driver, &mut ns3_event_task).await;
 
         let mut topo = topology.lock().await;
 
@@ -253,6 +282,31 @@ impl TestRunner {
 
 fn backend_uses_netem(backend: EmulationBackend) -> bool {
     matches!(backend, EmulationBackend::Netem)
+}
+
+fn backend_emits_ns3_telemetry(backend: EmulationBackend) -> bool {
+    matches!(backend, EmulationBackend::Ns3)
+}
+
+fn backend_streams_ns3_events(backend: EmulationBackend) -> bool {
+    matches!(backend, EmulationBackend::Ns3)
+}
+
+async fn shutdown_ns3_driver(
+    ns3_driver: &mut Option<Ns3DriverProcess>,
+    ns3_event_task: &mut Option<JoinHandle<()>>,
+) {
+    if let Some(driver) = ns3_driver.as_mut() {
+        if let Err(err) = driver.shutdown().await {
+            tracing::warn!(error = %err, "failed to shutdown ns3 driver cleanly");
+        }
+    }
+
+    if let Some(task) = ns3_event_task.take() {
+        if let Err(err) = task.await {
+            tracing::warn!(error = %err, "ns3 event forwarding task join failed");
+        }
+    }
 }
 
 async fn wait_for_node_ready(
@@ -370,5 +424,17 @@ mod tests {
     fn backend_uses_netem_only_for_netem_backend() {
         assert!(backend_uses_netem(EmulationBackend::Netem));
         assert!(!backend_uses_netem(EmulationBackend::Ns3));
+    }
+
+    #[test]
+    fn backend_emits_ns3_telemetry_only_for_ns3_backend() {
+        assert!(!backend_emits_ns3_telemetry(EmulationBackend::Netem));
+        assert!(backend_emits_ns3_telemetry(EmulationBackend::Ns3));
+    }
+
+    #[test]
+    fn backend_streams_ns3_events_only_for_ns3_backend() {
+        assert!(!backend_streams_ns3_events(EmulationBackend::Netem));
+        assert!(backend_streams_ns3_events(EmulationBackend::Ns3));
     }
 }

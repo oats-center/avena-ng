@@ -6,6 +6,7 @@
 use crate::links::{LinkError, LinkManager};
 use crate::metrics::{AvenadEventType, LogParser, MetricsLogger};
 use crate::scenario::{AssertCondition, Assertion, Event, EventAction};
+use crate::telemetry_bus::TelemetryBus;
 use crate::topology::{TestTopology, TopologyError};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -112,6 +113,7 @@ pub struct EventExecutor {
     topology: Arc<Mutex<TestTopology>>,
     links: Arc<Mutex<LinkManager>>,
     metrics: Arc<MetricsLogger>,
+    telemetry_bus: Arc<TelemetryBus>,
     log_dir: PathBuf,
     node_ids: Vec<String>,
 }
@@ -127,6 +129,7 @@ impl EventExecutor {
         topology: Arc<Mutex<TestTopology>>,
         links: Arc<Mutex<LinkManager>>,
         metrics: Arc<MetricsLogger>,
+        telemetry_bus: Arc<TelemetryBus>,
         log_dir: PathBuf,
         node_ids: Vec<String>,
     ) -> Self {
@@ -134,6 +137,7 @@ impl EventExecutor {
             topology,
             links,
             metrics,
+            telemetry_bus,
             log_dir,
             node_ids,
         }
@@ -304,6 +308,9 @@ impl EventExecutor {
 
                         assertions_passed += 1;
                         self.metrics.log_assertion_result(assertion, true);
+                        if let Err(err) = self.telemetry_bus.publish_assertion_result(assertion, true).await {
+                            tracing::warn!(error = %err, "failed to publish assertion telemetry");
+                        }
                         tracing::debug!(
                             condition = ?assertion.condition,
                             elapsed_secs = elapsed,
@@ -313,6 +320,13 @@ impl EventExecutor {
                     }
                     Err(e) => {
                         self.metrics.log_assertion_result(assertion, false);
+                        if let Err(err) = self
+                            .telemetry_bus
+                            .publish_assertion_result(assertion, false)
+                            .await
+                        {
+                            tracing::warn!(error = %err, "failed to publish assertion telemetry");
+                        }
                         return Err(e);
                     }
                 }

@@ -37,7 +37,7 @@ pub struct Ns3DriverProcess {
     child: Child,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
-    event_rx: UnboundedReceiver<Ns3DriverEvent>,
+    event_rx: Option<UnboundedReceiver<Ns3DriverEvent>>,
     pub config_path: PathBuf,
 }
 
@@ -215,7 +215,7 @@ impl Ns3DriverProcess {
             child,
             stdout_task,
             stderr_task,
-            event_rx,
+            event_rx: Some(event_rx),
             config_path,
         }))
     }
@@ -233,11 +233,19 @@ impl Ns3DriverProcess {
     }
 
     pub fn drain_events(&mut self) -> Vec<Ns3DriverEvent> {
+        let Some(event_rx) = self.event_rx.as_mut() else {
+            return Vec::new();
+        };
+
         let mut events = Vec::new();
-        while let Ok(event) = self.event_rx.try_recv() {
+        while let Ok(event) = event_rx.try_recv() {
             events.push(event);
         }
         events
+    }
+
+    pub fn take_event_receiver(&mut self) -> Option<UnboundedReceiver<Ns3DriverEvent>> {
+        self.event_rx.take()
     }
 }
 
@@ -593,6 +601,37 @@ bandwidth_kbps = 1000
             events.iter().any(|event| event.payload["type"] == "realtime"),
             "expected realtime event"
         );
+
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn take_event_receiver_streams_events() {
+        let toml = ns3_scenario_toml(
+            "[\"-c\", \"echo ns3_ready; echo '{\\\"type\\\":\\\"realtime\\\",\\\"lag_ms\\\":11}'; sleep 0.2\"]",
+            5,
+        );
+        let scenario = Scenario::from_toml(&toml).expect("valid scenario");
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        let mut handle = Ns3DriverProcess::start_if_needed(&scenario, temp.path())
+            .await
+            .expect("ns3 should start")
+            .expect("handle expected");
+
+        let mut rx = handle
+            .take_event_receiver()
+            .expect("receiver should be available");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event wait timeout")
+            .expect("event channel closed early");
+        assert_eq!(event.payload["type"], "realtime");
+        assert_eq!(event.payload["lag_ms"], 11);
+
+        assert!(handle.take_event_receiver().is_none());
+        assert!(handle.drain_events().is_empty());
 
         handle.shutdown().await.expect("shutdown");
     }
