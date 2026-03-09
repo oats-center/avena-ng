@@ -34,7 +34,7 @@ pub struct BabeldConfig {
     #[serde(default = "default_debug_level")]
     pub debug_level: u8,
 
-    /// Babeld state file (-S). Defaults to an ephemeral, avenad-controlled path.
+    /// Babeld state file (-S). Defaults to an ephemeral, avena-overlay-controlled path.
     #[serde(default = "default_state_path")]
     pub state_path: PathBuf,
 
@@ -48,7 +48,7 @@ pub struct BabeldConfig {
 
     /// Force babeld's `ipv6-subtrees` mode.
     ///
-    /// When unset, avenad may enable this automatically on kernels that don't
+    /// When unset, avena-overlay may enable this automatically on kernels that don't
     /// support IPv6 policy routing rules (where `ip -6 rule show` fails).
     #[serde(default)]
     pub ipv6_subtrees: Option<bool>,
@@ -233,7 +233,7 @@ impl BabeldController {
         // babeld defaults to /etc/babeld.conf, which makes behaviour depend on host state.
         cmd.arg("-c").arg("/dev/null");
 
-        // Keep persistent state in an avenad-controlled location.
+        // Keep persistent state in an avena-overlay-controlled location.
         cmd.arg("-S").arg(&self.config.state_path);
 
         // Avoid writing a global pidfile.
@@ -263,7 +263,7 @@ impl BabeldController {
 
         // Many babeld builds refuse to start without at least one interface.
         // Configure interfaces up-front via -C statements so behaviour is fully
-        // controlled by avenad and does not depend on /etc/babeld.conf.
+        // controlled by avena-overlay and does not depend on /etc/babeld.conf.
         for iface in interfaces {
             cmd.arg("-C").arg(interface_tunnel_statement(iface));
         }

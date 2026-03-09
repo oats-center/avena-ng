@@ -314,7 +314,7 @@ async fn wait_for_node_ready(
                         node = %node_id,
                         status = ?status,
                         log = %log_path.display(),
-                        "avenad exited before startup readiness"
+                        "avena-overlay exited before startup readiness"
                     );
                     true
                 }
@@ -328,7 +328,7 @@ async fn wait_for_node_ready(
             tracing::error!(
                 node = %node_id,
                 log = %log_path.display(),
-                "avenad reported startup failure"
+                "avena-overlay reported startup failure"
             );
             return Ok(false);
         }
@@ -356,11 +356,11 @@ async fn wait_for_node_ready(
 fn node_startup_ready(log: &str) -> bool {
     log.contains("Discovery service initialized")
         || log.contains("Handshake listener bound")
-        || log.contains("Avenad running. Press Ctrl+C to stop.")
+        || log.contains("avena-overlay running. Press Ctrl+C to stop.")
 }
 
 fn node_startup_failed(log: &str) -> bool {
-    log.contains("Failed to initialize avenad")
+    log.contains("Failed to initialize avena-overlay")
 }
 
 impl Default for TestRunner {
@@ -382,22 +382,22 @@ mod tests {
 
     #[test]
     fn node_startup_ready_detects_success_markers() {
-        let log = "INFO avenad: Loaded configuration\nINFO avenad: Discovery service initialized\n";
+        let log = "INFO avena_overlay: Loaded configuration\nINFO avena_overlay: Discovery service initialized\n";
         assert!(node_startup_ready(log));
 
-        let log = "INFO avenad: Handshake listener bound\n";
+        let log = "INFO avena_overlay: Handshake listener bound\n";
         assert!(node_startup_ready(log));
     }
 
     #[test]
     fn node_startup_ready_ignores_early_non_ready_logs() {
-        let log = "INFO avenad: Loaded configuration\nINFO avenad: Tunnel backend created\n";
+        let log = "INFO avena_overlay: Loaded configuration\nINFO avena_overlay: Tunnel backend created\n";
         assert!(!node_startup_ready(log));
     }
 
     #[test]
     fn node_startup_failed_detects_init_failure_marker() {
-        let log = "ERROR avenad: Failed to initialize avenad: tunnel error\n";
+        let log = "ERROR avena_overlay: Failed to initialize avena-overlay: tunnel error\n";
         assert!(node_startup_failed(log));
     }
 

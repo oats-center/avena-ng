@@ -211,7 +211,7 @@ impl MetricsLogger {
 
     pub fn log_parsed_events(
         &self,
-        events: &[ParsedAvenadEvent],
+        events: &[ParsedOverlayEvent],
         scenario_start: chrono::DateTime<chrono::Utc>,
     ) {
         for event in events {
@@ -222,33 +222,33 @@ impl MetricsLogger {
                 .max(0) as u64;
 
             let (event_type, data) = match &event.event_type {
-                AvenadEventType::PeerDiscovered { peer_id, endpoint } => (
+                OverlayEventType::PeerDiscovered { peer_id, endpoint } => (
                     "peer_discovered",
                     serde_json::json!({
                         "peer_id": peer_id,
                         "endpoint": endpoint
                     }),
                 ),
-                AvenadEventType::HandshakeStarted { peer_id } => (
+                OverlayEventType::HandshakeStarted { peer_id } => (
                     "handshake_started",
                     serde_json::json!({
                         "peer_id": peer_id
                     }),
                 ),
-                AvenadEventType::PeerConnected { peer_id } => (
+                OverlayEventType::PeerConnected { peer_id } => (
                     "peer_connected",
                     serde_json::json!({
                         "peer_id": peer_id
                     }),
                 ),
-                AvenadEventType::PeerDisconnected { peer_id, reason } => (
+                OverlayEventType::PeerDisconnected { peer_id, reason } => (
                     "peer_disconnected",
                     serde_json::json!({
                         "peer_id": peer_id,
                         "reason": reason
                     }),
                 ),
-                AvenadEventType::Unknown { message } => (
+                OverlayEventType::Unknown { message } => (
                     "unknown_event",
                     serde_json::json!({
                         "message": message
@@ -265,7 +265,7 @@ impl MetricsLogger {
         }
     }
 
-    pub fn log_metrics_summary(&self, metrics: &AvenadMetrics) {
+    pub fn log_metrics_summary(&self, metrics: &OverlayMetrics) {
         self.log(MetricEvent {
             timestamp_ms: self.elapsed_ms(),
             event_type: "metrics_summary".to_string(),
@@ -283,14 +283,14 @@ impl MetricsLogger {
 }
 
 #[derive(Debug, Clone)]
-pub struct ParsedAvenadEvent {
+pub struct ParsedOverlayEvent {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub node: String,
-    pub event_type: AvenadEventType,
+    pub event_type: OverlayEventType,
 }
 
 #[derive(Debug, Clone)]
-pub enum AvenadEventType {
+pub enum OverlayEventType {
     PeerDiscovered { peer_id: String, endpoint: String },
     HandshakeStarted { peer_id: String },
     PeerConnected { peer_id: String },
@@ -310,7 +310,7 @@ impl LogParser {
         }
     }
 
-    pub fn parse_log_file(&mut self, node_id: &str, path: &Path) -> Vec<ParsedAvenadEvent> {
+    pub fn parse_log_file(&mut self, node_id: &str, path: &Path) -> Vec<ParsedOverlayEvent> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
@@ -319,7 +319,7 @@ impl LogParser {
         self.parse_log_content(node_id, &content)
     }
 
-    pub fn parse_log_content(&mut self, node_id: &str, content: &str) -> Vec<ParsedAvenadEvent> {
+    pub fn parse_log_content(&mut self, node_id: &str, content: &str) -> Vec<ParsedOverlayEvent> {
         let mut events = Vec::new();
 
         for line in content.lines() {
@@ -334,7 +334,7 @@ impl LogParser {
         events
     }
 
-    fn parse_line(&self, node_id: &str, line: &str) -> Option<ParsedAvenadEvent> {
+    fn parse_line(&self, node_id: &str, line: &str) -> Option<ParsedOverlayEvent> {
         let stripped = strip_ansi_codes(line);
 
         let timestamp = parse_timestamp(&stripped)?;
@@ -342,29 +342,29 @@ impl LogParser {
         if stripped.contains("Peer discovered") {
             let peer_id = extract_field(&stripped, "peer_id=")?;
             let endpoint = extract_field(&stripped, "endpoint=").unwrap_or_default();
-            return Some(ParsedAvenadEvent {
+            return Some(ParsedOverlayEvent {
                 timestamp,
                 node: node_id.to_string(),
-                event_type: AvenadEventType::PeerDiscovered { peer_id, endpoint },
+                event_type: OverlayEventType::PeerDiscovered { peer_id, endpoint },
             });
         }
 
         if stripped.contains("Peer connected") {
             let peer_id = extract_field(&stripped, "peer_id=")?;
-            return Some(ParsedAvenadEvent {
+            return Some(ParsedOverlayEvent {
                 timestamp,
                 node: node_id.to_string(),
-                event_type: AvenadEventType::PeerConnected { peer_id },
+                event_type: OverlayEventType::PeerConnected { peer_id },
             });
         }
 
         if stripped.contains("Starting handshake") || stripped.contains("Initiating handshake") {
             let peer_id = extract_field(&stripped, "peer_id=")
                 .or_else(|| extract_field(&stripped, "peer="))?;
-            return Some(ParsedAvenadEvent {
+            return Some(ParsedOverlayEvent {
                 timestamp,
                 node: node_id.to_string(),
-                event_type: AvenadEventType::HandshakeStarted { peer_id },
+                event_type: OverlayEventType::HandshakeStarted { peer_id },
             });
         }
 
@@ -377,18 +377,18 @@ impl LogParser {
             } else {
                 "disconnected".to_string()
             };
-            return Some(ParsedAvenadEvent {
+            return Some(ParsedOverlayEvent {
                 timestamp,
                 node: node_id.to_string(),
-                event_type: AvenadEventType::PeerDisconnected { peer_id, reason },
+                event_type: OverlayEventType::PeerDisconnected { peer_id, reason },
             });
         }
 
         None
     }
 
-    pub fn compute_metrics(&self, events: &[ParsedAvenadEvent]) -> AvenadMetrics {
-        let mut metrics = AvenadMetrics::default();
+    pub fn compute_metrics(&self, events: &[ParsedOverlayEvent]) -> OverlayMetrics {
+        let mut metrics = OverlayMetrics::default();
 
         let mut discovery_times: std::collections::HashMap<
             (String, String),
@@ -397,12 +397,12 @@ impl LogParser {
 
         for event in events {
             match &event.event_type {
-                AvenadEventType::PeerDiscovered { peer_id, .. } => {
+                OverlayEventType::PeerDiscovered { peer_id, .. } => {
                     metrics.discovery_count += 1;
                     let key = (event.node.clone(), peer_id.clone());
                     discovery_times.entry(key).or_insert(event.timestamp);
                 }
-                AvenadEventType::PeerConnected { peer_id } => {
+                OverlayEventType::PeerConnected { peer_id } => {
                     metrics.connection_count += 1;
                     let key = (event.node.clone(), peer_id.clone());
                     if let Some(disc_time) = discovery_times.get(&key) {
@@ -411,13 +411,13 @@ impl LogParser {
                         metrics.handshake_times_ms.push(ms);
                     }
                 }
-                AvenadEventType::HandshakeStarted { .. } => {
+                OverlayEventType::HandshakeStarted { .. } => {
                     metrics.handshake_attempts += 1;
                 }
-                AvenadEventType::PeerDisconnected { .. } => {
+                OverlayEventType::PeerDisconnected { .. } => {
                     metrics.disconnection_count += 1;
                 }
-                AvenadEventType::Unknown { .. } => {}
+                OverlayEventType::Unknown { .. } => {}
             }
         }
 
@@ -439,7 +439,7 @@ impl Default for LogParser {
 }
 
 #[derive(Debug, Default)]
-pub struct AvenadMetrics {
+pub struct OverlayMetrics {
     pub discovery_count: u32,
     pub connection_count: u32,
     pub disconnection_count: u32,
@@ -449,7 +449,7 @@ pub struct AvenadMetrics {
     pub last_event_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-impl AvenadMetrics {
+impl OverlayMetrics {
     pub fn avg_handshake_ms(&self) -> Option<f64> {
         if self.handshake_times_ms.is_empty() {
             return None;
@@ -532,12 +532,12 @@ mod tests {
     #[test]
     fn test_log_parser_peer_discovered() {
         let mut parser = LogParser::new();
-        let log_line = "2025-12-10T21:41:10.488939Z INFO avenad: Peer discovered peer_id=z57vi6qy3xekktr2fvzev3nzfm endpoint=10.1.0.2:51820";
+        let log_line = "2025-12-10T21:41:10.488939Z INFO avena_overlay: Peer discovered peer_id=z57vi6qy3xekktr2fvzev3nzfm endpoint=10.1.0.2:51820";
         let events = parser.parse_log_content("nodeA", log_line);
 
         assert_eq!(events.len(), 1);
         match &events[0].event_type {
-            AvenadEventType::PeerDiscovered { peer_id, endpoint } => {
+            OverlayEventType::PeerDiscovered { peer_id, endpoint } => {
                 assert_eq!(peer_id, "z57vi6qy3xekktr2fvzev3nzfm");
                 assert_eq!(endpoint, "10.1.0.2:51820");
             }
@@ -548,12 +548,12 @@ mod tests {
     #[test]
     fn test_log_parser_peer_connected() {
         let mut parser = LogParser::new();
-        let log_line = "2025-12-10T21:41:10.584018Z INFO avenad: Peer connected via incoming handshake peer_id=z57vi6qy3xekktr2fvzev3nzfm";
+        let log_line = "2025-12-10T21:41:10.584018Z INFO avena_overlay: Peer connected via incoming handshake peer_id=z57vi6qy3xekktr2fvzev3nzfm";
         let events = parser.parse_log_content("nodeA", log_line);
 
         assert_eq!(events.len(), 1);
         match &events[0].event_type {
-            AvenadEventType::PeerConnected { peer_id } => {
+            OverlayEventType::PeerConnected { peer_id } => {
                 assert_eq!(peer_id, "z57vi6qy3xekktr2fvzev3nzfm");
             }
             _ => panic!("Expected PeerConnected event"),
@@ -568,7 +568,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         match &events[0].event_type {
-            AvenadEventType::PeerDiscovered { peer_id, .. } => {
+            OverlayEventType::PeerDiscovered { peer_id, .. } => {
                 assert_eq!(peer_id, "z57vi");
             }
             _ => panic!("Expected PeerDiscovered event"),
@@ -579,22 +579,22 @@ mod tests {
     fn test_compute_handshake_metrics() {
         let parser = LogParser::new();
         let events = vec![
-            ParsedAvenadEvent {
+            ParsedOverlayEvent {
                 timestamp: chrono::DateTime::parse_from_rfc3339("2025-12-10T21:41:10.000Z")
                     .unwrap()
                     .with_timezone(&chrono::Utc),
                 node: "nodeA".to_string(),
-                event_type: AvenadEventType::PeerDiscovered {
+                event_type: OverlayEventType::PeerDiscovered {
                     peer_id: "peer1".to_string(),
                     endpoint: "10.0.0.1:51820".to_string(),
                 },
             },
-            ParsedAvenadEvent {
+            ParsedOverlayEvent {
                 timestamp: chrono::DateTime::parse_from_rfc3339("2025-12-10T21:41:10.100Z")
                     .unwrap()
                     .with_timezone(&chrono::Utc),
                 node: "nodeA".to_string(),
-                event_type: AvenadEventType::PeerConnected {
+                event_type: OverlayEventType::PeerConnected {
                     peer_id: "peer1".to_string(),
                 },
             },

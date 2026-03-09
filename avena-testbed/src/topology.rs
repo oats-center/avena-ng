@@ -1,7 +1,7 @@
 //! Network namespace management for testbed nodes using unshare.
 //!
 //! Uses unshare to create isolated network+mount namespaces for each node,
-//! connects them with veth pairs, and manages avenad process lifecycle.
+//! connects them with veth pairs, and manages avena-overlay process lifecycle.
 
 use crate::ns3_plumbing::{
     apply_plan, endpoint_setup_plan_root_only, teardown_endpoint_port, Ns3EndpointNames,
@@ -11,7 +11,7 @@ use crate::scenario::{
     BridgeConfig, EmulationBackend, LinkConfig, NodeConfig, Scenario, TelemetryConfig,
 };
 use avena_overlay::{
-    AvenadConfig, DaemonDiscoveryConfig, DaemonTelemetryConfig, NetworkConfig, RoutingConfig,
+    DaemonDiscoveryConfig, DaemonTelemetryConfig, NetworkConfig, OverlayConfig, RoutingConfig,
     StaticPeerConfig, TunnelMode,
 };
 use std::collections::HashMap;
@@ -442,7 +442,7 @@ impl TestTopology {
             let config_str = toml::to_string_pretty(&config)?;
             std::fs::write(&config_path, &config_str)?;
 
-            tracing::debug!(node = %node_config.id, config = %config_path.display(), "spawning avenad");
+            tracing::debug!(node = %node_config.id, config = %config_path.display(), "spawning avena-overlay");
 
             let veth_config: Vec<_> = {
                 let node = self.nodes.get(&node_config.id).unwrap();
@@ -473,7 +473,7 @@ impl TestTopology {
                 )
                 .await?;
 
-            tracing::debug!(node = %node_config.id, pid = inner_pid, "avenad spawned");
+            tracing::debug!(node = %node_config.id, pid = inner_pid, "avena-overlay spawned");
 
             let node = self
                 .nodes
@@ -641,14 +641,14 @@ impl TestTopology {
         static_peers: Vec<StaticPeerConfig>,
         scenario_telemetry: &crate::scenario::TelemetryConfig,
         run_id: &str,
-    ) -> Result<AvenadConfig, TopologyError> {
+    ) -> Result<OverlayConfig, TopologyError> {
         let mdns_interfaces: Vec<String> = node
             .underlay_ips
             .iter()
             .map(|(veth, _)| veth.clone())
             .collect();
 
-        Ok(AvenadConfig {
+        Ok(OverlayConfig {
             interface_name: format!("wg-{}", node_config.id),
             tunnel_mode: default_tunnel_mode_for_testbed(),
             network: NetworkConfig::default(),
@@ -740,10 +740,10 @@ impl TestTopology {
         veth_config: &[(String, std::net::Ipv4Addr, u8)],
         temp_dir: &std::path::Path,
     ) -> Result<(Child, u32), TopologyError> {
-        let avenad_path = std::env::current_exe()?
+        let overlay_path = std::env::current_exe()?
             .parent()
             .expect("exe should have parent")
-            .join("avenad");
+            .join("avena-overlay");
 
         let stdout_path = log_dir.join(format!("{}.stdout.log", node_id));
         let stderr_path = log_dir.join(format!("{}.stderr.log", node_id));
@@ -777,11 +777,11 @@ impl TestTopology {
 
         setup_script.push_str(&format!(
             "exec {} {}\n",
-            avenad_path.display(),
+            overlay_path.display(),
             config_path.display()
         ));
 
-        tracing::debug!(node = %node_id, stdout = %stdout_path.display(), stderr = %stderr_path.display(), "avenad logs");
+        tracing::debug!(node = %node_id, stdout = %stdout_path.display(), stderr = %stderr_path.display(), "avena-overlay logs");
 
         let child = Command::new("unshare")
             .args(["--kill-child", "-rmn", "bash", "-c", &setup_script])

@@ -8,7 +8,7 @@ Items deferred to keep v1 implementations simple. Address before production.
 
 **Status:** Deferred
 **Added:** 2024-12-11
-**Component:** avenad / routing
+**Component:** avena-overlay / routing
 
 **Current State:**
 When Babel is enabled, allowed_ips uses a heuristic:
@@ -85,10 +85,10 @@ Profile convergence time under realistic mobility patterns. Consider:
 **Component:** routing / babeld
 
 **Current State:**
-Plan says avenad should restart babeld if it crashes. Not yet implemented.
+Plan says avena-overlay should restart babeld if it crashes. Not yet implemented.
 
 **Risk:**
-If babeld dies, routing stops working but avenad continues running. Silent failure.
+If babeld dies, routing stops working but avena-overlay continues running. Silent failure.
 
 **Proper Solution:**
 - Monitor babeld process in event loop
@@ -104,7 +104,7 @@ If babeld dies, routing stops working but avenad continues running. Silent failu
 **Component:** routing / babeld / WireGuard
 
 **Current State:**
-Babeld defaults to link-local multicast (`ff02::1:6`) for hellos/updates, but WireGuard does not forward multicast. To bridge this, avenad now:
+Babeld defaults to link-local multicast (`ff02::1:6`) for hellos/updates, but WireGuard does not forward multicast. To bridge this, avena-overlay now:
 - assigns deterministic link-local addresses on WG interfaces,
 - includes each peer’s link-local `/128` in allowed_ips, and
 - runs a small UDP/6696 multicast relay that forwards local multicast Babel packets to peers’ link-local addresses.
@@ -131,7 +131,7 @@ Validate multi-hop on real namespaces, then delete interim relay/heuristics if n
 
 **Status:** Needs Validation
 **Added:** 2025-12-12
-**Component:** avenad / WireGuard policy
+**Component:** avena-overlay / WireGuard policy
 
 **Current State:**
 When Babel is enabled, allowed_ips decisions depend on the current peer count. Two concurrent handshakes can briefly observe an empty peer set and both assign `::/0`, reintroducing overlap ambiguity. A best-effort reconciliation pass now runs after each peer insert.
@@ -147,7 +147,7 @@ Centralize allowed_ips policy updates under a single serialized path:
 Add a test that forces overlapping handshakes and asserts no simultaneous `::/0` assignment.
 
 **References:**
-- `avena-overlay/src/bin/avenad.rs`
+- `avena-overlay/src/bin/avena_overlay.rs`
 
 ---
 
@@ -179,7 +179,7 @@ Improve robustness of the testbed:
 
 **Status:** Needs Implementation
 **Added:** 2025-12-12
-**Component:** avenad / overlay / routing
+**Component:** avena-overlay / overlay / routing
 
 **Current State:**
 v1 uses a single WireGuard device per identity and attaches all peers to it. This collapses multiple physical underlay links into one logical interface, so Babel cannot represent "the same peer via WiFi" vs "the same peer via cellular" as distinct links with distinct metrics.

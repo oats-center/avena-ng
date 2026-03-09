@@ -12,11 +12,11 @@
 | **tunnel** | ✅ Complete | TunnelBackend trait + kernel/userspace implementations |
 | **discovery** | ✅ Complete | mDNS + static peers, DiscoveryService |
 | **address** | ✅ Complete | NetworkConfig, IPv6 overlay addressing |
-| **avenad** | ✅ Functional | Basic daemon with discovery→handshake→tunnel flow |
+| **avena-overlay** | ✅ Functional | Basic daemon with discovery→handshake→tunnel flow |
 
 ### Gaps in Current Implementation
 
-1. **IP/Route management uses shell commands** - `avenad.rs` calls `ip` binary instead of rtnetlink
+1. **IP/Route management uses shell commands** - `avena_overlay.rs` calls `ip` binary instead of rtnetlink
 2. **Certificate exchange not in handshake** - Design doc specifies cert chain validation during tunnel establishment
 3. **No Babel routing** - Only direct peer routes added, no mesh routing
 
@@ -46,13 +46,13 @@ Replace shell commands with proper netlink APIs.
 
 ### Task 1: Replace Shell Commands with rtnetlink
 
-**Goal:** Replace `ip` command invocations in avenad with rtnetlink crate calls.
+**Goal:** Replace `ip` command invocations in avena-overlay with rtnetlink crate calls.
 
 **Files:**
 - `src/netlink/mod.rs` (new)
 - `src/netlink/address.rs` (new)
 - `src/netlink/route.rs` (new)
-- `src/bin/avenad.rs` (modify)
+- `src/bin/avena_overlay.rs` (modify)
 
 **Subtasks:**
 
@@ -73,7 +73,7 @@ pub use route::{add_route, remove_route};
 - `add_route(prefix: IpNet, iface: &str, gateway: Option<Ipv6Addr>) -> Result<(), NetlinkError>`
 - `remove_route(prefix: IpNet, iface: &str) -> Result<(), NetlinkError>`
 
-1.4. Update avenad.rs:
+1.4. Update avena_overlay.rs:
 - Replace `assign_interface_address()` with netlink calls
 - Replace `add_peer_route()` with netlink calls
 
@@ -88,12 +88,12 @@ pub use route::{add_route, remove_route};
 **Goal:** Add certificate chain validation during tunnel establishment per design doc Phase 1 (Tunnel Establishment).
 
 **Files:**
-- `src/bin/avenad.rs` (modify)
+- `src/bin/avena_overlay.rs` (modify)
 - `src/daemon/mod.rs` (new or modify)
 
 **Subtasks:**
 
-2.1. Add `trusted_root: Option<PathBuf>` to AvenadConfig
+2.1. Add `trusted_root: Option<PathBuf>` to OverlayConfig
 
 2.2. Load and validate root CA on startup
 
@@ -104,7 +104,7 @@ pub use route::{add_route, remove_route};
 
 2.4. Update HandshakeMessage to include optional cert chain (backward compatible)
 
-**Decision needed:** Should this be mandatory or optional? Design doc says "avenad configured with trusted root CA at startup" but current implementation works without certs.
+**Decision needed:** Should this be mandatory or optional? Design doc says "avena-overlay configured with trusted root CA at startup" but current implementation works without certs.
 
 ---
 
@@ -152,12 +152,12 @@ impl BabelRouting {
 - Parse `show ipv6 route json` output
 - Parse `show babel route` text output
 
-3.4. Add routing config to AvenadConfig:
+3.4. Add routing config to OverlayConfig:
 ```rust
 pub babel: Option<BabelConfig>,
 ```
 
-3.5. Integrate with avenad main loop:
+3.5. Integrate with avena-overlay main loop:
 - On startup: add overlay interface to babel
 - Announce own overlay prefix
 
@@ -367,13 +367,13 @@ path = "src/bin/avena_sidecar.rs"
 
 ---
 
-### Task 7: Host-Sidecar Communication in avenad
+### Task 7: Host-Sidecar Communication in `avena-overlay`
 
-**Goal:** Enable avenad to spawn and control sidecars for Addressable workloads.
+**Goal:** Enable avena-overlay to spawn and control sidecars for Addressable workloads.
 
 **Files:**
 - `src/daemon/sidecar.rs` (new)
-- `src/bin/avenad.rs` (modify)
+- `src/bin/avena_overlay.rs` (modify)
 
 **Subtasks:**
 
@@ -414,7 +414,7 @@ let workload_keypair = derive_workload_keypair(&host_keypair, workload_id);
 let workload_ip = network.workload_address(&host_id, workload_idx);
 ```
 
-7.3. Integrate with avenad:
+7.3. Integrate with avena-overlay:
 - Track Addressable workloads
 - When new peer discovered, push to relevant sidecars
 - When workload terminates, cleanup sidecar

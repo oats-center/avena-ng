@@ -1,4 +1,4 @@
-//! Configuration types for the `avenad` daemon.
+//! Configuration types for the `avena-overlay` daemon.
 //!
 //! Settings include network prefix, discovery backends, interface name, and
 //! backend selection (kernel, userspace, or prefer-kernel fallback).
@@ -29,9 +29,9 @@ impl Default for TunnelMode {
     }
 }
 
-/// Runtime configuration for the avena daemon.
+/// Runtime configuration for the `avena-overlay` daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AvenadConfig {
+pub struct OverlayConfig {
     #[serde(default = "default_interface_name")]
     /// WireGuard interface name to create/manage.
     pub interface_name: String,
@@ -134,7 +134,7 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// Discovery-specific configuration embedded in `AvenadConfig`.
+/// Discovery-specific configuration embedded in `OverlayConfig`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveryConfig {
     #[serde(default = "default_mdns_enabled")]
@@ -222,7 +222,7 @@ fn default_peer_retry_interval_ms() -> u64 {
     250
 }
 
-impl Default for AvenadConfig {
+impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             interface_name: default_interface_name(),
@@ -242,7 +242,7 @@ impl Default for AvenadConfig {
     }
 }
 
-impl AvenadConfig {
+impl OverlayConfig {
     pub fn load_from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
         toml::from_str(&contents).map_err(ConfigError::Parse)
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
-        let config = AvenadConfig::default();
+        let config = OverlayConfig::default();
         assert_eq!(config.interface_name, "avena0");
         assert_eq!(config.listen_port, 51820);
         assert_eq!(config.persistent_keepalive, 25);
@@ -335,7 +335,7 @@ mod tests {
             trusted_root_cert = "/tmp/root.cert"
             device_cert = "/tmp/device.cert"
         "#;
-        let config: AvenadConfig = toml::from_str(toml).unwrap();
+        let config: OverlayConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.interface_name, "wg-avena");
         assert_eq!(config.listen_port, 51820);
     }
@@ -359,7 +359,7 @@ mod tests {
                 { endpoint = "10.0.0.1:51820" }
             ]
         "#;
-        let config: AvenadConfig = toml::from_str(toml).unwrap();
+        let config: OverlayConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.interface_name, "avena1");
         assert_eq!(config.listen_port, 51821);
         assert!(!config.discovery.enable_mdns);
@@ -376,7 +376,7 @@ mod tests {
             trusted_root_cert = "/etc/avena/root.cert"
             device_cert = "/etc/avena/device.cert"
         "#;
-        let config: AvenadConfig = toml::from_str(toml).unwrap();
+        let config: OverlayConfig = toml::from_str(toml).unwrap();
         assert!(matches!(config.tunnel_mode, TunnelMode::PreferKernel));
     }
 }

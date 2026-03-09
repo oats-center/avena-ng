@@ -200,7 +200,7 @@ impl TestTopology {
     /// Create network namespaces and veth pairs
     pub async fn setup(&mut self, scenario: &Scenario) -> Result<(), TestError>;
 
-    /// Start avenad in each namespace
+    /// Start avena-overlay in each namespace
     pub async fn start_nodes(&mut self, pki: &TestPki) -> Result<(), TestError>;
 
     /// Clean up namespaces and processes
@@ -481,18 +481,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ---
 
-## Phase 8: avenad Metrics Enhancement
+## Phase 8: avena-overlay Metrics Enhancement
 
-To support metrics collection, avenad needs structured log output:
+To support metrics collection, avena-overlay needs structured log output:
 
 ### 8.1 Add Structured Events
 
 ```rust
-// In avenad.rs, emit structured events alongside tracing logs
+// In avena_overlay.rs, emit structured events alongside tracing logs
 
 #[derive(Serialize)]
 #[serde(tag = "event")]
-pub enum AvenadEvent {
+pub enum OverlayEvent {
     PeerDiscovered { peer_id: String, endpoint: String, source: String },
     HandshakeStarted { peer_id: String },
     HandshakeCompleted { peer_id: String, duration_ms: u64 },
@@ -501,8 +501,8 @@ pub enum AvenadEvent {
     PeerDisconnected { peer_id: String, reason: String },
 }
 
-impl Avenad {
-    fn emit_event(&self, event: AvenadEvent) {
+impl OverlayDaemon {
+    fn emit_event(&self, event: OverlayEvent) {
         if let Ok(json) = serde_json::to_string(&event) {
             println!("AVENA_EVENT:{}", json);
         }
@@ -512,7 +512,7 @@ impl Avenad {
 
 ### 8.2 Testbed Captures Events
 
-The testbed runner captures stdout from avenad processes and parses `AVENA_EVENT:` lines into the metrics log.
+The testbed runner captures stdout from avena-overlay processes and parses `AVENA_EVENT:` lines into the metrics log.
 
 ---
 
@@ -527,8 +527,8 @@ The testbed runner captures stdout from avenad processes and parses `AVENA_EVENT
 ### Milestone 2: Topology Management
 1. `testbed/topology.rs` - Namespace creation/teardown
 2. Veth pair setup between nodes
-3. Generate avenad config files per node
-4. Start/stop avenad processes in namespaces
+3. Generate avena-overlay config files per node
+4. Start/stop avena-overlay processes in namespaces
 
 ### Milestone 3: Link Shaping
 1. `testbed/links.rs` - tc/netem wrapper
@@ -592,7 +592,7 @@ pub struct Ns3Backend { /* future: ns-3 integration */ }
 | `avena-testbed/src/runner.rs` | Create |
 | `avena-testbed/src/bin/avena-testbed.rs` | Create |
 | `avena-testbed/scenarios/*.toml` | Create - example scenarios |
-| `avena-overlay/src/bin/avenad.rs` | Modify - add AVENA_EVENT output |
+| `avena-overlay/src/bin/avena_overlay.rs` | Modify - add AVENA_EVENT output |
 
 ## Dependencies (avena-testbed/Cargo.toml)
 

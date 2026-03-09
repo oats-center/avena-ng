@@ -1,6 +1,6 @@
-# avenad Physical Hosts Quick Start
+# avena-overlay Physical Hosts Quick Start
 
-Minimal runbook to bring up `avenad` on a few real Linux hosts.
+Minimal runbook to bring up `avena-overlay` on a few real Linux hosts.
 
 This is the fastest path from zero to first overlay ping.
 
@@ -40,15 +40,15 @@ On a build machine with Rust toolchain:
 
 ```bash
 cd /path/to/avena
-cargo build --release -p avena-overlay --bin avenad --bin avena-keygen
+cargo build --release -p avena-overlay --bin avena-overlay --bin avena-keygen
 ```
 
 Copy binaries to each host:
 
 ```bash
-scp target/release/avenad target/release/avena-keygen node1:/usr/local/bin/
-scp target/release/avenad target/release/avena-keygen node2:/usr/local/bin/
-scp target/release/avenad target/release/avena-keygen node3:/usr/local/bin/
+scp target/release/avena-overlay target/release/avena-keygen node1:/usr/local/bin/
+scp target/release/avena-overlay target/release/avena-keygen node2:/usr/local/bin/
+scp target/release/avena-overlay target/release/avena-keygen node3:/usr/local/bin/
 ```
 
 ## 3) Create PKI and per-node credentials
@@ -99,7 +99,7 @@ Find the underlay NIC name (example command):
 ip route get 1.1.1.1 | awk '/dev/ {print $5; exit}'
 ```
 
-Create `/etc/avena/avenad.toml` on each host:
+Create `/etc/avena/avena-overlay.toml` on each host:
 
 ```toml
 interface_name = "avena0"
@@ -135,7 +135,7 @@ Change `mdns_interfaces` to the real NIC for each host.
 Manual start:
 
 ```bash
-sudo RUST_LOG=info /usr/local/bin/avenad /etc/avena/avenad.toml
+sudo RUST_LOG=info /usr/local/bin/avena-overlay /etc/avena/avena-overlay.toml
 ```
 
 You should see logs like:

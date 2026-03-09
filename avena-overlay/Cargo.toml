@@ -9,8 +9,8 @@ keywords = ["wireguard", "overlay", "mesh", "vpn", "networking"]
 categories = ["network-programming", "cryptography"]
 
 [[bin]]
-name = "avenad"
-path = "src/bin/avenad.rs"
+name = "avena-overlay"
+path = "src/bin/avena_overlay.rs"
 
 [[bin]]
 name = "avena-keygen"

@@ -125,7 +125,7 @@ impl UserspaceBackend {
             match socket::WgSocket::connect(name) {
                 Ok(_) => {
                     return Err(WgError::InterfaceCreation(format!(
-                        "interface {name} is already in use (existing WireGuard userspace control socket at {}). Stop the other `wireguard-go`/`avenad` instance or delete the interface before retrying.",
+                        "interface {name} is already in use (existing WireGuard userspace control socket at {}). Stop the other `wireguard-go`/`avena-overlay` instance or delete the interface before retrying.",
                         sock_path.display()
                     )));
                 }

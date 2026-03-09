@@ -41,7 +41,7 @@ avena-overlay/
 │   │   └── bridge.rs
 │   └── address.rs
 └── bin/
-    ├── avenad.rs
+    ├── avena_overlay.rs
     └── avena-sidecar.rs
 ```
 
@@ -188,7 +188,7 @@ pub fn verify_signature(
 
 ### 2.3 `crypto/certs.rs`
 
-Certificate chain validation. avenad configured with trusted root CA at startup. Revocation deferred.
+Certificate chain validation. `avena-overlay` configured with trusted root CA at startup. Revocation deferred.
 
 ```rust
 pub struct CertificateChain {
@@ -534,7 +534,7 @@ pub async fn delete_veth(name: &str) -> Result<(), VethError>;
 Host networking setup for workload internet access.
 
 ```rust
-/// One-time host setup (called on avenad startup)
+/// One-time host setup (called on `avena-overlay` startup)
 pub async fn init_host_routing(
     overlay_prefix: &IpNet,
     internet_iface: &str,
@@ -606,11 +606,11 @@ impl BridgeManager {
 
 ## Phase 7: Daemon Structure
 
-### 7.1 `bin/avenad.rs`
+### 7.1 `bin/avena_overlay.rs`
 
 ```rust
-struct Avenad {
-    config: AvenadConfig,
+struct OverlayDaemon {
+    config: OverlayConfig,
     keypair: DeviceKeypair,
     network: NetworkConfig,
 
@@ -643,8 +643,8 @@ enum WorkloadState {
     },
 }
 
-impl Avenad {
-    async fn run(&self) -> Result<(), AvenadError> {
+impl OverlayDaemon {
+    async fn run(&self) -> Result<(), OverlayDaemonError> {
         tokio::select! {
             _ = self.discovery_loop() => {},
             _ = self.peer_management_loop() => {},
@@ -655,13 +655,13 @@ impl Avenad {
         Ok(())
     }
 
-    async fn handle_discovered_peer(&self, peer: DiscoveredPeer) -> Result<(), AvenadError>;
-    async fn establish_tunnel(&self, peer: &DiscoveredPeer) -> Result<PeerState, AvenadError>;
-    async fn teardown_tunnel(&self, device_id: &DeviceId) -> Result<(), AvenadError>;
+    async fn handle_discovered_peer(&self, peer: DiscoveredPeer) -> Result<(), OverlayDaemonError>;
+    async fn establish_tunnel(&self, peer: &DiscoveredPeer) -> Result<PeerState, OverlayDaemonError>;
+    async fn teardown_tunnel(&self, device_id: &DeviceId) -> Result<(), OverlayDaemonError>;
 
     // Workload management
-    async fn spawn_sidecar(&self, workload: &WorkloadSpec) -> Result<(), AvenadError>;
-    async fn push_peer_to_sidecar(&self, workload_id: &str, peer: &PeerConfig) -> Result<(), AvenadError>;
+    async fn spawn_sidecar(&self, workload: &WorkloadSpec) -> Result<(), OverlayDaemonError>;
+    async fn push_peer_to_sidecar(&self, workload_id: &str, peer: &PeerConfig) -> Result<(), OverlayDaemonError>;
 }
 ```
 
@@ -826,10 +826,10 @@ sudo cargo test kernel -- --ignored
 3. `discovery/mod.rs` - Unified discovery service
 4. Integration test: two processes discover each other
 
-### Milestone 4: Minimal avenad (Week 4)
-1. `bin/avenad.rs` - Basic daemon structure
+### Milestone 4: Minimal avena-overlay daemon (Week 4)
+1. `bin/avena_overlay.rs` - Basic daemon structure
 2. Discovery → handshake → tunnel flow
-3. Manual testing: two avenad instances connect
+3. Manual testing: two avena-overlay instances connect
 
 ### Milestone 5: Routing Integration (Week 5)
 1. `routing/babel.rs` - Babel via vtysh
@@ -901,7 +901,7 @@ toml = "0.8"
 
 - **Unit tests**: All crypto, encoding, address derivation
 - **Integration tests**:
-  - Two avenad instances on same machine (different network namespaces)
+  - Two avena-overlay instances on same machine (different network namespaces)
   - Discovery → tunnel → ping flow
 - **Multi-node tests**:
   - Docker Compose with 3+ nodes

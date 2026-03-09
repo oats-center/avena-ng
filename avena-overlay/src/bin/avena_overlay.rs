@@ -2,7 +2,7 @@ use avena_overlay::{
     derive_session_keys, derive_wireguard_keypair,
     routing::{BabeldController, RoutingError},
     wg::WgError,
-    AvenadConfig, CertValidator, DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent,
+    CertValidator, DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent, OverlayConfig,
     DiscoveryService, EphemeralKeypair, HandshakeMessage, KernelBackend, LocalAnnouncement,
     NetworkConfig, PeerConfig, PeerState, TunnelBackend, TunnelMode, UserspaceBackend,
 };
@@ -88,7 +88,7 @@ struct TelemetryPublisher {
 }
 
 impl TelemetryPublisher {
-    async fn new(config: &AvenadConfig, fallback_node_id: String) -> Self {
+    async fn new(config: &OverlayConfig, fallback_node_id: String) -> Self {
         let run_id = config
             .telemetry
             .run_id
@@ -183,7 +183,7 @@ impl TelemetryPublisher {
             subject: subject.clone(),
             ts_ms: self.started_at.elapsed().as_millis() as u64,
             run_id: self.run_id.clone(),
-            source: "avenad".to_string(),
+            source: "avena-overlay".to_string(),
             node: Some(self.node_id.clone()),
             radio: data
                 .get("radio")
@@ -276,8 +276,8 @@ impl RateLimiter {
     }
 }
 
-struct AvenadInner {
-    config: AvenadConfig,
+struct OverlayDaemonInner {
+    config: OverlayConfig,
     keypair: DeviceKeypair,
     wg_public: [u8; 32],
     network: NetworkConfig,
@@ -298,8 +298,8 @@ struct AvenadInner {
     telemetry: Arc<TelemetryPublisher>,
 }
 
-struct Avenad {
-    inner: Arc<AvenadInner>,
+struct OverlayDaemon {
+    inner: Arc<OverlayDaemonInner>,
     discovery_rx: Option<tokio::sync::broadcast::Receiver<DiscoveryEvent>>,
     handshake_listener: TcpListener,
 }
@@ -332,12 +332,12 @@ fn canonical_underlay_ip(ip: IpAddr) -> IpAddr {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_local_underlay_identifier(local_ip: IpAddr) -> Result<String, AvenadError> {
+fn resolve_local_underlay_identifier(local_ip: IpAddr) -> Result<String, OverlayDaemonError> {
     use avena_overlay::wg::linux::netlink;
 
     let canonical_ip = canonical_underlay_ip(local_ip);
     netlink::get_interface_name_for_ip(canonical_ip).ok_or_else(|| {
-        AvenadError::Handshake(format!(
+        OverlayDaemonError::Handshake(format!(
             "strict underlay resolution failed for local IP {}",
             canonical_ip
         ))
@@ -345,8 +345,8 @@ fn resolve_local_underlay_identifier(local_ip: IpAddr) -> Result<String, AvenadE
 }
 
 #[cfg(not(target_os = "linux"))]
-fn resolve_local_underlay_identifier(local_ip: IpAddr) -> Result<String, AvenadError> {
-    Err(AvenadError::Handshake(format!(
+fn resolve_local_underlay_identifier(local_ip: IpAddr) -> Result<String, OverlayDaemonError> {
+    Err(OverlayDaemonError::Handshake(format!(
         "strict underlay resolution unsupported on this platform for local IP {}",
         local_ip
     )))
@@ -360,8 +360,8 @@ fn deterministic_tunnel_listen_port(interface_name: &str) -> u16 {
     TUNNEL_PORT_BASE + (n % TUNNEL_PORT_SPAN)
 }
 
-impl Avenad {
-    async fn new(config: AvenadConfig) -> Result<Self, AvenadError> {
+impl OverlayDaemon {
+    async fn new(config: OverlayConfig) -> Result<Self, OverlayDaemonError> {
         validate_interface_name(&config.interface_name)?;
 
         if let Err(e) = try_raise_nofile_limit() {
@@ -373,7 +373,7 @@ impl Avenad {
         info!(device_id = %device_id, "Initialized device identity");
 
         let (cert_validator, device_cert) =
-            config.load_crypto().map_err(AvenadError::CertConfig)?;
+            config.load_crypto().map_err(OverlayDaemonError::CertConfig)?;
         info!("Loaded device certificate");
 
         let wg_keys = derive_wireguard_keypair(&keypair);
@@ -398,7 +398,7 @@ impl Avenad {
                 TcpListener,
                 Option<BabeldController>,
             ),
-            AvenadError,
+            OverlayDaemonError,
         > = async {
             base_tunnel.set_private_key(&*wg_keys.private).await?;
             base_tunnel.set_listen_port(config.listen_port).await?;
@@ -447,7 +447,7 @@ impl Avenad {
         let telemetry =
             Arc::new(TelemetryPublisher::new(&config, keypair.device_id().to_string()).await);
 
-        let inner = Arc::new(AvenadInner {
+        let inner = Arc::new(OverlayDaemonInner {
             config,
             keypair,
             wg_public: wg_keys.public,
@@ -476,7 +476,7 @@ impl Avenad {
         })
     }
 
-    async fn run(&mut self) -> Result<(), AvenadError> {
+    async fn run(&mut self) -> Result<(), OverlayDaemonError> {
         let mut discovery_rx = self
             .discovery_rx
             .take()
@@ -496,7 +496,7 @@ impl Avenad {
             });
         }
 
-        info!("Avenad running. Press Ctrl+C to stop.");
+        info!("avena-overlay running. Press Ctrl+C to stop.");
 
         let mut dead_peer_interval =
             tokio::time::interval(Duration::from_secs(inner.config.dead_peer_timeout_secs));
@@ -743,7 +743,7 @@ fn default_mdns_interfaces(_overlay_iface: &str) -> Vec<String> {
     Vec::new()
 }
 
-async fn start_routing_controller(config: &AvenadConfig) -> Result<BabeldController, AvenadError> {
+async fn start_routing_controller(config: &OverlayConfig) -> Result<BabeldController, OverlayDaemonError> {
     let mut controller = BabeldController::new(config.routing.babel.clone());
     controller.start(&[&config.interface_name]).await?;
     info!("Started babeld for dynamic routing");
@@ -754,7 +754,7 @@ async fn select_tunnel_backend(
     mode: TunnelMode,
     interface_name: &str,
     context: &str,
-) -> Result<Arc<dyn TunnelBackend>, AvenadError> {
+) -> Result<Arc<dyn TunnelBackend>, OverlayDaemonError> {
     let prefer_kernel = matches!(mode, TunnelMode::PreferKernel);
     let candidates: Vec<Arc<dyn TunnelBackend>> = match mode {
         TunnelMode::Kernel => vec![Arc::new(KernelBackend::new())],
@@ -783,19 +783,19 @@ async fn select_tunnel_backend(
         }
     }
 
-    Err(AvenadError::Tunnel(last_err.unwrap_or_else(|| {
+    Err(OverlayDaemonError::Tunnel(last_err.unwrap_or_else(|| {
         avena_overlay::TunnelError::InterfaceCreation(
             "no tunnel backend could create interface".into(),
         )
     })))
 }
 
-impl AvenadInner {
+impl OverlayDaemonInner {
     async fn ensure_peer_tunnel(
         &self,
         peer_id: &DeviceId,
         local_underlay_hint: &str,
-    ) -> Result<PeerTunnelBinding, AvenadError> {
+    ) -> Result<PeerTunnelBinding, OverlayDaemonError> {
         let interface_name =
             peer_tunnel_interface_name(&self.keypair.device_id(), peer_id, local_underlay_hint);
         let listen_port = deterministic_tunnel_listen_port(&interface_name);
@@ -829,7 +829,7 @@ impl AvenadInner {
         tunnel: &Arc<dyn TunnelBackend>,
         interface_name: &str,
         listen_port: u16,
-    ) -> Result<(), AvenadError> {
+    ) -> Result<(), OverlayDaemonError> {
         let wg_keys = derive_wireguard_keypair(&self.keypair);
         tunnel.set_private_key(&*wg_keys.private).await?;
         tunnel.set_listen_port(listen_port).await?;
@@ -840,12 +840,12 @@ impl AvenadInner {
         let mut routing = self.routing.lock().await;
         let controller = routing
             .as_mut()
-            .ok_or_else(|| AvenadError::Routing(RoutingError::not_running()))?;
+            .ok_or_else(|| OverlayDaemonError::Routing(RoutingError::not_running()))?;
         controller.add_interface(interface_name).await?;
         Ok(())
     }
 
-    async fn announce_presence(&self) -> Result<(), AvenadError> {
+    async fn announce_presence(&self) -> Result<(), OverlayDaemonError> {
         let wg_port = self
             .base_tunnel
             .listen_port()
@@ -884,7 +884,7 @@ impl AvenadInner {
         Ok(())
     }
 
-    async fn handle_discovered_peer(&self, peer: DiscoveredPeer) -> Result<(), AvenadError> {
+    async fn handle_discovered_peer(&self, peer: DiscoveredPeer) -> Result<(), OverlayDaemonError> {
         let should_initiate = self.keypair.device_id() > peer.device_id;
         if !should_initiate {
             debug!(peer_id = %peer.device_id, "Waiting for peer to initiate");
@@ -1013,20 +1013,20 @@ impl AvenadInner {
         &self,
         addr: SocketAddr,
         peer: &DiscoveredPeer,
-    ) -> Result<PeerState, AvenadError> {
+    ) -> Result<PeerState, OverlayDaemonError> {
         tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
             self.perform_outgoing_handshake_inner(addr, peer),
         )
         .await
-        .map_err(|_| AvenadError::Timeout)?
+        .map_err(|_| OverlayDaemonError::Timeout)?
     }
 
     async fn perform_outgoing_handshake_inner(
         &self,
         addr: SocketAddr,
         peer: &DiscoveredPeer,
-    ) -> Result<PeerState, AvenadError> {
+    ) -> Result<PeerState, OverlayDaemonError> {
         let mut stream = TcpStream::connect(addr).await?;
 
         let local_underlay_hint = resolve_local_underlay_identifier(stream.local_addr()?.ip())?;
@@ -1057,27 +1057,27 @@ impl AvenadInner {
         let mut magic = [0u8; 4];
         stream.read_exact(&mut magic).await?;
         if &magic != HANDSHAKE_MAGIC {
-            return Err(AvenadError::Handshake("invalid magic".into()));
+            return Err(OverlayDaemonError::Handshake("invalid magic".into()));
         }
 
         let version = stream.read_u8().await?;
         if version != HANDSHAKE_VERSION {
-            return Err(AvenadError::Handshake("version mismatch".into()));
+            return Err(OverlayDaemonError::Handshake("version mismatch".into()));
         }
 
         let mut peer_pubkey_bytes = [0u8; 32];
         stream.read_exact(&mut peer_pubkey_bytes).await?;
         let peer_pubkey = VerifyingKey::from_bytes(&peer_pubkey_bytes)
-            .map_err(|_| AvenadError::Handshake("invalid peer public key".into()))?;
+            .map_err(|_| OverlayDaemonError::Handshake("invalid peer public key".into()))?;
 
         let peer_device_id = DeviceId::from_public_key(&peer_pubkey);
         if peer_device_id != peer.device_id {
-            return Err(AvenadError::Handshake("device id mismatch".into()));
+            return Err(OverlayDaemonError::Handshake("device id mismatch".into()));
         }
 
         let msg_len = stream.read_u32().await? as usize;
         if msg_len > MAX_HANDSHAKE_MSG_LEN {
-            return Err(AvenadError::Handshake("message too large".into()));
+            return Err(OverlayDaemonError::Handshake("message too large".into()));
         }
         let mut msg_bytes = vec![0u8; msg_len];
         stream.read_exact(&mut msg_bytes).await?;
@@ -1089,7 +1089,7 @@ impl AvenadInner {
                 &self.keypair.device_id(),
                 &self.cert_validator,
             )
-            .map_err(|e| AvenadError::Handshake(format!("handshake verification failed: {}", e)))?;
+            .map_err(|e| OverlayDaemonError::Handshake(format!("handshake verification failed: {}", e)))?;
 
         let peer_ephemeral = peer_msg.ephemeral_public_key();
         let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
@@ -1122,42 +1122,42 @@ impl AvenadInner {
         &self,
         stream: TcpStream,
         addr: SocketAddr,
-    ) -> Result<PeerState, AvenadError> {
+    ) -> Result<PeerState, OverlayDaemonError> {
         tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
             self.handle_incoming_handshake_inner(stream, addr),
         )
         .await
-        .map_err(|_| AvenadError::Timeout)?
+        .map_err(|_| OverlayDaemonError::Timeout)?
     }
 
     async fn handle_incoming_handshake_inner(
         &self,
         mut stream: TcpStream,
         addr: SocketAddr,
-    ) -> Result<PeerState, AvenadError> {
+    ) -> Result<PeerState, OverlayDaemonError> {
         let local_underlay_hint = resolve_local_underlay_identifier(stream.local_addr()?.ip())?;
 
         let mut magic = [0u8; 4];
         stream.read_exact(&mut magic).await?;
         if &magic != HANDSHAKE_MAGIC {
-            return Err(AvenadError::Handshake("invalid magic".into()));
+            return Err(OverlayDaemonError::Handshake("invalid magic".into()));
         }
 
         let version = stream.read_u8().await?;
         if version != HANDSHAKE_VERSION {
-            return Err(AvenadError::Handshake("version mismatch".into()));
+            return Err(OverlayDaemonError::Handshake("version mismatch".into()));
         }
 
         let mut peer_pubkey_bytes = [0u8; 32];
         stream.read_exact(&mut peer_pubkey_bytes).await?;
         let peer_pubkey = VerifyingKey::from_bytes(&peer_pubkey_bytes)
-            .map_err(|_| AvenadError::Handshake("invalid peer public key".into()))?;
+            .map_err(|_| OverlayDaemonError::Handshake("invalid peer public key".into()))?;
         let peer_device_id = DeviceId::from_public_key(&peer_pubkey);
 
         let msg_len = stream.read_u32().await? as usize;
         if msg_len > MAX_HANDSHAKE_MSG_LEN {
-            return Err(AvenadError::Handshake("message too large".into()));
+            return Err(OverlayDaemonError::Handshake("message too large".into()));
         }
         let mut msg_bytes = vec![0u8; msg_len];
         stream.read_exact(&mut msg_bytes).await?;
@@ -1169,14 +1169,14 @@ impl AvenadInner {
                 &self.keypair.device_id(),
                 &self.cert_validator,
             )
-            .map_err(|e| AvenadError::Handshake(format!("handshake verification failed: {}", e)))?;
+            .map_err(|e| OverlayDaemonError::Handshake(format!("handshake verification failed: {}", e)))?;
 
         if !self
             .nonce_cache
             .check_and_insert(peer_device_id, peer_msg.nonce)
             .await
         {
-            return Err(AvenadError::Handshake("replay detected".into()));
+            return Err(OverlayDaemonError::Handshake("replay detected".into()));
         }
 
         let binding = self
@@ -1310,7 +1310,7 @@ impl AvenadInner {
         }
     }
 
-    async fn reconcile_peer_allowed_ips(&self) -> Result<(), AvenadError> {
+    async fn reconcile_peer_allowed_ips(&self) -> Result<(), OverlayDaemonError> {
         let (peer_count, peers) = {
             let peers = self.peers.read().await;
             let peer_count = peers
@@ -1720,7 +1720,7 @@ impl AvenadInner {
     }
 
     async fn shutdown(&self) {
-        info!("Shutting down avenad...");
+        info!("Shutting down avena-overlay...");
 
         // Stop babeld first
         let mut routing = self.routing.lock().await;
@@ -1756,17 +1756,17 @@ impl AvenadInner {
     }
 }
 
-fn validate_interface_name(name: &str) -> Result<(), AvenadError> {
+fn validate_interface_name(name: &str) -> Result<(), OverlayDaemonError> {
     if name.is_empty() {
-        return Err(AvenadError::Config("interface name cannot be empty".into()));
+        return Err(OverlayDaemonError::Config("interface name cannot be empty".into()));
     }
     if name.len() > 15 {
-        return Err(AvenadError::Config(
+        return Err(OverlayDaemonError::Config(
             "interface name too long (max 15 chars)".into(),
         ));
     }
     if name.starts_with('-') {
-        return Err(AvenadError::Config(
+        return Err(OverlayDaemonError::Config(
             "interface name cannot start with '-'".into(),
         ));
     }
@@ -1774,19 +1774,19 @@ fn validate_interface_name(name: &str) -> Result<(), AvenadError> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return Err(AvenadError::Config(
+        return Err(OverlayDaemonError::Config(
             "interface name contains invalid characters".into(),
         ));
     }
     Ok(())
 }
 
-fn load_or_generate_keypair(config: &AvenadConfig) -> Result<DeviceKeypair, AvenadError> {
+fn load_or_generate_keypair(config: &OverlayConfig) -> Result<DeviceKeypair, OverlayDaemonError> {
     if let Some(ref path) = config.keypair_path {
         if path.exists() {
             let bytes = std::fs::read(path)?;
             if bytes.len() != 32 {
-                return Err(AvenadError::Config("invalid keypair file size".into()));
+                return Err(OverlayDaemonError::Config("invalid keypair file size".into()));
             }
             let mut seed = [0u8; 32];
             seed.copy_from_slice(&bytes);
@@ -2007,7 +2007,7 @@ fn get_interface_ip(_interface_name: &str) -> Option<IpAddr> {
 }
 
 #[derive(Debug)]
-enum AvenadError {
+enum OverlayDaemonError {
     Config(String),
     CertConfig(avena_overlay::ConfigError),
     Tunnel(avena_overlay::TunnelError),
@@ -2019,51 +2019,51 @@ enum AvenadError {
     Timeout,
 }
 
-impl std::fmt::Display for AvenadError {
+impl std::fmt::Display for OverlayDaemonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AvenadError::Config(e) => write!(f, "config error: {}", e),
-            AvenadError::CertConfig(e) => write!(f, "certificate config error: {}", e),
-            AvenadError::Tunnel(e) => write!(f, "tunnel error: {}", e),
-            AvenadError::Discovery(e) => write!(f, "discovery error: {}", e),
-            AvenadError::Routing(e) => write!(f, "routing error: {}", e),
-            AvenadError::Io(e) => write!(f, "io error: {}", e),
-            AvenadError::Handshake(e) => write!(f, "handshake error: {}", e),
-            AvenadError::Json(e) => write!(f, "json error: {}", e),
-            AvenadError::Timeout => write!(f, "handshake timeout"),
+            OverlayDaemonError::Config(e) => write!(f, "config error: {}", e),
+            OverlayDaemonError::CertConfig(e) => write!(f, "certificate config error: {}", e),
+            OverlayDaemonError::Tunnel(e) => write!(f, "tunnel error: {}", e),
+            OverlayDaemonError::Discovery(e) => write!(f, "discovery error: {}", e),
+            OverlayDaemonError::Routing(e) => write!(f, "routing error: {}", e),
+            OverlayDaemonError::Io(e) => write!(f, "io error: {}", e),
+            OverlayDaemonError::Handshake(e) => write!(f, "handshake error: {}", e),
+            OverlayDaemonError::Json(e) => write!(f, "json error: {}", e),
+            OverlayDaemonError::Timeout => write!(f, "handshake timeout"),
         }
     }
 }
 
-impl std::error::Error for AvenadError {}
+impl std::error::Error for OverlayDaemonError {}
 
-impl From<avena_overlay::TunnelError> for AvenadError {
+impl From<avena_overlay::TunnelError> for OverlayDaemonError {
     fn from(e: avena_overlay::TunnelError) -> Self {
-        AvenadError::Tunnel(e)
+        OverlayDaemonError::Tunnel(e)
     }
 }
 
-impl From<avena_overlay::DiscoveryError> for AvenadError {
+impl From<avena_overlay::DiscoveryError> for OverlayDaemonError {
     fn from(e: avena_overlay::DiscoveryError) -> Self {
-        AvenadError::Discovery(e)
+        OverlayDaemonError::Discovery(e)
     }
 }
 
-impl From<RoutingError> for AvenadError {
+impl From<RoutingError> for OverlayDaemonError {
     fn from(e: RoutingError) -> Self {
-        AvenadError::Routing(e)
+        OverlayDaemonError::Routing(e)
     }
 }
 
-impl From<std::io::Error> for AvenadError {
+impl From<std::io::Error> for OverlayDaemonError {
     fn from(e: std::io::Error) -> Self {
-        AvenadError::Io(e)
+        OverlayDaemonError::Io(e)
     }
 }
 
-impl From<serde_json::Error> for AvenadError {
+impl From<serde_json::Error> for OverlayDaemonError {
     fn from(e: serde_json::Error) -> Self {
-        AvenadError::Json(e)
+        OverlayDaemonError::Json(e)
     }
 }
 
@@ -2074,11 +2074,11 @@ mod tests {
 
     #[tokio::test]
     async fn routing_startup_is_fatal_when_babel_binary_is_missing() {
-        let mut config = AvenadConfig::default();
+        let mut config = OverlayConfig::default();
         config.routing.babel.binary_path = PathBuf::from("/definitely/missing/babeld");
 
         let err = start_routing_controller(&config).await.unwrap_err();
-        assert!(matches!(err, AvenadError::Routing(_)));
+        assert!(matches!(err, OverlayDaemonError::Routing(_)));
     }
 
     #[test]
@@ -2170,10 +2170,10 @@ async fn main() {
     let config_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/avena/avenad.toml"));
+        .unwrap_or_else(|| PathBuf::from("/etc/avena/avena-overlay.toml"));
 
     let config = if config_path.exists() {
-        match AvenadConfig::load_from_file(&config_path) {
+        match OverlayConfig::load_from_file(&config_path) {
             Ok(c) => {
                 info!(path = %config_path.display(), "Loaded configuration");
                 c
@@ -2185,18 +2185,18 @@ async fn main() {
         }
     } else {
         info!("Using default configuration");
-        AvenadConfig::default()
+        OverlayConfig::default()
     };
 
-    match Avenad::new(config).await {
+    match OverlayDaemon::new(config).await {
         Ok(mut daemon) => {
             if let Err(e) = daemon.run().await {
-                error!("Avenad error: {}", e);
+                error!("avena-overlay error: {}", e);
                 std::process::exit(1);
             }
         }
         Err(e) => {
-            error!("Failed to initialize avenad: {}", e);
+            error!("Failed to initialize avena-overlay: {}", e);
             std::process::exit(1);
         }
     }

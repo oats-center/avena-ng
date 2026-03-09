@@ -800,7 +800,7 @@ mod tests {
             subject: "avena.v1.run123.node.nodeA.overlay.peer_connected".to_string(),
             ts_ms: 10,
             run_id: "run123".to_string(),
-            source: "avenad".to_string(),
+            source: "avena-overlay".to_string(),
             node: Some("nodeA".to_string()),
             radio: None,
             peer: Some("nodeB".to_string()),

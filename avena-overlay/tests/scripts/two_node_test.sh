@@ -3,19 +3,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-AVENAD="$PROJECT_ROOT/target/debug/avenad"
+AVENA_OVERLAY="$PROJECT_ROOT/target/debug/avena-overlay"
 AVENA_KEYGEN="$PROJECT_ROOT/target/debug/avena-keygen"
 TMPDIR=$(mktemp -d)
 
 cleanup() {
     rm -rf "$TMPDIR"
-    pkill -f "avenad.*/tmp/tmp\." 2>/dev/null || true
+    pkill -f "avena-overlay.*/tmp/tmp\." 2>/dev/null || true
     pkill -f "wireguard-go wg-node" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "=== Building binaries ==="
-cargo build --bin avenad --bin avena-keygen --manifest-path "$PROJECT_ROOT/Cargo.toml" --quiet
+cargo build --bin avena-overlay --bin avena-keygen --manifest-path "$PROJECT_ROOT/Cargo.toml" --quiet
 
 if ! command -v wireguard-go &>/dev/null; then
     echo "ERROR: wireguard-go not found."
@@ -73,7 +73,7 @@ echo "Testing: mDNS discovery -> handshake -> WireGuard tunnel"
 echo "No hardcoded device IDs - nodes must discover each other"
 echo ""
 
-export TMPDIR AVENAD
+export TMPDIR AVENA_OVERLAY
 
 unshare --kill-child -rmn bash -c '
 set -euo pipefail
@@ -105,11 +105,11 @@ unshare -n bash -c '\''
 
     mkdir -p /var/run/wireguard
 
-    echo "[node2] Starting avenad with mDNS discovery..."
-    RUST_LOG=debug,mdns_sd=warn "$AVENAD" "$TMPDIR/node2.toml" 2>&1 | tee "$TMPDIR/node2.log" | stdbuf -oL sed "s/^/[node2] /" &
-    AVENAD_PID=$!
+    echo "[node2] Starting avena-overlay with mDNS discovery..."
+    RUST_LOG=debug,mdns_sd=warn "$AVENA_OVERLAY" "$TMPDIR/node2.toml" 2>&1 | tee "$TMPDIR/node2.log" | stdbuf -oL sed "s/^/[node2] /" &
+    AVENA_OVERLAY_PID=$!
 
-    wait $AVENAD_PID
+    wait $AVENA_OVERLAY_PID
 '\'' &
 NODE2_SHELL=$!
 
@@ -125,8 +125,8 @@ echo "[node1] Network ready: $(ip -4 addr show veth-n1 | grep inet | awk "{print
 
 mkdir -p /var/run/wireguard
 
-echo "[node1] Starting avenad with mDNS discovery..."
-RUST_LOG=debug,mdns_sd=warn "$AVENAD" "$TMPDIR/node1.toml" 2>&1 | tee "$TMPDIR/node1.log" | stdbuf -oL sed "s/^/[node1] /" &
+echo "[node1] Starting avena-overlay with mDNS discovery..."
+RUST_LOG=debug,mdns_sd=warn "$AVENA_OVERLAY" "$TMPDIR/node1.toml" 2>&1 | tee "$TMPDIR/node1.log" | stdbuf -oL sed "s/^/[node1] /" &
 NODE1_PID=$!
 
 echo ""
@@ -147,7 +147,7 @@ nsenter -t $INNER_PID -n wg show wg-node2 2>/dev/null || echo "(no interface or 
 echo ""
 echo "=== Testing overlay IPv6 connectivity ==="
 
-# Get peer overlay IPs from wg show (avenad now assigns IPs to interfaces)
+# Get peer overlay IPs from wg show (avena-overlay now assigns IPs to interfaces)
 NODE2_PEER_IP=$(wg show wg-node1 allowed-ips 2>/dev/null | awk "{print \$2}" | cut -d/ -f1 || true)
 
 echo "Node2 overlay IP (from node1 wg): $NODE2_PEER_IP"

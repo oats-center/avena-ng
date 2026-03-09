@@ -16,7 +16,7 @@ avena-overlay creates a WireGuard-based mesh network where devices:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         avenad                              │
+│                     avena-overlay                           │
 ├─────────────────────────────────────────────────────────────┤
 │  identity   │  crypto    │  discovery  │  tunnel            │
 │  ─────────  │  ────────  │  ─────────  │  ──────            │
@@ -40,7 +40,7 @@ avena-overlay creates a WireGuard-based mesh network where devices:
 | `discovery` | mDNS and static peer discovery with event broadcast     |
 | `tunnel`    | Backend-agnostic WireGuard tunnel management            |
 | `wg`        | Low-level WireGuard types, UAPI, kernel netlink         |
-| `daemon`    | Configuration and peer state for avenad                 |
+| `daemon`    | Configuration and peer state for `avena-overlay`        |
 
 ## Usage
 
@@ -65,10 +65,10 @@ let wg_keys = derive_wireguard_keypair(&device);
 
 ### Binaries
 
-**avenad** - The overlay network daemon
+**avena-overlay** - The overlay network daemon
 
 ```bash
-cargo run --bin avenad
+cargo run --bin avena-overlay
 ```
 
 **avena-keygen** - Key generation utility

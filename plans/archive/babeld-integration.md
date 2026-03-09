@@ -1,8 +1,8 @@
-# Babeld Integration Plan for Avenad
+# Babeld Integration Plan for `avena-overlay`
 
 ## Problem Statement
 
-The current avenad implementation adds static /128 routes for each directly-connected peer. This works for 2-node scenarios but fails for multi-hop routing:
+The current `avena-overlay` implementation adds static /128 routes for each directly-connected peer. This works for 2-node scenarios but fails for multi-hop routing:
 
 ```
 Node A ←→ Node B ←→ Node C
@@ -16,7 +16,7 @@ The `linear_three_hop.toml` and `star_gateway.toml` scenarios fail because of th
 
 ## Solution: Integrate babeld
 
-Use babeld (the reference Babel RFC 8966 implementation) as an external process with socket-based control from avenad.
+Use babeld (the reference Babel RFC 8966 implementation) as an external process with socket-based control from `avena-overlay`.
 
 ### Why babeld over FRR?
 
@@ -32,7 +32,7 @@ Use babeld (the reference Babel RFC 8966 implementation) as an external process 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         avenad                               │
+│                      avena-overlay                           │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
 │  │  Discovery  │  │   Tunnel    │  │  BabeldController   │ │
 │  │  (mDNS)     │  │  (WireGuard)│  │  (new module)       │ │
@@ -60,7 +60,7 @@ Use babeld (the reference Babel RFC 8966 implementation) as an external process 
      └─────────────────────────────────────┘
 ```
 
-**Key insight:** babeld directly manages the kernel routing table via its own netlink. Avenad doesn't need to add/remove routes—just tell babeld which interfaces to participate in.
+**Key insight:** babeld directly manages the kernel routing table via its own netlink. `avena-overlay` doesn't need to add/remove routes—just tell babeld which interfaces to participate in.
 
 ---
 
@@ -210,7 +210,7 @@ fn parse_babel_line(line: &str) -> Option<BabelMessage>;
 
 ---
 
-### Task 4: Extend `AvenadConfig`
+### Task 4: Extend `OverlayConfig`
 
 **File:** `src/daemon/config.rs`
 
@@ -231,9 +231,9 @@ fn default_routing_enabled() -> bool {
 }
 ```
 
-Add to `AvenadConfig`:
+Add to `OverlayConfig`:
 ```rust
-pub struct AvenadConfig {
+pub struct OverlayConfig {
     // ... existing fields ...
 
     #[serde(default)]
@@ -253,11 +253,11 @@ hello_interval = 4000
 
 ---
 
-### Task 5: Integrate into Avenad Event Loop
+### Task 5: Integrate into `avena-overlay` Event Loop
 
-**File:** `src/bin/avenad.rs`
+**File:** `src/bin/avena_overlay.rs`
 
-Changes to `Avenad::new()`:
+Changes to `OverlayDaemon::new()`:
 ```rust
 // After tunnel setup, before discovery
 let routing = if config.routing.enable_babel {
@@ -269,9 +269,9 @@ let routing = if config.routing.enable_babel {
 };
 ```
 
-Changes to `AvenadInner`:
+Changes to `OverlayDaemonInner`:
 ```rust
-struct AvenadInner {
+struct OverlayDaemonInner {
     // ... existing fields ...
     routing: Option<BabeldController>,
 }
@@ -338,11 +338,11 @@ For v1, use the simpler approach. Security hardening can come later with proper 
 The testbed creates network namespaces. Each namespace needs:
 1. babeld binary available (copy or bind-mount)
 2. Socket directory (`/run/avena/`) created
-3. babeld started by avenad automatically
+3. babeld started by avena-overlay automatically
 
 Testbed changes:
 - Ensure babeld is in PATH for namespace processes
-- Create `/run/avena/` in each namespace before starting avenad
+- Create `/run/avena/` in each namespace before starting avena-overlay
 
 ---
 
@@ -358,10 +358,10 @@ Task 2: Implement BabeldController (spawn/stop)
 Task 3: Implement socket protocol parser
     │
     ▼
-Task 4: Extend AvenadConfig
+Task 4: Extend OverlayConfig
     │
     ▼
-Task 5: Integrate into avenad (basic - just spawn babeld)
+Task 5: Integrate into avena-overlay (basic - just spawn babeld)
     │
     ▼
 Task 6: Update allowed_ips (v1: use ::/0, simple)
@@ -413,7 +413,7 @@ babeld must be installed on the system (`/usr/sbin/babeld`).
    - **Recommendation:** Start with `::/0`, harden later
 
 2. **babeld process supervision:**
-   - Should avenad restart babeld if it crashes?
+   - Should avena-overlay restart babeld if it crashes?
    - **Recommendation:** Yes, simple respawn with backoff
 
 3. **Testbed babeld installation:**
