@@ -209,6 +209,9 @@ async fn main() -> ExitCode {
             println!("  dual_underlay_same_peer.toml - Parallel links between same peer pair");
             println!("  dual_underlay_failover.toml  - Parallel-link failover validation");
             println!("  dual_underlay_churn_cleanup.toml - Churn teardown/rebuild leak check");
+            println!("  two_node_basic_ns3.toml - Two-node ns3 wireless scenario");
+            println!("  linear_three_hop_ns3.toml - Three-hop ns3 routing scenario");
+            println!("  dual_underlay_same_peer_ns3.toml - Dual-radio ns3 same-peer scenario");
             ExitCode::SUCCESS
         }
     }

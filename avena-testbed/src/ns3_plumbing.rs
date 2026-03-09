@@ -39,7 +39,13 @@ impl Ns3EndpointNames {
 
 fn hash8(network_id: &str, node_id: &str, radio_id: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for part in [network_id.as_bytes(), &[0], node_id.as_bytes(), &[0], radio_id.as_bytes()] {
+    for part in [
+        network_id.as_bytes(),
+        &[0],
+        node_id.as_bytes(),
+        &[0],
+        radio_id.as_bytes(),
+    ] {
         for byte in part {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x1000_0000_01b3);
@@ -105,11 +111,7 @@ pub fn endpoint_setup_plan_root_only(names: &Ns3EndpointNames) -> Vec<PlannedCom
     vec![
         PlannedCommand::best_effort(
             "ip",
-            &[
-                "link".to_string(),
-                "del".to_string(),
-                names.root_if.clone(),
-            ],
+            &["link".to_string(), "del".to_string(), names.root_if.clone()],
         ),
         PlannedCommand::best_effort(
             "ip",
@@ -241,11 +243,7 @@ pub fn endpoint_teardown_plan(names: &Ns3EndpointNames) -> Vec<PlannedCommand> {
         ),
         PlannedCommand::best_effort(
             "ip",
-            &[
-                "link".to_string(),
-                "del".to_string(),
-                names.root_if.clone(),
-            ],
+            &["link".to_string(), "del".to_string(), names.root_if.clone()],
         ),
         PlannedCommand::best_effort(
             "ip",
@@ -263,7 +261,10 @@ pub fn endpoint_teardown_plan(names: &Ns3EndpointNames) -> Vec<PlannedCommand> {
 
 pub async fn apply_plan(plan: &[PlannedCommand]) -> Result<(), Ns3PlumbingError> {
     for step in plan {
-        let output = Command::new(&step.program).args(&step.args).output().await?;
+        let output = Command::new(&step.program)
+            .args(&step.args)
+            .output()
+            .await?;
         if !output.status.success() && !step.allow_failure {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Ns3PlumbingError::CommandFailed {
@@ -330,7 +331,10 @@ mod tests {
         assert_eq!(plan[0].display(), format!("ip link del {}", names.root_if));
         assert!(plan[0].allow_failure);
 
-        assert_eq!(plan[1].display(), format!("ip link del {}", names.bridge_if));
+        assert_eq!(
+            plan[1].display(),
+            format!("ip link del {}", names.bridge_if)
+        );
         assert!(plan[1].allow_failure);
 
         assert_eq!(
@@ -404,7 +408,10 @@ mod tests {
 
         assert_eq!(plan.len(), 3);
         assert!(plan.iter().all(|step| step.allow_failure));
-        assert_eq!(plan[0].display(), format!("ip link del {}", names.bridge_if));
+        assert_eq!(
+            plan[0].display(),
+            format!("ip link del {}", names.bridge_if)
+        );
         assert_eq!(plan[1].display(), format!("ip link del {}", names.root_if));
         assert_eq!(
             plan[2].display(),
@@ -431,7 +438,9 @@ mod tests {
         let plan = endpoint_setup_plan_root_only(&names);
 
         assert_eq!(plan.len(), 11);
-        assert!(plan.iter().all(|step| !step.args.iter().any(|arg| arg == "netns")));
+        assert!(plan
+            .iter()
+            .all(|step| !step.args.iter().any(|arg| arg == "netns")));
         assert_eq!(
             plan[3].display(),
             format!(
@@ -446,7 +455,10 @@ mod tests {
         let names = Ns3EndpointNames::from_ids("ab-wifi", "nodeA", "wifi0");
         let step = attach_ns_interface_to_pid_plan(&names, 1234);
 
-        assert_eq!(step.display(), format!("ip link set {} netns 1234", names.ns_if));
+        assert_eq!(
+            step.display(),
+            format!("ip link set {} netns 1234", names.ns_if)
+        );
         assert!(!step.allow_failure);
     }
 }

@@ -4,13 +4,12 @@
 //! assertions at specified times during scenario execution.
 
 use crate::links::{LinkError, LinkManager};
-use crate::metrics::{AvenadEventType, LogParser, MetricsLogger};
+use crate::metrics::MetricsLogger;
 use crate::scenario::{AssertCondition, Assertion, Event, EventAction};
 use crate::telemetry_bus::TelemetryBus;
 use crate::topology::{TestTopology, TopologyError};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -46,7 +45,6 @@ pub struct TestResult {
 #[derive(Debug, Default)]
 struct EventTracker {
     connection_counts: HashMap<String, usize>,
-    log_positions: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,32 +73,10 @@ const NODE_CONNECTIVITY_ATTEMPTS: usize = 10;
 const ASSERTION_PING_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 impl EventTracker {
-    fn update_from_logs(&mut self, node_ids: &[String], log_dir: &PathBuf) {
-        let mut parser = LogParser::new();
-
+    fn update_from_telemetry(&mut self, node_ids: &[String], telemetry_bus: &TelemetryBus) {
         for node_id in node_ids {
-            let log_path = log_dir.join(format!("{}.stdout.log", node_id));
-            let pos = self.log_positions.entry(node_id.clone()).or_insert(0);
-
-            let content = match std::fs::read_to_string(&log_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let new_content = if (*pos as usize) < content.len() {
-                &content[*pos as usize..]
-            } else {
-                continue;
-            };
-
-            *pos = content.len() as u64;
-
-            let events = parser.parse_log_content(node_id, new_content);
-            for event in events {
-                if matches!(event.event_type, AvenadEventType::PeerConnected { .. }) {
-                    *self.connection_counts.entry(node_id.clone()).or_insert(0) += 1;
-                }
-            }
+            let count = telemetry_bus.peer_connected_count(node_id);
+            self.connection_counts.insert(node_id.clone(), count);
         }
     }
 }
@@ -114,7 +90,6 @@ pub struct EventExecutor {
     links: Arc<Mutex<LinkManager>>,
     metrics: Arc<MetricsLogger>,
     telemetry_bus: Arc<TelemetryBus>,
-    log_dir: PathBuf,
     node_ids: Vec<String>,
 }
 
@@ -130,7 +105,6 @@ impl EventExecutor {
         links: Arc<Mutex<LinkManager>>,
         metrics: Arc<MetricsLogger>,
         telemetry_bus: Arc<TelemetryBus>,
-        log_dir: PathBuf,
         node_ids: Vec<String>,
     ) -> Self {
         Self {
@@ -138,7 +112,6 @@ impl EventExecutor {
             links,
             metrics,
             telemetry_bus,
-            log_dir,
             node_ids,
         }
     }
@@ -203,7 +176,7 @@ impl EventExecutor {
                 events_executed += 1;
             }
 
-            tracker.update_from_logs(&self.node_ids, &self.log_dir);
+            tracker.update_from_telemetry(&self.node_ids, &self.telemetry_bus);
 
             let elapsed_ms = (elapsed * 1000.0) as u64;
             for state in link_convergence.values_mut() {
@@ -308,7 +281,11 @@ impl EventExecutor {
 
                         assertions_passed += 1;
                         self.metrics.log_assertion_result(assertion, true);
-                        if let Err(err) = self.telemetry_bus.publish_assertion_result(assertion, true).await {
+                        if let Err(err) = self
+                            .telemetry_bus
+                            .publish_assertion_result(assertion, true)
+                            .await
+                        {
                             tracing::warn!(error = %err, "failed to publish assertion telemetry");
                         }
                         tracing::debug!(
@@ -730,6 +707,8 @@ where
 mod tests {
     use super::*;
     use crate::scenario::AssertCondition;
+    use crate::telemetry::TELEMETRY_SCHEMA_VERSION;
+    use crate::telemetry_bus::{TelemetryBus, TelemetryEnvelope};
 
     #[test]
     fn test_result_default() {
@@ -811,5 +790,29 @@ mod tests {
 
         assert!(!ok);
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn event_tracker_updates_connection_counts_from_telemetry_bus() {
+        let bus = TelemetryBus::disabled("run123");
+        let peer_connected = TelemetryEnvelope {
+            v: TELEMETRY_SCHEMA_VERSION,
+            subject: "avena.v1.run123.node.nodeA.overlay.peer_connected".to_string(),
+            ts_ms: 10,
+            run_id: "run123".to_string(),
+            source: "avenad".to_string(),
+            node: Some("nodeA".to_string()),
+            radio: None,
+            peer: Some("nodeB".to_string()),
+            data: serde_json::json!({"peer":"nodeB"}),
+        };
+        bus.record_inbound_envelope(&peer_connected);
+        bus.record_inbound_envelope(&peer_connected);
+
+        let mut tracker = EventTracker::default();
+        tracker.update_from_telemetry(&["nodeA".to_string(), "nodeB".to_string()], &bus);
+
+        assert_eq!(tracker.connection_counts.get("nodeA"), Some(&2));
+        assert_eq!(tracker.connection_counts.get("nodeB"), Some(&0));
     }
 }

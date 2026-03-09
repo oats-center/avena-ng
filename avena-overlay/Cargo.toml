@@ -42,6 +42,7 @@ mdns-sd = "0.11"
 
 # Async
 async-trait = "0.1"
+async-nats = "0.39"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "time", "fs", "io-util", "process"] }
 
 # Logging

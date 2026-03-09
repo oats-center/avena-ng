@@ -9,6 +9,7 @@ use avena_overlay::{
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
 use lru::LruCache;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,179 @@ const OUTGOING_HANDSHAKE_COOLDOWN: Duration = Duration::from_secs(10);
 const OUTGOING_HANDSHAKE_REFRESH_AFTER: Duration = Duration::from_secs(5);
 const TUNNEL_PORT_BASE: u16 = 20000;
 const TUNNEL_PORT_SPAN: u16 = 40000;
+const TELEMETRY_SCHEMA_VERSION: u8 = 1;
+const DEFAULT_TELEMETRY_RUN_ID: &str = "standalone";
+const DEFAULT_TELEMETRY_TOKEN: &str = "unknown";
+
+fn sanitize_subject_token(raw: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_dash = false;
+
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TelemetryEnvelope {
+    v: u8,
+    subject: String,
+    ts_ms: u64,
+    run_id: String,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    radio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer: Option<String>,
+    data: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct TelemetryPublisher {
+    client: Option<async_nats::Client>,
+    run_id: String,
+    node_id: String,
+    started_at: Instant,
+}
+
+impl TelemetryPublisher {
+    async fn new(config: &AvenadConfig, fallback_node_id: String) -> Self {
+        let run_id = config
+            .telemetry
+            .run_id
+            .clone()
+            .or_else(|| std::env::var("AVENA_RUN_ID").ok())
+            .map(|id| sanitize_subject_token(&id, DEFAULT_TELEMETRY_RUN_ID))
+            .unwrap_or_else(|| DEFAULT_TELEMETRY_RUN_ID.to_string());
+        let node_id = config
+            .telemetry
+            .node_id
+            .clone()
+            .map(|id| sanitize_subject_token(&id, DEFAULT_TELEMETRY_TOKEN))
+            .unwrap_or_else(|| sanitize_subject_token(&fallback_node_id, DEFAULT_TELEMETRY_TOKEN));
+
+        if !config.telemetry.publish_nats {
+            return Self {
+                client: None,
+                run_id,
+                node_id,
+                started_at: Instant::now(),
+            };
+        }
+
+        let nats_url = config
+            .telemetry
+            .nats_url
+            .as_ref()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+            .or_else(|| std::env::var("AVENA_NATS_URL").ok());
+
+        let client = match nats_url {
+            Some(url) => match async_nats::connect(&url).await {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    warn!(url = %url, "Failed to connect telemetry NATS: {}", err);
+                    None
+                }
+            },
+            None => {
+                warn!("Telemetry enabled but no NATS URL configured");
+                None
+            }
+        };
+
+        Self {
+            client,
+            run_id,
+            node_id,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn overlay_subject(&self, event: &str) -> String {
+        let event = sanitize_subject_token(event, DEFAULT_TELEMETRY_TOKEN);
+        format!(
+            "avena.v1.{}.node.{}.overlay.{}",
+            self.run_id, self.node_id, event
+        )
+    }
+
+    fn babel_subject(&self, topic: &str) -> String {
+        let topic = sanitize_subject_token(topic, DEFAULT_TELEMETRY_TOKEN);
+        format!(
+            "avena.v1.{}.node.{}.routing.babel.{}",
+            self.run_id, self.node_id, topic
+        )
+    }
+
+    async fn publish_overlay(&self, event: &str, data: serde_json::Value) {
+        let subject = self.overlay_subject(event);
+        self.publish_subject(subject, data).await;
+    }
+
+    async fn publish_babel_routes(&self, routes: serde_json::Value) {
+        let subject = self.babel_subject("routes");
+        self.publish_subject(subject, routes).await;
+    }
+
+    async fn publish_babel_neighbours(&self, neighbours: serde_json::Value) {
+        let subject = self.babel_subject("neighbors");
+        self.publish_subject(subject, neighbours).await;
+    }
+
+    async fn publish_subject(&self, subject: String, data: serde_json::Value) {
+        let Some(client) = &self.client else {
+            return;
+        };
+
+        let envelope = TelemetryEnvelope {
+            v: TELEMETRY_SCHEMA_VERSION,
+            subject: subject.clone(),
+            ts_ms: self.started_at.elapsed().as_millis() as u64,
+            run_id: self.run_id.clone(),
+            source: "avenad".to_string(),
+            node: Some(self.node_id.clone()),
+            radio: data
+                .get("radio")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            peer: data
+                .get("peer")
+                .or_else(|| data.get("peer_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            data,
+        };
+
+        let payload = match serde_json::to_vec(&envelope) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!(subject = %subject, "Failed to serialize telemetry event: {}", err);
+                return;
+            }
+        };
+
+        if let Err(err) = client.publish(subject.clone(), payload.into()).await {
+            warn!(subject = %subject, "Failed to publish telemetry event: {}", err);
+        }
+    }
+}
 
 struct NonceCache {
     entries: Mutex<LruCache<(DeviceId, [u8; 32]), Instant>>,
@@ -121,6 +295,7 @@ struct AvenadInner {
     device_cert: String,
     routing: Mutex<Option<BabeldController>>,
     overlay_route_rx_bytes: Mutex<HashMap<String, u64>>,
+    telemetry: Arc<TelemetryPublisher>,
 }
 
 struct Avenad {
@@ -269,6 +444,9 @@ impl Avenad {
             }
         };
 
+        let telemetry =
+            Arc::new(TelemetryPublisher::new(&config, keypair.device_id().to_string()).await);
+
         let inner = Arc::new(AvenadInner {
             config,
             keypair,
@@ -288,6 +466,7 @@ impl Avenad {
             device_cert,
             routing: Mutex::new(routing),
             overlay_route_rx_bytes: Mutex::new(HashMap::new()),
+            telemetry,
         });
 
         Ok(Self {
@@ -344,6 +523,12 @@ impl Avenad {
             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         discovered_peer_retry_interval.tick().await;
 
+        let mut babel_snapshot_interval = tokio::time::interval(Duration::from_secs(
+            inner.config.telemetry.babel_snapshot_interval_secs.max(1),
+        ));
+        babel_snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        babel_snapshot_interval.tick().await;
+
         loop {
             tokio::select! {
                 result = discovery_rx.recv() => {
@@ -359,6 +544,16 @@ impl Avenad {
                                 };
 
                                 info!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Peer discovered");
+                                inner
+                                    .telemetry
+                                    .publish_overlay(
+                                        "peer_discovered",
+                                        serde_json::json!({
+                                            "peer_id": peer.device_id.to_string(),
+                                            "endpoint": peer.endpoint.to_string(),
+                                        }),
+                                    )
+                                    .await;
                                 inner.discovery.cache_discovered_peer(&peer);
                                 let inner_clone = Arc::clone(&inner);
                                 tokio::spawn(async move {
@@ -371,6 +566,16 @@ impl Avenad {
                         }
                         Ok(DiscoveryEvent::PeerLost(device_id)) => {
                             info!(peer_id = %device_id, "Peer lost");
+                            inner
+                                .telemetry
+                                .publish_overlay(
+                                    "peer_disconnected",
+                                    serde_json::json!({
+                                        "peer_id": device_id.to_string(),
+                                        "reason": "peer_lost",
+                                    }),
+                                )
+                                .await;
                             inner.handle_peer_lost(&device_id).await;
                         }
                         Err(e) => {
@@ -395,6 +600,16 @@ impl Avenad {
                             };
 
                             info!(addr = %addr, "Incoming handshake connection");
+                            inner
+                                .telemetry
+                                .publish_overlay(
+                                    "handshake_started",
+                                    serde_json::json!({
+                                        "direction": "incoming",
+                                        "addr": addr.to_string(),
+                                    }),
+                                )
+                                .await;
                             let inner_clone = Arc::clone(&inner);
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -409,10 +624,34 @@ impl Avenad {
                                                 entry.insert(peer_state);
                                                 inserted = true;
                                                 info!(peer_id = %device_id, iface = %iface, "Peer connected via incoming handshake");
+                                                inner_clone
+                                                    .telemetry
+                                                    .publish_overlay(
+                                                        "peer_connected",
+                                                        serde_json::json!({
+                                                            "peer_id": device_id.to_string(),
+                                                            "iface": iface,
+                                                            "direction": "incoming",
+                                                            "inserted": inserted,
+                                                        }),
+                                                    )
+                                                    .await;
                                             }
                                             Entry::Occupied(mut entry) => {
                                                 *entry.get_mut() = peer_state;
                                                 info!(peer_id = %device_id, iface = %iface, "Peer refreshed via incoming handshake");
+                                                inner_clone
+                                                    .telemetry
+                                                    .publish_overlay(
+                                                        "peer_connected",
+                                                        serde_json::json!({
+                                                            "peer_id": device_id.to_string(),
+                                                            "iface": iface,
+                                                            "direction": "incoming",
+                                                            "inserted": inserted,
+                                                        }),
+                                                    )
+                                                    .await;
                                             }
                                         }
                                         drop(peers);
@@ -450,6 +689,9 @@ impl Avenad {
                 }
                 _ = discovered_peer_retry_interval.tick() => {
                     inner.retry_discovered_peers().await;
+                }
+                _ = babel_snapshot_interval.tick() => {
+                    inner.publish_babel_snapshot().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutdown signal received");
@@ -635,12 +877,12 @@ impl AvenadInner {
                     capabilities: std::collections::HashSet::new(),
                     interface_suffix: Some(idx as u8),
                 };
-                 debug!(interface = %iface, endpoint = %announcement.wg_endpoint, "Announcing on interface");
-                 self.discovery.announce(&announcement).await?;
-             }
-         }
-         Ok(())
-     }
+                debug!(interface = %iface, endpoint = %announcement.wg_endpoint, "Announcing on interface");
+                self.discovery.announce(&announcement).await?;
+            }
+        }
+        Ok(())
+    }
 
     async fn handle_discovered_peer(&self, peer: DiscoveredPeer) -> Result<(), AvenadError> {
         let should_initiate = self.keypair.device_id() > peer.device_id;
@@ -707,6 +949,16 @@ impl AvenadInner {
         }
 
         info!(peer_id = %peer.device_id, "Initiating handshake");
+        self.telemetry
+            .publish_overlay(
+                "handshake_started",
+                serde_json::json!({
+                    "direction": "outgoing",
+                    "peer_id": peer.device_id.to_string(),
+                    "endpoint": peer.endpoint.to_string(),
+                }),
+            )
+            .await;
 
         let handshake_addr = SocketAddr::new(peer.endpoint.ip(), peer.endpoint.port() + 1);
         let handshake_result = self.perform_outgoing_handshake(handshake_addr, &peer).await;
@@ -722,10 +974,32 @@ impl AvenadInner {
             Entry::Vacant(entry) => {
                 entry.insert(peer_state);
                 info!(peer_id = %peer.device_id, iface = %iface, "Peer connected");
+                self.telemetry
+                    .publish_overlay(
+                        "peer_connected",
+                        serde_json::json!({
+                            "peer_id": peer.device_id.to_string(),
+                            "iface": iface,
+                            "direction": "outgoing",
+                            "inserted": true,
+                        }),
+                    )
+                    .await;
             }
             Entry::Occupied(mut entry) => {
                 *entry.get_mut() = peer_state;
                 info!(peer_id = %peer.device_id, iface = %iface, "Peer refreshed");
+                self.telemetry
+                    .publish_overlay(
+                        "peer_connected",
+                        serde_json::json!({
+                            "peer_id": peer.device_id.to_string(),
+                            "iface": iface,
+                            "direction": "outgoing",
+                            "inserted": false,
+                        }),
+                    )
+                    .await;
             }
         }
         drop(peers);
@@ -1016,7 +1290,19 @@ impl AvenadInner {
         }
 
         for tunnel_interface in tunnels_to_remove {
-            self.remove_tunnel_interface(&tunnel_interface).await;
+            if let Some((removed_id, _overlay_ip)) =
+                self.remove_tunnel_interface(&tunnel_interface).await
+            {
+                self.telemetry
+                    .publish_overlay(
+                        "peer_disconnected",
+                        serde_json::json!({
+                            "peer_id": removed_id.to_string(),
+                            "reason": "peer_lost",
+                        }),
+                    )
+                    .await;
+            }
         }
 
         if let Err(e) = self.reconcile_peer_allowed_ips().await {
@@ -1264,8 +1550,7 @@ impl AvenadInner {
             }
 
             let already_connected = self.peers.read().await.values().any(|state| {
-                state.device_id == peer.device_id
-                    && state.endpoint == Some(peer.endpoint)
+                state.device_id == peer.device_id && state.endpoint == Some(peer.endpoint)
             });
             if already_connected {
                 continue;
@@ -1275,6 +1560,59 @@ impl AvenadInner {
                 debug!(peer_id = %peer.device_id, "retrying discovered peer failed: {}", e);
             }
         }
+    }
+
+    async fn publish_babel_snapshot(&self) {
+        let dump = {
+            let mut routing = self.routing.lock().await;
+            let Some(controller) = routing.as_mut() else {
+                return;
+            };
+
+            match controller.dump().await {
+                Ok(dump) => dump,
+                Err(err) => {
+                    debug!("failed to dump babel state for telemetry: {}", err);
+                    return;
+                }
+            }
+        };
+
+        let routes = dump
+            .routes
+            .iter()
+            .map(|route| {
+                serde_json::json!({
+                    "id": route.id.clone(),
+                    "prefix": route.prefix.to_string(),
+                    "installed": route.installed,
+                    "metric": route.metric,
+                    "via": route.via.to_string(),
+                    "interface": route.interface.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.telemetry
+            .publish_babel_routes(serde_json::json!({ "routes": routes }))
+            .await;
+
+        let neighbours = dump
+            .neighbours
+            .iter()
+            .map(|neighbour| {
+                serde_json::json!({
+                    "id": neighbour.id.clone(),
+                    "address": neighbour.address.to_string(),
+                    "interface": neighbour.interface.clone(),
+                    "rxcost": neighbour.rxcost,
+                    "txcost": neighbour.txcost,
+                    "reach": neighbour.reach,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.telemetry
+            .publish_babel_neighbours(serde_json::json!({ "neighbours": neighbours }))
+            .await;
     }
 
     async fn check_dead_peers(&self) {
@@ -1356,10 +1694,19 @@ impl AvenadInner {
         let mut removed_any = false;
         for (device_id, tunnel_interface) in to_remove {
             warn!(peer_id = %device_id, iface = %tunnel_interface, "Removing dead peer tunnel");
-            removed_any |= self
-                .remove_tunnel_interface(&tunnel_interface)
-                .await
-                .is_some();
+            let removed = self.remove_tunnel_interface(&tunnel_interface).await;
+            if removed.is_some() {
+                self.telemetry
+                    .publish_overlay(
+                        "peer_disconnected",
+                        serde_json::json!({
+                            "peer_id": device_id.to_string(),
+                            "reason": "dead_peer_timeout",
+                        }),
+                    )
+                    .await;
+            }
+            removed_any |= removed.is_some();
         }
 
         if removed_any {
@@ -1777,6 +2124,37 @@ mod tests {
         let mapped: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
         let normalized = canonical_underlay_ip(mapped);
         assert_eq!(normalized, "10.1.2.3".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn telemetry_subject_tokens_are_sanitized() {
+        let publisher = TelemetryPublisher {
+            client: None,
+            run_id: sanitize_subject_token("Run ID 01", DEFAULT_TELEMETRY_RUN_ID),
+            node_id: sanitize_subject_token("Node.ID", DEFAULT_TELEMETRY_TOKEN),
+            started_at: Instant::now(),
+        };
+
+        assert_eq!(
+            publisher.overlay_subject("peer.connected!"),
+            "avena.v1.run-id-01.node.node-id.overlay.peer-connected"
+        );
+        assert_eq!(
+            publisher.babel_subject("NEIGHBORS/active"),
+            "avena.v1.run-id-01.node.node-id.routing.babel.neighbors-active"
+        );
+    }
+
+    #[test]
+    fn telemetry_subject_tokens_use_fallback_when_empty() {
+        assert_eq!(
+            sanitize_subject_token("", DEFAULT_TELEMETRY_TOKEN),
+            "unknown"
+        );
+        assert_eq!(
+            sanitize_subject_token("...", DEFAULT_TELEMETRY_TOKEN),
+            "unknown"
+        );
     }
 }
 

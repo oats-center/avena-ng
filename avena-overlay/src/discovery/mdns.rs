@@ -5,8 +5,8 @@
 
 use crate::DeviceId;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 

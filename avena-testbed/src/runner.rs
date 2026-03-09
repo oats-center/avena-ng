@@ -5,7 +5,7 @@
 
 use crate::events::{EventError, EventExecutor, TestResult};
 use crate::links::LinkManager;
-use crate::metrics::{LogParser, MetricsLogger};
+use crate::metrics::MetricsLogger;
 use crate::ns3_driver::Ns3DriverProcess;
 use crate::pki::TestPki;
 use crate::scenario::{EmulationBackend, Scenario};
@@ -97,11 +97,11 @@ impl TestRunner {
 
         let run_id = new_run_id();
         tracing::info!(run_id = %run_id, "starting testbed run");
-        let telemetry_bus = Arc::new(TelemetryBus::from_config(
-            &run_id,
-            &scenario.emulation.telemetry,
-        )
-        .await?);
+        let telemetry_bus =
+            Arc::new(TelemetryBus::from_config(&run_id, &scenario.emulation.telemetry).await?);
+        if let Err(err) = telemetry_bus.publish_scenario_started(&scenario.name).await {
+            tracing::warn!(error = %err, "failed to publish scenario started telemetry");
+        }
         if let Err(err) = telemetry_bus.publish_scenario_inventory(scenario).await {
             tracing::warn!(error = %err, "failed to publish scenario inventory telemetry");
         }
@@ -141,7 +141,8 @@ impl TestRunner {
                         while let Some(event) = event_rx.recv().await {
                             metrics.log_ns3_event_with_run_id(&run_id, event.payload.clone());
                             if emit_nats {
-                                if let Err(err) = telemetry_bus.publish_ns3_payload(&event.payload).await
+                                if let Err(err) =
+                                    telemetry_bus.publish_ns3_payload(&event.payload).await
                                 {
                                     tracing::warn!(
                                         error = %err,
@@ -157,7 +158,7 @@ impl TestRunner {
 
         let phase = status.phase(&format!("Starting {} nodes", scenario.nodes.len()));
         let log_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
-        if let Err(err) = topology.start_nodes(&pki, scenario, log_dir).await {
+        if let Err(err) = topology.start_nodes(&pki, scenario, log_dir, &run_id).await {
             shutdown_ns3_driver(&mut ns3_driver, &mut ns3_event_task).await;
             return Err(err.into());
         }
@@ -216,7 +217,6 @@ impl TestRunner {
             Arc::clone(&links),
             Arc::clone(&metrics),
             Arc::clone(&telemetry_bus),
-            log_dir.to_path_buf(),
             node_ids,
         );
 
@@ -247,30 +247,11 @@ impl TestRunner {
 
         let result = result?;
 
-        let mut log_parser = LogParser::new();
-        let mut all_events = Vec::new();
-
-        for node in &scenario.nodes {
-            let log_path = log_dir.join(format!("{}.stdout.log", node.id));
-            let events = log_parser.parse_log_file(&node.id, &log_path);
-            all_events.extend(events);
-        }
-
-        all_events.sort_by_key(|e| e.timestamp);
-
-        if let Some(first_event) = all_events.first() {
-            let scenario_start = first_event.timestamp;
-            metrics.log_parsed_events(&all_events, scenario_start);
-
-            let aggregated_metrics = log_parser.compute_metrics(&all_events);
-            metrics.log_metrics_summary(&aggregated_metrics);
-
-            tracing::info!(
-                discoveries = aggregated_metrics.discovery_count,
-                connections = aggregated_metrics.connection_count,
-                avg_handshake_ms = ?aggregated_metrics.avg_handshake_ms(),
-                "avenad metrics"
-            );
+        if let Err(err) = telemetry_bus
+            .publish_scenario_completed(&scenario.name, result.passed, result.duration_secs)
+            .await
+        {
+            tracing::warn!(error = %err, "failed to publish scenario completed telemetry");
         }
 
         metrics.log_scenario_completed(result.passed, result.duration_secs);

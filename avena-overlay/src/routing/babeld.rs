@@ -255,8 +255,10 @@ impl BabeldController {
             .arg(hello_secs.to_string());
 
         if let Some(value) = ipv6_subtrees_setting {
-            cmd.arg("-C")
-                .arg(format!("ipv6-subtrees {}", if value { "true" } else { "false" }));
+            cmd.arg("-C").arg(format!(
+                "ipv6-subtrees {}",
+                if value { "true" } else { "false" }
+            ));
         }
 
         // Many babeld builds refuse to start without at least one interface.

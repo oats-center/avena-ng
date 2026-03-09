@@ -1,0 +1,83 @@
+name = "dual-underlay-same-peer-ns3"
+description = "Two parallel wireless underlays between the same peer pair on ns3 backend"
+duration_secs = 45
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+realtime_hard_limit_ms = 250
+
+[emulation.ns3.radio_profiles.default_wifi]
+kind = "wifi"
+phy_backend = "spectrum"
+standard = "802.11n"
+band = "5ghz"
+channel_width_mhz = 20
+tx_power_dbm = 18
+rx_noise_figure_db = 7
+propagation = "log-distance"
+
+[[nodes]]
+id = "nodeA"
+capabilities = ["relay"]
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "default_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+channel = 36
+
+[[nodes.radios]]
+id = "wifi1"
+band = "2.4ghz"
+channel = 1
+
+[[nodes]]
+id = "nodeB"
+capabilities = ["relay"]
+position = { x_m = 20.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "default_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+channel = 36
+
+[[nodes.radios]]
+id = "wifi1"
+band = "2.4ghz"
+channel = 1
+
+[[links]]
+id = "ab-5g"
+medium = "wifi"
+endpoints = ["nodeA:wifi0", "nodeB:wifi0"]
+latency_ms = 8
+bandwidth_kbps = 100000
+loss_percent = 0.0
+enabled = true
+
+[[links]]
+id = "ab-24g"
+medium = "wifi"
+endpoints = ["nodeA:wifi1", "nodeB:wifi1"]
+latency_ms = 20
+bandwidth_kbps = 50000
+loss_percent = 1.0
+enabled = true
+
+[[assertions]]
+at_secs = 15.0
+condition = { type = "NodesConnected", nodes = ["nodeA", "nodeB"] }
+
+[[assertions]]
+at_secs = 30.0
+condition = { type = "TunnelInterfaceCount", node = "nodeA", count = 2 }
+
+[[assertions]]
+at_secs = 30.0
+condition = { type = "TunnelInterfaceCount", node = "nodeB", count = 2 }
+
+[[assertions]]
+at_secs = 35.0
+condition = { type = "Ping", from = "nodeA", to = "nodeB", timeout_ms = 2500 }

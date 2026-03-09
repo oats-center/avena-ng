@@ -1,6 +1,9 @@
 use crate::ns3_plumbing::Ns3EndpointNames;
-use crate::scenario::{EmulationBackend, NodePosition, Scenario};
+use crate::scenario::{
+    EmulationBackend, NodeConfig, NodePosition, NodeRadioConfig, RadioProfileConfig, Scenario,
+};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
@@ -14,7 +17,9 @@ const READY_MARKER: &str = "ns3_ready";
 
 #[derive(Error, Debug)]
 pub enum Ns3DriverError {
-    #[error("ns3 driver binary is not configured; set emulation.ns3.driver_bin or AVENA_NS3_DRIVER_BIN")]
+    #[error(
+        "ns3 driver binary is not configured; set emulation.ns3.driver_bin or AVENA_NS3_DRIVER_BIN"
+    )]
     MissingDriverBinary,
 
     #[error("invalid radio reference '{value}', expected '<node_id>:<radio_id>'")]
@@ -261,18 +266,8 @@ pub fn build_runtime_config(scenario: &Scenario) -> Result<Ns3RuntimeConfig, Ns3
             radios: node
                 .radios
                 .iter()
-                .map(|radio| Ns3RuntimeRadio {
-                    id: radio.id.clone(),
-                    profile: radio.profile.clone(),
-                    kind: radio.kind.clone(),
-                    phy_backend: radio.phy_backend.clone(),
-                    standard: radio.standard.clone(),
-                    band: radio.band.clone(),
-                    channel: radio.channel,
-                    channel_width_mhz: radio.channel_width_mhz,
-                    tx_power_dbm: radio.tx_power_dbm,
-                    rx_noise_figure_db: radio.rx_noise_figure_db,
-                    propagation: radio.propagation.clone(),
+                .map(|radio| {
+                    resolved_radio_config(node, radio, &scenario.emulation.ns3.radio_profiles)
                 })
                 .collect(),
         })
@@ -425,6 +420,62 @@ fn fixed_from_position(position: &NodePosition) -> Ns3Mobility {
     }
 }
 
+fn resolved_radio_config(
+    node: &NodeConfig,
+    radio: &NodeRadioConfig,
+    profiles: &HashMap<String, RadioProfileConfig>,
+) -> Ns3RuntimeRadio {
+    let mut resolved = Ns3RuntimeRadio {
+        id: radio.id.clone(),
+        profile: radio.profile.clone().or_else(|| node.radio_profile.clone()),
+        kind: None,
+        phy_backend: None,
+        standard: None,
+        band: None,
+        channel: None,
+        channel_width_mhz: None,
+        tx_power_dbm: None,
+        rx_noise_figure_db: None,
+        propagation: None,
+    };
+
+    if let Some(node_profile_name) = node.radio_profile.as_ref() {
+        if let Some(profile) = profiles.get(node_profile_name) {
+            apply_profile_to_runtime(&mut resolved, profile);
+        }
+    }
+
+    if let Some(radio_profile_name) = radio.profile.as_ref() {
+        if let Some(profile) = profiles.get(radio_profile_name) {
+            apply_profile_to_runtime(&mut resolved, profile);
+        }
+    }
+
+    resolved.kind = radio.kind.clone().or(resolved.kind);
+    resolved.phy_backend = radio.phy_backend.clone().or(resolved.phy_backend);
+    resolved.standard = radio.standard.clone().or(resolved.standard);
+    resolved.band = radio.band.clone().or(resolved.band);
+    resolved.channel = radio.channel.or(resolved.channel);
+    resolved.channel_width_mhz = radio.channel_width_mhz.or(resolved.channel_width_mhz);
+    resolved.tx_power_dbm = radio.tx_power_dbm.or(resolved.tx_power_dbm);
+    resolved.rx_noise_figure_db = radio.rx_noise_figure_db.or(resolved.rx_noise_figure_db);
+    resolved.propagation = radio.propagation.clone().or(resolved.propagation);
+
+    resolved
+}
+
+fn apply_profile_to_runtime(runtime: &mut Ns3RuntimeRadio, profile: &RadioProfileConfig) {
+    runtime.kind = profile.kind.clone().or(runtime.kind.clone());
+    runtime.phy_backend = profile.phy_backend.clone().or(runtime.phy_backend.clone());
+    runtime.standard = profile.standard.clone().or(runtime.standard.clone());
+    runtime.band = profile.band.clone().or(runtime.band.clone());
+    runtime.channel = profile.channel.or(runtime.channel);
+    runtime.channel_width_mhz = profile.channel_width_mhz.or(runtime.channel_width_mhz);
+    runtime.tx_power_dbm = profile.tx_power_dbm.or(runtime.tx_power_dbm);
+    runtime.rx_noise_figure_db = profile.rx_noise_figure_db.or(runtime.rx_noise_figure_db);
+    runtime.propagation = profile.propagation.clone().or(runtime.propagation.clone());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +554,87 @@ members = ["nodeA:wifi0", "nodeB:wifi0"]
         assert_eq!(bridge.members[1].underlay_ipv4, "10.2.0.2");
     }
 
+    #[test]
+    fn build_runtime_config_merges_radio_profiles_with_overrides() {
+        let toml = r#"
+name = "ns3-driver-merge"
+duration_secs = 3
+
+[emulation]
+backend = "ns3"
+
+[emulation.ns3]
+driver_bin = "/bin/bash"
+driver_args = ["-c", "echo ns3_ready; sleep 0.1"]
+
+[emulation.ns3.radio_profiles.default_wifi]
+kind = "wifi"
+phy_backend = "spectrum"
+standard = "802.11n"
+band = "5ghz"
+channel_width_mhz = 20
+tx_power_dbm = 18
+rx_noise_figure_db = 7
+propagation = "log-distance"
+
+[emulation.ns3.radio_profiles.sensor_wifi]
+kind = "wifi"
+phy_backend = "yans"
+band = "2.4ghz"
+channel = 1
+tx_power_dbm = 10
+
+[[nodes]]
+id = "nodeA"
+position = { x_m = 0.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "default_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+profile = "sensor_wifi"
+channel = 6
+tx_power_dbm = 13
+
+[[nodes]]
+id = "nodeB"
+position = { x_m = 1.0, y_m = 0.0, z_m = 0.0 }
+radio_profile = "default_wifi"
+
+[[nodes.radios]]
+id = "wifi0"
+
+[[links]]
+id = "ab"
+medium = "wifi"
+endpoints = ["nodeA:wifi0", "nodeB:wifi0"]
+latency_ms = 10
+bandwidth_kbps = 1000
+"#;
+
+        let scenario = Scenario::from_toml(toml).expect("valid scenario");
+        let config = build_runtime_config(&scenario).expect("runtime config");
+        let node_a = config
+            .nodes
+            .iter()
+            .find(|node| node.id == "nodeA")
+            .expect("missing nodeA");
+        let radio = node_a
+            .radios
+            .iter()
+            .find(|r| r.id == "wifi0")
+            .expect("radio");
+
+        assert_eq!(radio.profile.as_deref(), Some("sensor_wifi"));
+        assert_eq!(radio.kind.as_deref(), Some("wifi"));
+        assert_eq!(radio.phy_backend.as_deref(), Some("yans"));
+        assert_eq!(radio.band.as_deref(), Some("2.4ghz"));
+        assert_eq!(radio.channel, Some(6));
+        assert_eq!(radio.channel_width_mhz, Some(20));
+        assert_eq!(radio.tx_power_dbm, Some(13.0));
+        assert_eq!(radio.rx_noise_figure_db, Some(7.0));
+        assert_eq!(radio.propagation.as_deref(), Some("log-distance"));
+    }
+
     #[tokio::test]
     async fn start_if_needed_is_noop_for_netem() {
         let toml = r#"
@@ -568,8 +700,8 @@ bandwidth_kbps = 1000
 
     #[test]
     fn parse_event_line_parses_valid_json() {
-        let event = parse_event_line(r#"{"type":"realtime","lag_ms":3}"#)
-            .expect("event should parse");
+        let event =
+            parse_event_line(r#"{"type":"realtime","lag_ms":3}"#).expect("event should parse");
         assert_eq!(event.payload["type"], "realtime");
         assert_eq!(event.payload["lag_ms"], 3);
     }
@@ -598,7 +730,9 @@ bandwidth_kbps = 1000
         tokio::time::sleep(Duration::from_millis(100)).await;
         let events = handle.drain_events();
         assert!(
-            events.iter().any(|event| event.payload["type"] == "realtime"),
+            events
+                .iter()
+                .any(|event| event.payload["type"] == "realtime"),
             "expected realtime event"
         );
 

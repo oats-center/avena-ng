@@ -76,6 +76,10 @@ pub struct AvenadConfig {
     #[serde(default)]
     /// Routing protocol configuration (babeld).
     pub routing: RoutingConfig,
+
+    #[serde(default)]
+    /// Telemetry publishing configuration (NATS).
+    pub telemetry: TelemetryConfig,
 }
 
 /// Routing protocol configuration.
@@ -90,6 +94,42 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             babel: BabeldConfig::default(),
+        }
+    }
+}
+
+/// Telemetry transport configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    #[serde(default = "default_publish_nats")]
+    /// Publish telemetry events to NATS when true.
+    pub publish_nats: bool,
+
+    #[serde(default)]
+    /// Optional explicit NATS URL. Falls back to AVENA_NATS_URL when unset.
+    pub nats_url: Option<String>,
+
+    #[serde(default)]
+    /// Optional run identifier used in telemetry subjects.
+    pub run_id: Option<String>,
+
+    #[serde(default)]
+    /// Optional logical node identifier to use in telemetry subjects.
+    pub node_id: Option<String>,
+
+    #[serde(default = "default_babel_snapshot_interval_secs")]
+    /// How often to publish Babel route/neighbour snapshots.
+    pub babel_snapshot_interval_secs: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            publish_nats: default_publish_nats(),
+            nats_url: None,
+            run_id: None,
+            node_id: None,
+            babel_snapshot_interval_secs: default_babel_snapshot_interval_secs(),
         }
     }
 }
@@ -162,6 +202,14 @@ fn default_dead_peer_timeout() -> u64 {
     180
 }
 
+fn default_publish_nats() -> bool {
+    true
+}
+
+fn default_babel_snapshot_interval_secs() -> u64 {
+    1
+}
+
 fn default_mdns_enabled() -> bool {
     true
 }
@@ -189,6 +237,7 @@ impl Default for AvenadConfig {
             persistent_keepalive: default_keepalive(),
             dead_peer_timeout_secs: default_dead_peer_timeout(),
             routing: RoutingConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 }
@@ -265,6 +314,18 @@ mod tests {
             PathBuf::from("/etc/avena/root.cert")
         );
         assert_eq!(config.device_cert, PathBuf::from("/etc/avena/device.cert"));
+        assert!(config.telemetry.publish_nats);
+        assert_eq!(config.telemetry.babel_snapshot_interval_secs, 1);
+    }
+
+    #[test]
+    fn telemetry_defaults_are_safe() {
+        let telemetry = TelemetryConfig::default();
+        assert!(telemetry.publish_nats);
+        assert!(telemetry.nats_url.is_none());
+        assert!(telemetry.run_id.is_none());
+        assert!(telemetry.node_id.is_none());
+        assert_eq!(telemetry.babel_snapshot_interval_secs, 1);
     }
 
     #[test]

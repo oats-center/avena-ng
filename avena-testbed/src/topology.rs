@@ -3,19 +3,27 @@
 //! Uses unshare to create isolated network+mount namespaces for each node,
 //! connects them with veth pairs, and manages avenad process lifecycle.
 
-use crate::pki::{NodePaths, TestPki};
 use crate::ns3_plumbing::{
     apply_plan, endpoint_setup_plan_root_only, teardown_endpoint_port, Ns3EndpointNames,
 };
-use crate::scenario::{BridgeConfig, EmulationBackend, LinkConfig, NodeConfig, Scenario};
+use crate::pki::{NodePaths, TestPki};
+use crate::scenario::{
+    BridgeConfig, EmulationBackend, LinkConfig, NodeConfig, Scenario, TelemetryConfig,
+};
 use avena_overlay::{
-    AvenadConfig, DaemonDiscoveryConfig, NetworkConfig, RoutingConfig, StaticPeerConfig, TunnelMode,
+    AvenadConfig, DaemonDiscoveryConfig, DaemonTelemetryConfig, NetworkConfig, RoutingConfig,
+    StaticPeerConfig, TunnelMode,
 };
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::process::{Child, Command};
+
+const MANAGEMENT_BRIDGE_NAME: &str = "av-mgmt0";
+const MANAGEMENT_SUBNET: (u8, u8, u8) = (172, 31, 255);
+const MANAGEMENT_GATEWAY_HOST: u8 = 1;
+const MANAGEMENT_NATS_PORT: u16 = 4222;
 
 #[derive(Error, Debug)]
 pub enum TopologyError {
@@ -65,6 +73,7 @@ pub struct NodeInstance {
     pub config_path: PathBuf,
     pub avenad_process: Option<Child>,
     pub underlay_ips: Vec<(String, std::net::Ipv4Addr)>,
+    pub management_ips: Vec<(String, std::net::Ipv4Addr)>,
 }
 
 pub struct TestTopology {
@@ -72,6 +81,9 @@ pub struct TestTopology {
     veth_pairs: Vec<VethPair>,
     bridges: Vec<BridgeInstance>,
     ns3_ports: Vec<Ns3EndpointPortPlan>,
+    management_bridge: Option<String>,
+    management_ports: Vec<ManagementPort>,
+    management_nats_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +95,11 @@ struct Ns3EndpointPortPlan {
     if_tap: String,
     if_bridge: String,
     underlay_ip: std::net::Ipv4Addr,
+}
+
+#[derive(Debug, Clone)]
+struct ManagementPort {
+    if_root: String,
 }
 
 impl std::fmt::Debug for TestTopology {
@@ -103,6 +120,9 @@ impl TestTopology {
             veth_pairs: Vec::new(),
             bridges: Vec::new(),
             ns3_ports: Vec::new(),
+            management_bridge: None,
+            management_ports: Vec::new(),
+            management_nats_url: None,
         }
     }
 
@@ -125,9 +145,12 @@ impl TestTopology {
                     config_path: PathBuf::new(),
                     avenad_process: None,
                     underlay_ips: Vec::new(),
+                    management_ips: Vec::new(),
                 },
             );
         }
+
+        self.setup_management_network(scenario).await?;
 
         match scenario.emulation.backend {
             EmulationBackend::Netem => {
@@ -162,12 +185,14 @@ impl TestTopology {
                 }
 
                 for bridge_config in &scenario.bridges {
-                    self.setup_bridge(bridge_config, &mut subnet_counter).await?;
+                    self.setup_bridge(bridge_config, &mut subnet_counter)
+                        .await?;
                 }
             }
             EmulationBackend::Ns3 => {
                 for link_config in &scenario.links {
-                    self.setup_ns3_link(link_config, &mut subnet_counter).await?;
+                    self.setup_ns3_link(link_config, &mut subnet_counter)
+                        .await?;
                 }
 
                 for bridge_config in &scenario.bridges {
@@ -175,6 +200,78 @@ impl TestTopology {
                         .await?;
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn setup_management_network(&mut self, scenario: &Scenario) -> Result<(), TopologyError> {
+        if !scenario.emulation.telemetry.publish_nats {
+            self.management_bridge = None;
+            self.management_ports.clear();
+            self.management_nats_url = None;
+            return Ok(());
+        }
+
+        let bridge_name = MANAGEMENT_BRIDGE_NAME.to_string();
+        let _ = self.run_cmd("ip", &["link", "del", &bridge_name]).await;
+
+        self.run_cmd("ip", &["link", "add", &bridge_name, "type", "bridge"])
+            .await?;
+        self.run_cmd(
+            "ip",
+            &[
+                "addr",
+                "add",
+                &format!(
+                    "{}.{}.{}.{}/24",
+                    MANAGEMENT_SUBNET.0,
+                    MANAGEMENT_SUBNET.1,
+                    MANAGEMENT_SUBNET.2,
+                    MANAGEMENT_GATEWAY_HOST
+                ),
+                "dev",
+                &bridge_name,
+            ],
+        )
+        .await?;
+        self.run_cmd("ip", &["link", "set", &bridge_name, "up"])
+            .await?;
+
+        self.management_bridge = Some(bridge_name.clone());
+        self.management_nats_url = Some(format!(
+            "nats://{}.{}.{}.{}:{}",
+            MANAGEMENT_SUBNET.0,
+            MANAGEMENT_SUBNET.1,
+            MANAGEMENT_SUBNET.2,
+            MANAGEMENT_GATEWAY_HOST,
+            MANAGEMENT_NATS_PORT
+        ));
+
+        for (idx, node_config) in scenario.nodes.iter().enumerate() {
+            let host = (idx + 2) as u8;
+            let if_root = format!("mg{}r", host);
+            let if_ns = format!("mg{}n", host);
+
+            self.create_veth_pair(&if_root, &if_ns).await?;
+            self.run_cmd("ip", &["link", "set", &if_root, "master", &bridge_name])
+                .await?;
+            self.run_cmd("ip", &["link", "set", &if_root, "up"]).await?;
+
+            let ip = std::net::Ipv4Addr::new(
+                MANAGEMENT_SUBNET.0,
+                MANAGEMENT_SUBNET.1,
+                MANAGEMENT_SUBNET.2,
+                host,
+            );
+
+            let node = self
+                .nodes
+                .get_mut(&node_config.id)
+                .ok_or_else(|| TopologyError::NodeNotFound(node_config.id.clone()))?;
+            node.management_ips.push((if_ns.clone(), ip));
+
+            self.management_ports.push(ManagementPort { if_root });
         }
 
         Ok(())
@@ -239,7 +336,8 @@ impl TestTopology {
                 .nodes
                 .get_mut(&plan.node_id)
                 .ok_or_else(|| TopologyError::NodeNotFound(plan.node_id.clone()))?;
-            node.underlay_ips.push((plan.if_ns.clone(), plan.underlay_ip));
+            node.underlay_ips
+                .push((plan.if_ns.clone(), plan.underlay_ip));
             self.ns3_ports.push(plan);
         }
 
@@ -317,6 +415,7 @@ impl TestTopology {
         pki: &TestPki,
         scenario: &Scenario,
         log_dir: &std::path::Path,
+        run_id: &str,
     ) -> Result<(), TopologyError> {
         for node_config in &scenario.nodes {
             let node_paths = pki
@@ -329,7 +428,14 @@ impl TestTopology {
                     .get(&node_config.id)
                     .ok_or_else(|| TopologyError::NodeNotFound(node_config.id.clone()))?;
                 let static_peers = self.static_peers_for_node(&node_config.id, pki)?;
-                self.generate_node_config(node_config, &node_paths, node, static_peers)?
+                self.generate_node_config(
+                    node_config,
+                    &node_paths,
+                    node,
+                    static_peers,
+                    &scenario.emulation.telemetry,
+                    run_id,
+                )?
             };
 
             let config_path = pki.temp_dir().join(format!("{}.toml", node_config.id));
@@ -340,11 +446,21 @@ impl TestTopology {
 
             let veth_config: Vec<_> = {
                 let node = self.nodes.get(&node_config.id).unwrap();
-                node.underlay_ips
+                let mut underlay: Vec<(String, std::net::Ipv4Addr, u8)> = node
+                    .underlay_ips
                     .iter()
                     .enumerate()
                     .map(|(i, (veth, ip))| (veth.clone(), *ip, (i + 1) as u8))
-                    .collect()
+                    .collect();
+
+                let mgmt_offset = underlay.len();
+                underlay.extend(
+                    node.management_ips
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (veth, ip))| (veth.clone(), *ip, (mgmt_offset + i + 65) as u8)),
+                );
+                underlay
             };
 
             let (child, inner_pid) = self
@@ -394,6 +510,14 @@ impl TestTopology {
 
         for veth in &self.veth_pairs {
             let _ = self.run_cmd("ip", &["link", "del", &veth.veth_a]).await;
+        }
+
+        for port in &self.management_ports {
+            let _ = self.run_cmd("ip", &["link", "del", &port.if_root]).await;
+        }
+
+        if let Some(bridge) = &self.management_bridge {
+            let _ = self.run_cmd("ip", &["link", "del", bridge]).await;
         }
 
         for port in &self.ns3_ports {
@@ -515,6 +639,8 @@ impl TestTopology {
         node_paths: &NodePaths,
         node: &NodeInstance,
         static_peers: Vec<StaticPeerConfig>,
+        scenario_telemetry: &crate::scenario::TelemetryConfig,
+        run_id: &str,
     ) -> Result<AvenadConfig, TopologyError> {
         let mdns_interfaces: Vec<String> = node
             .underlay_ips
@@ -542,6 +668,16 @@ impl TestTopology {
             persistent_keepalive: 5,
             dead_peer_timeout_secs: 30,
             routing: RoutingConfig::default(),
+            telemetry: DaemonTelemetryConfig {
+                publish_nats: scenario_telemetry.publish_nats,
+                nats_url: effective_telemetry_nats_url(
+                    scenario_telemetry,
+                    self.management_nats_url.as_ref(),
+                ),
+                run_id: Some(run_id.to_string()),
+                node_id: Some(node_config.id.clone()),
+                babel_snapshot_interval_secs: 1,
+            },
         })
     }
 
@@ -697,6 +833,18 @@ impl TestTopology {
     }
 }
 
+fn effective_telemetry_nats_url(
+    scenario_telemetry: &TelemetryConfig,
+    management_nats_url: Option<&String>,
+) -> Option<String> {
+    scenario_telemetry
+        .nats_url
+        .as_ref()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .or_else(|| management_nats_url.cloned())
+}
+
 fn parse_radio_ref(value: &str) -> Result<(&str, &str), TopologyError> {
     let Some((node_id, radio_id)) = value.split_once(':') else {
         return Err(TopologyError::InvalidRadioRef {
@@ -796,6 +944,29 @@ mod tests {
         let topo = TestTopology::new();
         assert!(topo.nodes.is_empty());
         assert!(topo.veth_pairs.is_empty());
+        assert!(topo.management_bridge.is_none());
+    }
+
+    #[test]
+    fn effective_telemetry_url_prefers_explicit_scenario_url() {
+        let telemetry = TelemetryConfig {
+            publish_nats: true,
+            nats_url: Some("nats://10.0.0.5:4222".to_string()),
+        };
+        let url =
+            effective_telemetry_nats_url(&telemetry, Some(&"nats://172.31.255.1:4222".to_string()));
+        assert_eq!(url.as_deref(), Some("nats://10.0.0.5:4222"));
+    }
+
+    #[test]
+    fn effective_telemetry_url_falls_back_to_management_network() {
+        let telemetry = TelemetryConfig {
+            publish_nats: true,
+            nats_url: None,
+        };
+        let url =
+            effective_telemetry_nats_url(&telemetry, Some(&"nats://172.31.255.1:4222".to_string()));
+        assert_eq!(url.as_deref(), Some("nats://172.31.255.1:4222"));
     }
 
     #[test]
@@ -808,7 +979,10 @@ mod tests {
     #[test]
     fn parse_radio_ref_rejects_invalid_values() {
         for value in ["nodeA", "nodeA:", ":wifi0", "nodeA:wifi0:extra"] {
-            assert!(parse_radio_ref(value).is_err(), "value should fail: {value}");
+            assert!(
+                parse_radio_ref(value).is_err(),
+                "value should fail: {value}"
+            );
         }
     }
 

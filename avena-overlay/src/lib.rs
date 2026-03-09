@@ -26,7 +26,7 @@ pub use crypto::{
 };
 pub use daemon::{
     AvenadConfig, ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, PeerState, RoutingConfig,
-    TunnelMode,
+    TelemetryConfig as DaemonTelemetryConfig, TunnelMode,
 };
 pub use discovery::{
     Capability, DiscoveredPeer, DiscoveryConfig, DiscoveryError, DiscoveryEvent, DiscoveryService,

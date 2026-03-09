@@ -14,6 +14,7 @@ async-nats = "0.39"
 avena-overlay = { path = "../avena-overlay" }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+futures = "0.3"
 libc = "0.2"
 regex = "1"
 tempfile = "3"
