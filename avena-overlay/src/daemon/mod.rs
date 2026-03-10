@@ -4,6 +4,7 @@ mod config;
 mod peer_state;
 
 pub use config::{
-    ConfigError, DiscoveryConfig, OverlayConfig, RoutingConfig, TelemetryConfig, TunnelMode,
+    AcmeConfig, ConfigError, DiscoveryConfig, OverlayConfig, RoutingConfig, TelemetryConfig,
+    TunnelMode,
 };
 pub use peer_state::PeerState;

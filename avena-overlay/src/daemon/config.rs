@@ -8,7 +8,7 @@ use crate::discovery::StaticPeerConfig;
 use crate::routing::BabeldConfig;
 use crate::NetworkConfig;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,6 +80,94 @@ pub struct OverlayConfig {
     #[serde(default)]
     /// Telemetry publishing configuration (NATS).
     pub telemetry: TelemetryConfig,
+
+    #[serde(default)]
+    /// Optional ACME shared-medium transport configuration.
+    pub acme: Option<AcmeConfig>,
+}
+
+/// ACME shared-medium transport configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcmeConfig {
+    #[serde(default = "default_acme_name")]
+    /// Stable local identifier for this ACME underlay.
+    pub name: String,
+
+    /// Interface name passed to the external ACME helper.
+    pub interface: String,
+
+    #[serde(default = "default_acme_binary_path")]
+    /// Path to the external `acme` binary.
+    pub binary_path: PathBuf,
+
+    #[serde(default = "default_acme_destination")]
+    /// Destination multicast/group address used by the radio helper.
+    pub destination: String,
+
+    #[serde(default = "default_acme_event_port")]
+    /// Shared over-the-air event port used by both TX and RX helpers.
+    pub event_port: u16,
+
+    #[serde(default = "default_acme_proxy_ip")]
+    /// Loopback IPv4 address used for proxy sockets.
+    pub proxy_ip: Ipv4Addr,
+
+    #[serde(default = "default_acme_wg_proxy_port")]
+    /// Local UDP port that WireGuard peers target for the shared ACME proxy.
+    pub wg_proxy_port: u16,
+
+    #[serde(default = "default_acme_tx_local_port")]
+    /// Local UDP port the TX helper listens on.
+    pub tx_local_port: u16,
+
+    #[serde(default = "default_acme_rx_local_port")]
+    /// Local UDP port the RX helper delivers frames to.
+    pub rx_local_port: u16,
+
+    #[serde(default = "default_acme_announce_interval_ms")]
+    /// How often to re-announce local ACME discovery information.
+    pub announce_interval_ms: u64,
+
+    #[serde(default = "default_acme_startup_delay_ms")]
+    /// Delay after spawning helpers before traffic is sent.
+    pub startup_delay_ms: u64,
+
+    #[serde(default = "default_acme_control_timeout_ms")]
+    /// Timeout for ACME control-plane request/response exchanges.
+    pub control_timeout_ms: u64,
+}
+
+impl AcmeConfig {
+    pub fn wg_proxy_endpoint(&self) -> SocketAddr {
+        SocketAddr::from((self.proxy_ip, self.wg_proxy_port))
+    }
+
+    pub fn tx_endpoint(&self) -> SocketAddr {
+        SocketAddr::from((self.proxy_ip, self.tx_local_port))
+    }
+
+    pub fn rx_endpoint(&self) -> SocketAddr {
+        SocketAddr::from((self.proxy_ip, self.rx_local_port))
+    }
+}
+
+impl Default for AcmeConfig {
+    fn default() -> Self {
+        Self {
+            name: default_acme_name(),
+            interface: String::new(),
+            binary_path: default_acme_binary_path(),
+            destination: default_acme_destination(),
+            event_port: default_acme_event_port(),
+            proxy_ip: default_acme_proxy_ip(),
+            wg_proxy_port: default_acme_wg_proxy_port(),
+            tx_local_port: default_acme_tx_local_port(),
+            rx_local_port: default_acme_rx_local_port(),
+            announce_interval_ms: default_acme_announce_interval_ms(),
+            startup_delay_ms: default_acme_startup_delay_ms(),
+            control_timeout_ms: default_acme_control_timeout_ms(),
+        }
+    }
 }
 
 /// Routing protocol configuration.
@@ -210,6 +298,50 @@ fn default_babel_snapshot_interval_secs() -> u64 {
     1
 }
 
+fn default_acme_name() -> String {
+    "acme".to_string()
+}
+
+fn default_acme_binary_path() -> PathBuf {
+    PathBuf::from("acme")
+}
+
+fn default_acme_destination() -> String {
+    "ff02::1".to_string()
+}
+
+fn default_acme_event_port() -> u16 {
+    9000
+}
+
+const fn default_acme_proxy_ip() -> Ipv4Addr {
+    Ipv4Addr::new(127, 0, 0, 1)
+}
+
+fn default_acme_wg_proxy_port() -> u16 {
+    51831
+}
+
+fn default_acme_tx_local_port() -> u16 {
+    51841
+}
+
+fn default_acme_rx_local_port() -> u16 {
+    51842
+}
+
+fn default_acme_announce_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_acme_startup_delay_ms() -> u64 {
+    1_000
+}
+
+fn default_acme_control_timeout_ms() -> u64 {
+    10_000
+}
+
 fn default_mdns_enabled() -> bool {
     true
 }
@@ -238,6 +370,7 @@ impl Default for OverlayConfig {
             dead_peer_timeout_secs: default_dead_peer_timeout(),
             routing: RoutingConfig::default(),
             telemetry: TelemetryConfig::default(),
+            acme: None,
         }
     }
 }
@@ -316,6 +449,7 @@ mod tests {
         assert_eq!(config.device_cert, PathBuf::from("/etc/avena/device.cert"));
         assert!(config.telemetry.publish_nats);
         assert_eq!(config.telemetry.babel_snapshot_interval_secs, 1);
+        assert!(config.acme.is_none());
     }
 
     #[test]
@@ -366,6 +500,7 @@ mod tests {
         assert_eq!(config.discovery.static_peers.len(), 1);
         assert_eq!(config.discovery.presence_reannounce_interval_ms, 1000);
         assert_eq!(config.discovery.peer_retry_interval_ms, 250);
+        assert!(config.acme.is_none());
     }
 
     #[test]
@@ -378,5 +513,26 @@ mod tests {
         "#;
         let config: OverlayConfig = toml::from_str(toml).unwrap();
         assert!(matches!(config.tunnel_mode, TunnelMode::PreferKernel));
+    }
+
+    #[test]
+    fn parse_acme_config() {
+        let toml = r#"
+            interface_name = "avena1"
+            trusted_root_cert = "/etc/avena/root.cert"
+            device_cert = "/etc/avena/device.cert"
+
+            [acme]
+            interface = "cv2x0"
+        "#;
+        let config: OverlayConfig = toml::from_str(toml).unwrap();
+        let acme = config.acme.expect("acme config should parse");
+        assert_eq!(acme.name, "acme");
+        assert_eq!(acme.interface, "cv2x0");
+        assert_eq!(acme.event_port, 9000);
+        assert_eq!(
+            acme.wg_proxy_endpoint(),
+            SocketAddr::from(([127, 0, 0, 1], 51831))
+        );
     }
 }

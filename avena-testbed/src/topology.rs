@@ -678,6 +678,7 @@ impl TestTopology {
                 node_id: Some(node_config.id.clone()),
                 babel_snapshot_interval_secs: 1,
             },
+            acme: None,
         })
     }
 

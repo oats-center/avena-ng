@@ -173,4 +173,4 @@ ping -6 <node2_overlay_ip>
 
 ## Next step
 
-After this baseline works, move to static peer config for cross-subnet/WAN setups and add a systemd unit for persistent service management.
+After this baseline works, move to static peer config for cross-subnet/WAN setups, use `acme-getting-started.md` for mixed IP + ACME nodes, and add a systemd unit for persistent service management.

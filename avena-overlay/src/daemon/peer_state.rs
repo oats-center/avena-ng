@@ -1,6 +1,6 @@
 //! In-memory bookkeeping for connected peers.
 
-use crate::DeviceId;
+use crate::{DeviceId, PeerLocator};
 use ed25519_dalek::VerifyingKey;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Instant;
@@ -12,6 +12,7 @@ pub struct PeerState {
     pub public_key: VerifyingKey,
     pub wg_pubkey: [u8; 32],
     pub endpoint: Option<SocketAddr>,
+    pub locator: Option<PeerLocator>,
     pub overlay_ip: Ipv6Addr,
     pub tunnel_interface: String,
     pub connected_at: Instant,
@@ -34,6 +35,7 @@ impl PeerState {
             public_key,
             wg_pubkey,
             endpoint: None,
+            locator: None,
             overlay_ip,
             tunnel_interface,
             connected_at: now,
@@ -45,6 +47,11 @@ impl PeerState {
 
     pub fn with_endpoint(mut self, endpoint: SocketAddr) -> Self {
         self.endpoint = Some(endpoint);
+        self
+    }
+
+    pub fn with_locator(mut self, locator: PeerLocator) -> Self {
+        self.locator = Some(locator);
         self
     }
 

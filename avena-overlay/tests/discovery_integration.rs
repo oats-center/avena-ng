@@ -1,6 +1,6 @@
 use avena_overlay::{
     Capability, DeviceId, DeviceKeypair, DiscoveryConfig, DiscoveryService, LocalAnnouncement,
-    StaticPeerConfig,
+    PeerLocator, StaticPeerConfig,
 };
 use std::collections::HashSet;
 use std::time::Duration;
@@ -39,11 +39,11 @@ async fn static_peer_resolution() {
 
     let peer1 = peers.iter().find(|p| p.device_id == device1).unwrap();
     assert!(peer1.has_capability(&Capability::Gateway));
-    assert_eq!(peer1.endpoint.port(), 51820);
+    assert_eq!(peer1.locator.programmed_endpoint().port(), 51820);
 
     let peer2 = peers.iter().find(|p| p.device_id == device2).unwrap();
     assert!(peer2.has_capability(&Capability::Relay));
-    assert_eq!(peer2.endpoint.port(), 51821);
+    assert_eq!(peer2.locator.programmed_endpoint().port(), 51821);
 }
 
 #[tokio::test]
@@ -63,7 +63,7 @@ async fn discovery_service_event_channel() {
     let device = test_device_id(42);
     let peer = avena_overlay::DiscoveredPeer::new(
         device,
-        "10.0.0.1:51820".parse().unwrap(),
+        PeerLocator::direct_ip("10.0.0.1:51820".parse().unwrap()),
         HashSet::new(),
         avena_overlay::DiscoverySource::Static,
     );

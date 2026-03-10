@@ -1,0 +1,42 @@
+interface_name = "avena0"
+tunnel_mode = "prefer_kernel"
+listen_port = 51820
+keypair_path = "/etc/avena/device.key"
+trusted_root_cert = "/etc/avena/root.cert"
+device_cert = "/etc/avena/device.cert"
+persistent_keepalive = 5
+dead_peer_timeout_secs = 30
+
+[network]
+prefix = "fd00:a0e0:a000::"
+prefix_len = 48
+
+[discovery]
+enable_mdns = true
+mdns_interfaces = ["eth0"]
+presence_reannounce_interval_ms = 1000
+peer_retry_interval_ms = 250
+
+[routing.babel]
+socket_path = "/run/avena/babel.sock"
+binary_path = "/usr/sbin/babeld"
+hello_interval = 1000
+update_interval = 4000
+
+[telemetry]
+publish_nats = false
+node_id = "mk6-node-01"
+
+[acme]
+name = "cv2x"
+interface = "cv2x0"
+binary_path = "/usr/local/bin/acme"
+destination = "ff02::1"
+event_port = 9000
+proxy_ip = "127.0.0.1"
+wg_proxy_port = 51821
+tx_local_port = 51831
+rx_local_port = 51832
+announce_interval_ms = 5000
+startup_delay_ms = 1000
+control_timeout_ms = 10000

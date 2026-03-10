@@ -10,7 +10,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use tokio::task;
 use tracing::{debug, warn};
 
-use super::{Capability, DiscoveredPeer, DiscoverySource};
+use super::{Capability, DiscoveredPeer, DiscoverySource, PeerLocator};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StaticPeerConfig {
@@ -84,7 +84,7 @@ impl StaticPeers {
 
                         discovered.push(DiscoveredPeer::new(
                             device_id,
-                            endpoint,
+                            PeerLocator::direct_ip(endpoint),
                             peer_config.capabilities.clone(),
                             DiscoverySource::Static,
                         ));
@@ -171,8 +171,8 @@ mod tests {
         let discovered = peers.resolve().await;
         assert_eq!(discovered.len(), 2);
 
-        assert_eq!(discovered[0].endpoint.port(), 51820);
-        assert_eq!(discovered[1].endpoint.port(), 51821);
+        assert_eq!(discovered[0].locator.programmed_endpoint().port(), 51820);
+        assert_eq!(discovered[1].locator.programmed_endpoint().port(), 51821);
         assert!(matches!(discovered[0].source, DiscoverySource::Static));
     }
 

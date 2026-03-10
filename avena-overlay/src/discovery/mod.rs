@@ -64,33 +64,118 @@ impl Capability {
 pub enum DiscoverySource {
     Mdns,
     Static,
+    Acme,
     /// Reserved for mesh routing integration (Phase 5: Babel)
     Gossip,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PeerLocator {
+    DirectIp { endpoint: SocketAddr },
+    Acme {
+        underlay_id: String,
+        proxy_endpoint: SocketAddr,
+        node_name: Option<String>,
+    },
+}
+
+impl PeerLocator {
+    pub fn direct_ip(endpoint: SocketAddr) -> Self {
+        Self::DirectIp { endpoint }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            PeerLocator::DirectIp { endpoint } => endpoint.to_string(),
+            PeerLocator::Acme {
+                underlay_id,
+                proxy_endpoint,
+                node_name,
+            } => match node_name {
+                Some(node_name) => format!(
+                    "acme:{}:{} via {}",
+                    underlay_id, node_name, proxy_endpoint
+                ),
+                None => format!("acme:{} via {}", underlay_id, proxy_endpoint),
+            },
+        }
+    }
+
+    pub fn cache_key(&self) -> String {
+        match self {
+            PeerLocator::DirectIp { endpoint } => format!("ip:{endpoint}"),
+            PeerLocator::Acme { underlay_id, .. } => format!("acme:{underlay_id}"),
+        }
+    }
+
+    pub fn programmed_endpoint(&self) -> SocketAddr {
+        match self {
+            PeerLocator::DirectIp { endpoint } => *endpoint,
+            PeerLocator::Acme { proxy_endpoint, .. } => *proxy_endpoint,
+        }
+    }
+
+    pub fn handshake_address(&self) -> Option<SocketAddr> {
+        match self {
+            PeerLocator::DirectIp { endpoint } => Some(SocketAddr::new(
+                endpoint.ip(),
+                endpoint.port().saturating_add(1),
+            )),
+            PeerLocator::Acme { .. } => None,
+        }
+    }
+
+    pub fn local_underlay_hint(&self) -> Option<&str> {
+        match self {
+            PeerLocator::DirectIp { .. } => None,
+            PeerLocator::Acme { underlay_id, .. } => Some(underlay_id.as_str()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PeerPathId {
+    pub device_id: DeviceId,
+    pub locator_key: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredPeer {
     pub device_id: DeviceId,
-    pub endpoint: SocketAddr,
+    pub locator: PeerLocator,
     pub capabilities: HashSet<Capability>,
     pub source: DiscoverySource,
     pub discovered_at: Instant,
+    pub node_name: Option<String>,
 }
 
 impl DiscoveredPeer {
     /// Create a record for a newly learned peer endpoint.
     pub fn new(
         device_id: DeviceId,
-        endpoint: SocketAddr,
+        locator: PeerLocator,
         capabilities: HashSet<Capability>,
         source: DiscoverySource,
     ) -> Self {
         Self {
             device_id,
-            endpoint,
+            locator,
             capabilities,
             source,
             discovered_at: Instant::now(),
+            node_name: None,
+        }
+    }
+
+    pub fn with_node_name(mut self, node_name: Option<String>) -> Self {
+        self.node_name = node_name;
+        self
+    }
+
+    pub fn path_id(&self) -> PeerPathId {
+        PeerPathId {
+            device_id: self.device_id,
+            locator_key: self.locator.cache_key(),
         }
     }
 
@@ -137,7 +222,7 @@ pub struct DiscoveryService {
     mdns: Option<MdnsDiscovery>,
     static_peers: StaticPeers,
     tx: broadcast::Sender<DiscoveryEvent>,
-    discovered_peers: RwLock<HashMap<(DeviceId, SocketAddr), DiscoveredPeer>>,
+    discovered_peers: RwLock<HashMap<PeerPathId, DiscoveredPeer>>,
 }
 
 impl DiscoveryService {
@@ -207,20 +292,20 @@ impl DiscoveryService {
     }
 
     /// Get the most recently cached endpoint for a peer.
-    pub fn get_discovered_endpoint(&self, device_id: &DeviceId) -> Option<SocketAddr> {
+    pub fn get_discovered_locator(&self, device_id: &DeviceId) -> Option<PeerLocator> {
         self.discovered_peers.read().ok().and_then(|guard| {
             guard
-                .iter()
-                .filter_map(|((id, _), peer)| (id == device_id).then_some(peer))
+                .values()
+                .filter_map(|peer| (&peer.device_id == device_id).then_some(peer))
                 .max_by_key(|peer| peer.discovered_at)
-                .map(|peer| peer.endpoint)
+                .map(|peer| peer.locator.clone())
         })
     }
 
     /// Cache a peer record discovered through any channel.
     pub fn cache_discovered_peer(&self, peer: &DiscoveredPeer) {
         if let Ok(mut guard) = self.discovered_peers.write() {
-            guard.insert((peer.device_id, peer.endpoint), peer.clone());
+            guard.insert(peer.path_id(), peer.clone());
         }
     }
 
@@ -273,7 +358,7 @@ mod tests {
 
         let peer = DiscoveredPeer::new(
             DeviceId::from_bytes([0u8; 16]),
-            "127.0.0.1:51820".parse().unwrap(),
+            PeerLocator::direct_ip("127.0.0.1:51820".parse().unwrap()),
             caps,
             DiscoverySource::Static,
         );
@@ -295,13 +380,13 @@ mod tests {
         let device_id = DeviceId::from_bytes([7u8; 16]);
         let peer_a = DiscoveredPeer::new(
             device_id,
-            "10.1.0.2:51820".parse().unwrap(),
+            PeerLocator::direct_ip("10.1.0.2:51820".parse().unwrap()),
             HashSet::new(),
             DiscoverySource::Static,
         );
         let peer_b = DiscoveredPeer::new(
             device_id,
-            "10.2.0.2:51820".parse().unwrap(),
+            PeerLocator::direct_ip("10.2.0.2:51820".parse().unwrap()),
             HashSet::new(),
             DiscoverySource::Static,
         );
@@ -311,12 +396,12 @@ mod tests {
 
         let cached = service.cached_peers();
         assert_eq!(cached.len(), 2);
-        assert!(cached.iter().any(|p| p.endpoint == peer_a.endpoint));
-        assert!(cached.iter().any(|p| p.endpoint == peer_b.endpoint));
+        assert!(cached.iter().any(|p| p.locator == peer_a.locator));
+        assert!(cached.iter().any(|p| p.locator == peer_b.locator));
 
         let selected = service
-            .get_discovered_endpoint(&device_id)
-            .expect("device endpoint should be available");
-        assert!(selected == peer_a.endpoint || selected == peer_b.endpoint);
+            .get_discovered_locator(&device_id)
+            .expect("device locator should be available");
+        assert!(selected == peer_a.locator || selected == peer_b.locator);
     }
 }

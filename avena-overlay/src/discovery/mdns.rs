@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::{Capability, DiscoveredPeer, DiscoveryError, DiscoverySource, LocalAnnouncement};
+use super::{
+    Capability, DiscoveredPeer, DiscoveryError, DiscoverySource, LocalAnnouncement, PeerLocator,
+};
 
 const SERVICE_TYPE: &str = "_avena._udp.local.";
 const TXT_AVENA_ID: &str = "avena-id";
@@ -161,7 +163,7 @@ impl MdnsDiscovery {
 
         Some(DiscoveredPeer::new(
             device_id,
-            endpoint,
+            PeerLocator::direct_ip(endpoint),
             capabilities,
             DiscoverySource::Mdns,
         ))

@@ -1,10 +1,12 @@
 use avena_overlay::{
+    acme::{AcmeRuntime, DiscoveryPayload as AcmeDiscoveryPayload, IncomingControlRequest},
     derive_session_keys, derive_wireguard_keypair,
     routing::{BabeldController, RoutingError},
     wg::WgError,
-    CertValidator, DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent, OverlayConfig,
+    Capability, CertValidator, DeviceId, DeviceKeypair, DiscoveredPeer, DiscoveryEvent,
     DiscoveryService, EphemeralKeypair, HandshakeMessage, KernelBackend, LocalAnnouncement,
-    NetworkConfig, PeerConfig, PeerState, TunnelBackend, TunnelMode, UserspaceBackend,
+    NetworkConfig, OverlayConfig, PeerConfig, PeerLocator, PeerPathId, PeerState,
+    TunnelBackend, TunnelMode, UserspaceBackend,
 };
 use ed25519_dalek::VerifyingKey;
 use ipnet::IpNet;
@@ -20,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
 const HANDSHAKE_MAGIC: &[u8; 4] = b"AVHS";
@@ -40,6 +42,74 @@ const TUNNEL_PORT_SPAN: u16 = 40000;
 const TELEMETRY_SCHEMA_VERSION: u8 = 1;
 const DEFAULT_TELEMETRY_RUN_ID: &str = "standalone";
 const DEFAULT_TELEMETRY_TOKEN: &str = "unknown";
+
+fn encode_handshake_packet(
+    public_key: &[u8; 32],
+    message: &HandshakeMessage,
+) -> Result<Vec<u8>, OverlayDaemonError> {
+    let message_bytes = serde_json::to_vec(message)?;
+    let mut out = Vec::with_capacity(4 + 1 + 32 + 4 + message_bytes.len());
+    out.extend_from_slice(HANDSHAKE_MAGIC);
+    out.push(HANDSHAKE_VERSION);
+    out.extend_from_slice(public_key);
+    out.extend_from_slice(&(message_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&message_bytes);
+    Ok(out)
+}
+
+fn decode_handshake_packet(
+    packet: &[u8],
+) -> Result<(VerifyingKey, DeviceId, HandshakeMessage), OverlayDaemonError> {
+    const HEADER_LEN: usize = 4 + 1 + 32 + 4;
+    if packet.len() < HEADER_LEN {
+        return Err(OverlayDaemonError::Handshake(
+            "handshake packet too short".into(),
+        ));
+    }
+    if &packet[..4] != HANDSHAKE_MAGIC {
+        return Err(OverlayDaemonError::Handshake("invalid magic".into()));
+    }
+    if packet[4] != HANDSHAKE_VERSION {
+        return Err(OverlayDaemonError::Handshake("version mismatch".into()));
+    }
+    let peer_pubkey = VerifyingKey::from_bytes(
+        &packet[5..37]
+            .try_into()
+            .expect("fixed-size handshake public key"),
+    )
+    .map_err(|_| OverlayDaemonError::Handshake("invalid peer public key".into()))?;
+    let peer_device_id = DeviceId::from_public_key(&peer_pubkey);
+    let msg_len = u32::from_be_bytes(
+        packet[37..41]
+            .try_into()
+            .expect("fixed-size handshake length"),
+    ) as usize;
+    if msg_len > MAX_HANDSHAKE_MSG_LEN {
+        return Err(OverlayDaemonError::Handshake("message too large".into()));
+    }
+    if packet.len() != HEADER_LEN + msg_len {
+        return Err(OverlayDaemonError::Handshake(
+            "truncated handshake packet".into(),
+        ));
+    }
+    let message = serde_json::from_slice(&packet[HEADER_LEN..])?;
+    Ok((peer_pubkey, peer_device_id, message))
+}
+
+async fn read_handshake_packet(
+    stream: &mut TcpStream,
+) -> Result<(VerifyingKey, DeviceId, HandshakeMessage), OverlayDaemonError> {
+    let mut header = [0u8; 41];
+    stream.read_exact(&mut header).await?;
+    let msg_len = u32::from_be_bytes(header[37..41].try_into().expect("fixed width")) as usize;
+    if msg_len > MAX_HANDSHAKE_MSG_LEN {
+        return Err(OverlayDaemonError::Handshake("message too large".into()));
+    }
+    let mut packet = header.to_vec();
+    packet.resize(41 + msg_len, 0);
+    stream.read_exact(&mut packet[41..]).await?;
+    decode_handshake_packet(&packet)
+}
 
 fn sanitize_subject_token(raw: &str, fallback: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -289,19 +359,22 @@ struct OverlayDaemonInner {
     rate_limiter: RateLimiter,
     handshake_semaphore: Arc<Semaphore>,
     outgoing_semaphore: Arc<Semaphore>,
-    outgoing_handshake_inflight: Mutex<HashSet<(DeviceId, IpAddr)>>,
-    outgoing_handshake_last_attempt: Mutex<HashMap<DeviceId, Instant>>,
+    outgoing_handshake_inflight: Mutex<HashSet<PeerPathId>>,
+    outgoing_handshake_last_attempt: Mutex<HashMap<PeerPathId, Instant>>,
     cert_validator: CertValidator,
     device_cert: String,
     routing: Mutex<Option<BabeldController>>,
     overlay_route_rx_bytes: Mutex<HashMap<String, u64>>,
     telemetry: Arc<TelemetryPublisher>,
+    acme: Option<AcmeRuntime>,
 }
 
 struct OverlayDaemon {
     inner: Arc<OverlayDaemonInner>,
     discovery_rx: Option<tokio::sync::broadcast::Receiver<DiscoveryEvent>>,
     handshake_listener: TcpListener,
+    acme_control_rx: Option<tokio::sync::mpsc::Receiver<IncomingControlRequest>>,
+    acme_discovery_rx: Option<tokio::sync::mpsc::Receiver<AcmeDiscoveryPayload>>,
 }
 
 #[derive(Clone)]
@@ -397,6 +470,9 @@ impl OverlayDaemon {
                 tokio::sync::broadcast::Receiver<DiscoveryEvent>,
                 TcpListener,
                 Option<BabeldController>,
+                Option<AcmeRuntime>,
+                Option<mpsc::Receiver<IncomingControlRequest>>,
+                Option<mpsc::Receiver<AcmeDiscoveryPayload>>,
             ),
             OverlayDaemonError,
         > = async {
@@ -419,6 +495,16 @@ impl OverlayDaemon {
         discovery.start_mdns_browse()?;
         info!("Discovery service initialized");
 
+            let (acme, acme_control_rx, acme_discovery_rx) = if let Some(acme_config) = config.acme.clone() {
+                let (runtime, control_rx, discovery_rx) =
+                    AcmeRuntime::start(acme_config, device_id).await
+                        .map_err(|e| OverlayDaemonError::Acme(e.to_string()))?;
+                info!(proxy = %runtime.shared_proxy_endpoint(), underlay = runtime.underlay_id(), "ACME runtime started");
+                (Some(runtime), Some(control_rx), Some(discovery_rx))
+            } else {
+                (None, None, None)
+            };
+
             let wg_port = base_tunnel
                 .listen_port()
                 .await
@@ -432,11 +518,19 @@ impl OverlayDaemon {
 
             let routing = Some(start_routing_controller(&config).await?);
 
-            Ok((discovery, discovery_rx, handshake_listener, routing))
+            Ok((
+                discovery,
+                discovery_rx,
+                handshake_listener,
+                routing,
+                acme,
+                acme_control_rx,
+                acme_discovery_rx,
+            ))
         }
         .await;
 
-        let (discovery, discovery_rx, handshake_listener, routing) = match init_result {
+        let (discovery, discovery_rx, handshake_listener, routing, acme, acme_control_rx, acme_discovery_rx) = match init_result {
             Ok(v) => v,
             Err(e) => {
                 let _ = base_tunnel.remove_interface().await;
@@ -467,12 +561,15 @@ impl OverlayDaemon {
             routing: Mutex::new(routing),
             overlay_route_rx_bytes: Mutex::new(HashMap::new()),
             telemetry,
+            acme,
         });
 
         Ok(Self {
             inner,
             discovery_rx: Some(discovery_rx),
             handshake_listener,
+            acme_control_rx,
+            acme_discovery_rx,
         })
     }
 
@@ -486,7 +583,7 @@ impl OverlayDaemon {
         inner.announce_presence().await?;
 
         for peer in inner.discovery.resolve_static_peers().await {
-            info!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Resolved static peer");
+            info!(peer_id = %peer.device_id, locator = %peer.locator.describe(), "Resolved static peer");
             inner.discovery.cache_discovered_peer(&peer);
             let inner_clone = Arc::clone(&inner);
             tokio::spawn(async move {
@@ -543,14 +640,14 @@ impl OverlayDaemon {
                                     }
                                 };
 
-                                info!(peer_id = %peer.device_id, endpoint = %peer.endpoint, "Peer discovered");
+                                info!(peer_id = %peer.device_id, locator = %peer.locator.describe(), "Peer discovered");
                                 inner
                                     .telemetry
                                     .publish_overlay(
                                         "peer_discovered",
                                         serde_json::json!({
                                             "peer_id": peer.device_id.to_string(),
-                                            "endpoint": peer.endpoint.to_string(),
+                                            "locator": peer.locator.describe(),
                                         }),
                                     )
                                     .await;
@@ -580,6 +677,61 @@ impl OverlayDaemon {
                         }
                         Err(e) => {
                             debug!("Discovery channel error: {}", e);
+                        }
+                    }
+                }
+                Some(payload) = async { match &mut self.acme_discovery_rx { Some(rx) => rx.recv().await, None => None } } => {
+                    if payload.device_id == inner.keypair.device_id() {
+                        continue;
+                    }
+                    let Some(acme) = &inner.acme else {
+                        continue;
+                    };
+                    let peer = DiscoveredPeer::new(
+                        payload.device_id,
+                        PeerLocator::Acme {
+                            underlay_id: payload.underlay_id.clone(),
+                            proxy_endpoint: acme.shared_proxy_endpoint(),
+                            node_name: payload.node_name.clone(),
+                        },
+                        payload.capabilities(),
+                        avena_overlay::DiscoverySource::Acme,
+                    )
+                    .with_node_name(payload.node_name);
+                    inner.discovery.cache_discovered_peer(&peer);
+                    if let Err(err) = inner.handle_discovered_peer(peer).await {
+                        warn!("Failed to handle discovered ACME peer: {}", err);
+                    }
+                }
+                Some(request) = async { match &mut self.acme_control_rx { Some(rx) => rx.recv().await, None => None } } => {
+                    let Some(acme) = &inner.acme else {
+                        continue;
+                    };
+                    match inner.handle_incoming_acme_handshake(&request).await {
+                        Ok((peer_state, response_packet)) => {
+                            let device_id = peer_state.device_id;
+                            let iface = peer_state.tunnel_interface.clone();
+                            let mut peers = inner.peers.write().await;
+                            match peers.entry(iface.clone()) {
+                                Entry::Vacant(entry) => {
+                                    entry.insert(peer_state);
+                                    info!(peer_id = %device_id, iface = %iface, "Peer connected via incoming ACME control");
+                                }
+                                Entry::Occupied(mut entry) => {
+                                    *entry.get_mut() = peer_state;
+                                    info!(peer_id = %device_id, iface = %iface, "Peer refreshed via incoming ACME control");
+                                }
+                            }
+                            drop(peers);
+                            if let Err(err) = acme.send_control_response(device_id, request.request_id, &response_packet).await {
+                                warn!(peer_id = %device_id, "Failed to send ACME control response: {}", err);
+                            }
+                            if let Err(err) = inner.reconcile_peer_allowed_ips().await {
+                                warn!(peer_id = %device_id, "Failed to reconcile peer allowed-ips after ACME handshake: {}", err);
+                            }
+                        }
+                        Err(err) => {
+                            warn!(peer_id = %request.source, "Incoming ACME handshake failed: {}", err);
                         }
                     }
                 }
@@ -846,6 +998,7 @@ impl OverlayDaemonInner {
     }
 
     async fn announce_presence(&self) -> Result<(), OverlayDaemonError> {
+        let capabilities = HashSet::<Capability>::new();
         let wg_port = self
             .base_tunnel
             .listen_port()
@@ -857,7 +1010,7 @@ impl OverlayDaemonInner {
             let announcement = LocalAnnouncement {
                 device_id: self.keypair.device_id(),
                 wg_endpoint: SocketAddr::new(IpAddr::from([0u8; 4]), wg_port),
-                capabilities: std::collections::HashSet::new(),
+                capabilities: capabilities.clone(),
                 interface_suffix: None,
             };
             self.discovery.announce(&announcement).await?;
@@ -874,12 +1027,30 @@ impl OverlayDaemonInner {
                 let announcement = LocalAnnouncement {
                     device_id: self.keypair.device_id(),
                     wg_endpoint: SocketAddr::new(ip, wg_port),
-                    capabilities: std::collections::HashSet::new(),
+                    capabilities: capabilities.clone(),
                     interface_suffix: Some(idx as u8),
                 };
                 debug!(interface = %iface, endpoint = %announcement.wg_endpoint, "Announcing on interface");
                 self.discovery.announce(&announcement).await?;
             }
+        }
+
+        if let Some(acme) = &self.acme {
+            let node_name = self
+                .config
+                .telemetry
+                .node_id
+                .clone()
+                .or_else(|| Some(self.keypair.device_id().to_string()));
+            let payload = AcmeDiscoveryPayload::new(
+                self.keypair.device_id(),
+                node_name,
+                &capabilities,
+                acme.underlay_id().to_string(),
+            );
+            acme.announce_discovery(&payload)
+                .await
+                .map_err(|e| OverlayDaemonError::Acme(e.to_string()))?;
         }
         Ok(())
     }
@@ -891,12 +1062,15 @@ impl OverlayDaemonInner {
             return Ok(());
         }
 
+        let path_id = peer.path_id();
+        let locator_desc = peer.locator.describe();
+
         // Decide whether this discovery event should trigger a (re)handshake.
         // We use a short cooldown because mDNS can emit frequent resolves.
         let (already_connected, last_seen_elapsed) = {
             let peers = self.peers.read().await;
             let existing = peers.values().find(|state| {
-                state.device_id == peer.device_id && state.endpoint == Some(peer.endpoint)
+                state.device_id == peer.device_id && state.locator.as_ref() == Some(&peer.locator)
             });
             match existing {
                 Some(state) => (true, Some(state.time_since_last_seen())),
@@ -909,7 +1083,7 @@ impl OverlayDaemonInner {
                 if elapsed < OUTGOING_HANDSHAKE_REFRESH_AFTER {
                     debug!(
                         peer_id = %peer.device_id,
-                        endpoint = %peer.endpoint,
+                        locator = %locator_desc,
                         last_seen_ms = elapsed.as_millis(),
                         "Peer endpoint already connected and recently active"
                     );
@@ -920,28 +1094,27 @@ impl OverlayDaemonInner {
 
         {
             let mut last_attempt = self.outgoing_handshake_last_attempt.lock().await;
-            if let Some(prev) = last_attempt.get(&peer.device_id) {
+            if let Some(prev) = last_attempt.get(&path_id) {
                 if prev.elapsed() < OUTGOING_HANDSHAKE_COOLDOWN {
                     debug!(
                         peer_id = %peer.device_id,
-                        endpoint = %peer.endpoint,
+                        locator = %locator_desc,
                         cooldown_ms = OUTGOING_HANDSHAKE_COOLDOWN.as_millis(),
                         "Skipping outgoing handshake due to cooldown"
                     );
                     return Ok(());
                 }
             }
-            last_attempt.insert(peer.device_id, Instant::now());
+            last_attempt.insert(path_id.clone(), Instant::now());
         }
 
-        let canonical_peer_ip = canonical_underlay_ip(peer.endpoint.ip());
-        let inflight_key = (peer.device_id, canonical_peer_ip);
+        let inflight_key = path_id;
         {
             let mut inflight = self.outgoing_handshake_inflight.lock().await;
-            if !inflight.insert(inflight_key) {
+            if !inflight.insert(inflight_key.clone()) {
                 debug!(
                     peer_id = %peer.device_id,
-                    endpoint = %peer.endpoint,
+                    locator = %locator_desc,
                     "Outgoing handshake already in flight for peer endpoint"
                 );
                 return Ok(());
@@ -955,13 +1128,12 @@ impl OverlayDaemonInner {
                 serde_json::json!({
                     "direction": "outgoing",
                     "peer_id": peer.device_id.to_string(),
-                    "endpoint": peer.endpoint.to_string(),
+                    "locator": locator_desc,
                 }),
             )
             .await;
 
-        let handshake_addr = SocketAddr::new(peer.endpoint.ip(), peer.endpoint.port() + 1);
-        let handshake_result = self.perform_outgoing_handshake(handshake_addr, &peer).await;
+        let handshake_result = self.perform_outgoing_handshake(&peer).await;
         {
             let mut inflight = self.outgoing_handshake_inflight.lock().await;
             inflight.remove(&inflight_key);
@@ -1011,12 +1183,11 @@ impl OverlayDaemonInner {
 
     async fn perform_outgoing_handshake(
         &self,
-        addr: SocketAddr,
         peer: &DiscoveredPeer,
     ) -> Result<PeerState, OverlayDaemonError> {
         tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            self.perform_outgoing_handshake_inner(addr, peer),
+            self.perform_outgoing_handshake_inner(peer),
         )
         .await
         .map_err(|_| OverlayDaemonError::Timeout)?
@@ -1024,98 +1195,104 @@ impl OverlayDaemonInner {
 
     async fn perform_outgoing_handshake_inner(
         &self,
-        addr: SocketAddr,
         peer: &DiscoveredPeer,
     ) -> Result<PeerState, OverlayDaemonError> {
-        let mut stream = TcpStream::connect(addr).await?;
-
-        let local_underlay_hint = resolve_local_underlay_identifier(stream.local_addr()?.ip())?;
-        let binding = self
-            .ensure_peer_tunnel(&peer.device_id, &local_underlay_hint)
-            .await?;
-
-        let local_ephemeral = EphemeralKeypair::generate();
-        let local_msg = HandshakeMessage::create(
-            &self.keypair,
-            &local_ephemeral,
-            &peer.device_id,
-            self.wg_public,
-            binding.listen_port,
-            &self.device_cert,
-        );
-
-        stream.write_all(HANDSHAKE_MAGIC).await?;
-        stream.write_u8(HANDSHAKE_VERSION).await?;
-
-        let pubkey_bytes = self.keypair.public_key().to_bytes();
-        stream.write_all(&pubkey_bytes).await?;
-
-        let msg_bytes = serde_json::to_vec(&local_msg)?;
-        stream.write_u32(msg_bytes.len() as u32).await?;
-        stream.write_all(&msg_bytes).await?;
-
-        let mut magic = [0u8; 4];
-        stream.read_exact(&mut magic).await?;
-        if &magic != HANDSHAKE_MAGIC {
-            return Err(OverlayDaemonError::Handshake("invalid magic".into()));
+        match &peer.locator {
+            PeerLocator::DirectIp { endpoint } => {
+                let handshake_addr = peer
+                    .locator
+                    .handshake_address()
+                    .ok_or_else(|| OverlayDaemonError::Handshake("missing direct handshake address".into()))?;
+                let mut stream = TcpStream::connect(handshake_addr).await?;
+                let local_underlay_hint =
+                    resolve_local_underlay_identifier(stream.local_addr()?.ip())?;
+                let binding = self
+                    .ensure_peer_tunnel(&peer.device_id, &local_underlay_hint)
+                    .await?;
+                let local_ephemeral = EphemeralKeypair::generate();
+                let local_msg = HandshakeMessage::create(
+                    &self.keypair,
+                    &local_ephemeral,
+                    &peer.device_id,
+                    self.wg_public,
+                    binding.listen_port,
+                    &self.device_cert,
+                );
+                let packet = encode_handshake_packet(&self.keypair.public_key().to_bytes(), &local_msg)?;
+                stream.write_all(&packet).await?;
+                let (peer_pubkey, peer_device_id, peer_msg) = read_handshake_packet(&mut stream).await?;
+                if peer_device_id != peer.device_id {
+                    return Err(OverlayDaemonError::Handshake("device id mismatch".into()));
+                }
+                peer_msg
+                    .verify(
+                        &peer_pubkey,
+                        &self.keypair.device_id(),
+                        &self.cert_validator,
+                    )
+                    .map_err(|e| OverlayDaemonError::Handshake(format!("handshake verification failed: {}", e)))?;
+                let peer_wg_endpoint = SocketAddr::new(canonical_underlay_ip(endpoint.ip()), peer_msg.wg_listen_port);
+                self
+                    .finalize_peer_handshake(
+                        binding,
+                        peer.device_id,
+                        peer_pubkey,
+                        peer_msg,
+                        local_ephemeral,
+                        peer_wg_endpoint,
+                        peer.locator.clone(),
+                    )
+                    .await
+            }
+            PeerLocator::Acme {
+                underlay_id,
+                proxy_endpoint,
+                ..
+            } => {
+                let acme = self
+                    .acme
+                    .as_ref()
+                    .ok_or_else(|| OverlayDaemonError::Acme("ACME runtime not available".into()))?;
+                let binding = self.ensure_peer_tunnel(&peer.device_id, underlay_id).await?;
+                acme.register_peer_tunnel(peer.device_id, binding.listen_port).await;
+                let local_ephemeral = EphemeralKeypair::generate();
+                let local_msg = HandshakeMessage::create(
+                    &self.keypair,
+                    &local_ephemeral,
+                    &peer.device_id,
+                    self.wg_public,
+                    binding.listen_port,
+                    &self.device_cert,
+                );
+                let packet = encode_handshake_packet(&self.keypair.public_key().to_bytes(), &local_msg)?;
+                let response = acme
+                    .request_control(peer.device_id, &packet)
+                    .await
+                    .map_err(|e| OverlayDaemonError::Acme(e.to_string()))?;
+                let (peer_pubkey, peer_device_id, peer_msg) = decode_handshake_packet(&response)?;
+                if peer_device_id != peer.device_id {
+                    return Err(OverlayDaemonError::Handshake("device id mismatch".into()));
+                }
+                peer_msg
+                    .verify(
+                        &peer_pubkey,
+                        &self.keypair.device_id(),
+                        &self.cert_validator,
+                    )
+                    .map_err(|e| OverlayDaemonError::Handshake(format!("handshake verification failed: {}", e)))?;
+                self
+                    .finalize_peer_handshake(
+                        binding,
+                        peer.device_id,
+                        peer_pubkey,
+                        peer_msg,
+                        local_ephemeral,
+                        *proxy_endpoint,
+                        peer.locator.clone(),
+                    )
+                    .await
+            }
         }
-
-        let version = stream.read_u8().await?;
-        if version != HANDSHAKE_VERSION {
-            return Err(OverlayDaemonError::Handshake("version mismatch".into()));
-        }
-
-        let mut peer_pubkey_bytes = [0u8; 32];
-        stream.read_exact(&mut peer_pubkey_bytes).await?;
-        let peer_pubkey = VerifyingKey::from_bytes(&peer_pubkey_bytes)
-            .map_err(|_| OverlayDaemonError::Handshake("invalid peer public key".into()))?;
-
-        let peer_device_id = DeviceId::from_public_key(&peer_pubkey);
-        if peer_device_id != peer.device_id {
-            return Err(OverlayDaemonError::Handshake("device id mismatch".into()));
-        }
-
-        let msg_len = stream.read_u32().await? as usize;
-        if msg_len > MAX_HANDSHAKE_MSG_LEN {
-            return Err(OverlayDaemonError::Handshake("message too large".into()));
-        }
-        let mut msg_bytes = vec![0u8; msg_len];
-        stream.read_exact(&mut msg_bytes).await?;
-        let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;
-
-        peer_msg
-            .verify(
-                &peer_pubkey,
-                &self.keypair.device_id(),
-                &self.cert_validator,
-            )
-            .map_err(|e| OverlayDaemonError::Handshake(format!("handshake verification failed: {}", e)))?;
-
-        let peer_ephemeral = peer_msg.ephemeral_public_key();
-        let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
-        let peer_wg_pubkey = peer_msg.wg_pubkey;
-        let peer_overlay_ip = self.network.device_address(&peer.device_id);
-        let peer_wg_endpoint =
-            SocketAddr::new(canonical_underlay_ip(addr.ip()), peer_msg.wg_listen_port);
-
-        let allowed_ips = universal_peer_allowed_ips();
-
-        let peer_config = PeerConfig::new(peer_wg_pubkey)
-            .with_psk(*our_keys.wireguard_psk)
-            .with_allowed_ips(allowed_ips)
-            .with_endpoint(peer_wg_endpoint)
-            .with_keepalive(self.config.persistent_keepalive);
-
-        binding.tunnel.add_peer(&peer_config).await?;
-
-        Ok(PeerState::new(
-            peer.device_id,
-            peer_pubkey,
-            peer_wg_pubkey,
-            peer_overlay_ip,
-            binding.interface_name,
-        )
-        .with_endpoint(peer_wg_endpoint))
     }
 
     async fn handle_incoming_handshake(
@@ -1138,30 +1315,7 @@ impl OverlayDaemonInner {
     ) -> Result<PeerState, OverlayDaemonError> {
         let local_underlay_hint = resolve_local_underlay_identifier(stream.local_addr()?.ip())?;
 
-        let mut magic = [0u8; 4];
-        stream.read_exact(&mut magic).await?;
-        if &magic != HANDSHAKE_MAGIC {
-            return Err(OverlayDaemonError::Handshake("invalid magic".into()));
-        }
-
-        let version = stream.read_u8().await?;
-        if version != HANDSHAKE_VERSION {
-            return Err(OverlayDaemonError::Handshake("version mismatch".into()));
-        }
-
-        let mut peer_pubkey_bytes = [0u8; 32];
-        stream.read_exact(&mut peer_pubkey_bytes).await?;
-        let peer_pubkey = VerifyingKey::from_bytes(&peer_pubkey_bytes)
-            .map_err(|_| OverlayDaemonError::Handshake("invalid peer public key".into()))?;
-        let peer_device_id = DeviceId::from_public_key(&peer_pubkey);
-
-        let msg_len = stream.read_u32().await? as usize;
-        if msg_len > MAX_HANDSHAKE_MSG_LEN {
-            return Err(OverlayDaemonError::Handshake("message too large".into()));
-        }
-        let mut msg_bytes = vec![0u8; msg_len];
-        stream.read_exact(&mut msg_bytes).await?;
-        let peer_msg: HandshakeMessage = serde_json::from_slice(&msg_bytes)?;
+        let (peer_pubkey, peer_device_id, peer_msg) = read_handshake_packet(&mut stream).await?;
 
         peer_msg
             .verify(
@@ -1192,33 +1346,114 @@ impl OverlayDaemonInner {
             binding.listen_port,
             &self.device_cert,
         );
+        let response_packet =
+            encode_handshake_packet(&self.keypair.public_key().to_bytes(), &local_msg)?;
+        stream.write_all(&response_packet).await?;
 
-        stream.write_all(HANDSHAKE_MAGIC).await?;
-        stream.write_u8(HANDSHAKE_VERSION).await?;
+        let peer_wg_endpoint = SocketAddr::new(canonical_underlay_ip(addr.ip()), peer_msg.wg_listen_port);
+        self
+            .finalize_peer_handshake(
+                binding,
+                peer_device_id,
+                peer_pubkey,
+                peer_msg,
+                local_ephemeral,
+                peer_wg_endpoint,
+                PeerLocator::direct_ip(peer_wg_endpoint),
+            )
+            .await
+    }
 
-        let pubkey_bytes = self.keypair.public_key().to_bytes();
-        stream.write_all(&pubkey_bytes).await?;
+    async fn handle_incoming_acme_handshake(
+        &self,
+        request: &IncomingControlRequest,
+    ) -> Result<(PeerState, Vec<u8>), OverlayDaemonError> {
+        let acme = self
+            .acme
+            .as_ref()
+            .ok_or_else(|| OverlayDaemonError::Acme("ACME runtime not available".into()))?;
+        let (peer_pubkey, peer_device_id, peer_msg) = decode_handshake_packet(&request.payload)?;
+        if peer_device_id != request.source {
+            return Err(OverlayDaemonError::Handshake(
+                "ACME control source and device id mismatch".into(),
+            ));
+        }
+        peer_msg
+            .verify(
+                &peer_pubkey,
+                &self.keypair.device_id(),
+                &self.cert_validator,
+            )
+            .map_err(|e| OverlayDaemonError::Handshake(format!("handshake verification failed: {}", e)))?;
+        if !self
+            .nonce_cache
+            .check_and_insert(peer_device_id, peer_msg.nonce)
+            .await
+        {
+            return Err(OverlayDaemonError::Handshake("replay detected".into()));
+        }
 
-        let msg_bytes = serde_json::to_vec(&local_msg)?;
-        stream.write_u32(msg_bytes.len() as u32).await?;
-        stream.write_all(&msg_bytes).await?;
+        let binding = self.ensure_peer_tunnel(&peer_device_id, acme.underlay_id()).await?;
+        acme.register_peer_tunnel(peer_device_id, binding.listen_port).await;
 
+        let local_ephemeral = EphemeralKeypair::generate();
+        let local_msg = HandshakeMessage::create(
+            &self.keypair,
+            &local_ephemeral,
+            &peer_device_id,
+            self.wg_public,
+            binding.listen_port,
+            &self.device_cert,
+        );
+        let response_packet =
+            encode_handshake_packet(&self.keypair.public_key().to_bytes(), &local_msg)?;
+        let peer_wg_endpoint = acme.shared_proxy_endpoint();
+        let peer_state = self
+            .finalize_peer_handshake(
+                binding,
+                peer_device_id,
+                peer_pubkey,
+                peer_msg,
+                local_ephemeral,
+                peer_wg_endpoint,
+                PeerLocator::Acme {
+                    underlay_id: acme.underlay_id().to_string(),
+                    proxy_endpoint: peer_wg_endpoint,
+                    node_name: None,
+                },
+            )
+            .await?;
+        Ok((peer_state, response_packet))
+    }
+
+    async fn finalize_peer_handshake(
+        &self,
+        binding: PeerTunnelBinding,
+        peer_device_id: DeviceId,
+        peer_pubkey: VerifyingKey,
+        peer_msg: HandshakeMessage,
+        local_ephemeral: EphemeralKeypair,
+        peer_wg_endpoint: SocketAddr,
+        locator: PeerLocator,
+    ) -> Result<PeerState, OverlayDaemonError> {
         let peer_ephemeral = peer_msg.ephemeral_public_key();
         let our_keys = derive_session_keys(&local_ephemeral, &peer_ephemeral);
         let peer_wg_pubkey = peer_msg.wg_pubkey;
         let peer_overlay_ip = self.network.device_address(&peer_device_id);
-        let peer_wg_endpoint =
-            SocketAddr::new(canonical_underlay_ip(addr.ip()), peer_msg.wg_listen_port);
 
         let allowed_ips = universal_peer_allowed_ips();
-
         let peer_config = PeerConfig::new(peer_wg_pubkey)
             .with_psk(*our_keys.wireguard_psk)
             .with_allowed_ips(allowed_ips)
             .with_endpoint(peer_wg_endpoint)
             .with_keepalive(self.config.persistent_keepalive);
-
         binding.tunnel.add_peer(&peer_config).await?;
+
+        if let PeerLocator::Acme { .. } = locator {
+            if let Some(acme) = &self.acme {
+                acme.register_peer_tunnel(peer_device_id, binding.listen_port).await;
+            }
+        }
 
         Ok(PeerState::new(
             peer_device_id,
@@ -1227,7 +1462,8 @@ impl OverlayDaemonInner {
             peer_overlay_ip,
             binding.interface_name,
         )
-        .with_endpoint(peer_wg_endpoint))
+        .with_endpoint(peer_wg_endpoint)
+        .with_locator(locator))
     }
 
     async fn remove_tunnel_interface(
@@ -1249,6 +1485,13 @@ impl OverlayDaemonInner {
             }
             if let Err(e) = tunnel.remove_interface().await {
                 warn!(peer_id = %peer.device_id, iface = %peer.tunnel_interface, "Failed to remove tunnel interface: {}", e);
+            }
+        }
+
+        if matches!(peer.locator, Some(PeerLocator::Acme { .. })) {
+            if let Some(acme) = &self.acme {
+                acme.unregister_peer_tunnel(&peer.device_id, deterministic_tunnel_listen_port(&peer.tunnel_interface))
+                    .await;
             }
         }
 
@@ -1550,7 +1793,7 @@ impl OverlayDaemonInner {
             }
 
             let already_connected = self.peers.read().await.values().any(|state| {
-                state.device_id == peer.device_id && state.endpoint == Some(peer.endpoint)
+                state.device_id == peer.device_id && state.locator.as_ref() == Some(&peer.locator)
             });
             if already_connected {
                 continue;
@@ -1748,6 +1991,16 @@ impl OverlayDaemonInner {
                     warn!(peer_id = %id, iface = %peer.tunnel_interface, "Failed to remove tunnel interface during shutdown: {}", e);
                 }
             }
+            if matches!(peer.locator, Some(PeerLocator::Acme { .. })) {
+                if let Some(acme) = &self.acme {
+                    acme.unregister_peer_tunnel(&peer.device_id, deterministic_tunnel_listen_port(&peer.tunnel_interface))
+                        .await;
+                }
+            }
+        }
+
+        if let Some(acme) = &self.acme {
+            acme.shutdown().await;
         }
 
         // Stop discovery last (best-effort). This reduces noisy shutdown logs
@@ -2012,6 +2265,7 @@ enum OverlayDaemonError {
     CertConfig(avena_overlay::ConfigError),
     Tunnel(avena_overlay::TunnelError),
     Discovery(avena_overlay::DiscoveryError),
+    Acme(String),
     Routing(RoutingError),
     Io(std::io::Error),
     Handshake(String),
@@ -2026,6 +2280,7 @@ impl std::fmt::Display for OverlayDaemonError {
             OverlayDaemonError::CertConfig(e) => write!(f, "certificate config error: {}", e),
             OverlayDaemonError::Tunnel(e) => write!(f, "tunnel error: {}", e),
             OverlayDaemonError::Discovery(e) => write!(f, "discovery error: {}", e),
+            OverlayDaemonError::Acme(e) => write!(f, "acme error: {}", e),
             OverlayDaemonError::Routing(e) => write!(f, "routing error: {}", e),
             OverlayDaemonError::Io(e) => write!(f, "io error: {}", e),
             OverlayDaemonError::Handshake(e) => write!(f, "handshake error: {}", e),
@@ -2167,25 +2422,44 @@ async fn main() {
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let config_path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args_os();
+    let program = args
+        .next()
+        .and_then(|arg| arg.into_string().ok())
+        .unwrap_or_else(|| "avena-overlay".to_string());
+    let default_config_path = PathBuf::from("/etc/avena/avena-overlay.toml");
+    let config_path = args
+        .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/avena/avena-overlay.toml"));
+        .unwrap_or_else(|| default_config_path.clone());
 
-    let config = if config_path.exists() {
-        match OverlayConfig::load_from_file(&config_path) {
-            Ok(c) => {
-                info!(path = %config_path.display(), "Loaded configuration");
-                c
-            }
-            Err(e) => {
-                error!("Failed to load config: {}", e);
-                std::process::exit(1);
-            }
+    if args.next().is_some() {
+        error!("Too many arguments. Usage: {} <config-path>", program);
+        std::process::exit(2);
+    }
+
+    if !config_path.exists() {
+        if config_path == default_config_path {
+            error!(
+                "Configuration file not found at default path {}. Usage: {} <config-path>",
+                config_path.display(),
+                program
+            );
+        } else {
+            error!("Configuration file not found: {}", config_path.display());
         }
-    } else {
-        info!("Using default configuration");
-        OverlayConfig::default()
+        std::process::exit(1);
+    }
+
+    let config = match OverlayConfig::load_from_file(&config_path) {
+        Ok(c) => {
+            info!(path = %config_path.display(), "Loaded configuration");
+            c
+        }
+        Err(e) => {
+            error!("Failed to load config {}: {}", config_path.display(), e);
+            std::process::exit(1);
+        }
     };
 
     match OverlayDaemon::new(config).await {

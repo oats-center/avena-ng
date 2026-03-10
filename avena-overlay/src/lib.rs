@@ -10,6 +10,7 @@
 //! Most types are re-exported for ergonomic use by the `avena-overlay` binary.
 
 pub mod address;
+pub mod acme;
 pub mod crypto;
 pub mod daemon;
 pub mod discovery;
@@ -24,13 +25,16 @@ pub use crypto::{
     issue_jwt, wireguard_pubkey, CertClaims, CertError, CertValidator, EphemeralKeypair,
     HandshakeError, HandshakeMessage, SessionKeys, WireguardKeypair,
 };
+pub use acme::{AcmeError, AcmeRuntime, DiscoveryPayload as AcmeDiscoveryPayload, IncomingControlRequest};
 pub use daemon::{
-    ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, OverlayConfig, PeerState, RoutingConfig,
+    AcmeConfig, ConfigError, DiscoveryConfig as DaemonDiscoveryConfig, OverlayConfig, PeerState,
+    RoutingConfig,
     TelemetryConfig as DaemonTelemetryConfig, TunnelMode,
 };
 pub use discovery::{
     Capability, DiscoveredPeer, DiscoveryConfig, DiscoveryError, DiscoveryEvent, DiscoveryService,
-    DiscoverySource, LocalAnnouncement, MdnsDiscovery, StaticPeerConfig, StaticPeers,
+    DiscoverySource, LocalAnnouncement, MdnsDiscovery, PeerLocator, PeerPathId,
+    StaticPeerConfig, StaticPeers,
 };
 pub use identity::{derive_workload_keypair, DecodeError, DeviceId, DeviceKeypair};
 pub use tunnel::{
