@@ -2525,6 +2525,24 @@ async fn main() {
         .and_then(|arg| arg.into_string().ok())
         .unwrap_or_else(|| "avena-overlay".to_string());
     let default_config_path = PathBuf::from("/etc/avena/avena-overlay.toml");
+
+    match args.next().as_ref().and_then(|arg| arg.to_str()) {
+        Some("--help") | Some("-h") => {
+            print_usage(&program);
+            std::process::exit(0);
+        }
+        Some("--version") | Some("-V") => {
+            println!("{} {}", program, env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Some(other) if other.starts_with('-') => {
+            error!("Unknown option: {}", other);
+            print_usage(&program);
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+
     let config_path = args
         .next()
         .map(PathBuf::from)
@@ -2573,4 +2591,15 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn print_usage(program: &str) {
+    eprintln!("Usage:");
+    eprintln!("  {} [--help] [--version] [config-path]", program);
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -h, --help       Show this help message");
+    eprintln!("  -V, --version    Show version information");
+    eprintln!();
+    eprintln!("If config-path is omitted, defaults to /etc/avena/avena-overlay.toml");
 }
