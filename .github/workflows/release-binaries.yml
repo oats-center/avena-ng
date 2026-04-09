@@ -1,0 +1,62 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary
+        run: cross build --release --bin avena-overlay --target ${{ matrix.target }} -p avena-overlay
+
+      - name: Package release asset
+        run: |
+          stage_dir="dist/${{ matrix.target }}"
+          mkdir -p "$stage_dir"
+          cp "target/${{ matrix.target }}/release/avena-overlay" "$stage_dir/avena-overlay"
+          tar -C "$stage_dir" -czf "avena-overlay-${{ matrix.target }}.tar.gz" "avena-overlay"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: avena-overlay-${{ matrix.target }}
+          path: avena-overlay-${{ matrix.target }}.tar.gz
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/avena-overlay-*.tar.gz

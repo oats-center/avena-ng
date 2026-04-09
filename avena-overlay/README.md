@@ -150,3 +150,14 @@ Remote nodes that should publish to that NATS server need `telemetry.nats_url = 
 The GitHub Actions workflow publishes `ghcr.io/<owner>/avena-overlay` on pushes to `main` and tags matching `v*`.
 Use `podman pull ghcr.io/<owner>/avena-overlay:latest` on hosts that should run the quadlet unit.
 If the package is private, run `podman login ghcr.io` first.
+
+## Release binaries
+
+Tag pushes publish tarball assets for `avena-overlay` on both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`.
+
+Example asset names:
+
+- `avena-overlay-x86_64-unknown-linux-gnu.tar.gz`
+- `avena-overlay-aarch64-unknown-linux-gnu.tar.gz`
+
+Install by unpacking the tarball and copying `avena-overlay` into your PATH.
