@@ -1,0 +1,37 @@
+FROM docker.io/library/rust:1-bookworm AS builder
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY avena-overlay/Cargo.toml avena-overlay/Cargo.toml
+COPY avena-testbed/Cargo.toml avena-testbed/Cargo.toml
+COPY avena-overlay/src avena-overlay/src
+
+RUN cargo build --release -p avena-overlay --bin avena-overlay
+
+FROM docker.io/library/golang:1.24-bookworm AS wireguard-go-builder
+
+WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git make \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/WireGuard/wireguard-go.git . \
+    && make
+
+FROM registry.fedoraproject.org/fedora:43
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        babeld \
+        ca-certificates \
+        iproute \
+        wireguard-tools \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+COPY --from=builder /src/target/release/avena-overlay /usr/local/bin/avena-overlay
+COPY --from=wireguard-go-builder /src/wireguard-go /usr/local/bin/wireguard-go
+
+ENTRYPOINT ["/usr/local/bin/avena-overlay"]
+CMD ["/etc/avena/avena-overlay.toml"]

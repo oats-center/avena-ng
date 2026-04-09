@@ -1,0 +1,19 @@
+[Unit]
+Description=Avena overlay sidecar
+
+[Container]
+Image=localhost/avena-overlay:latest
+ContainerName=avena-overlay
+Network=bridge
+Volume=/etc/avena:/etc/avena:Z
+PublishPort=51820:51820/udp
+PublishPort=51821:51821/tcp
+AddCapability=NET_ADMIN
+AddDevice=/dev/net/tun
+Environment=RUST_LOG=info
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
