@@ -1,4 +1,5 @@
 use crate::AcmeConfig;
+use std::time::Duration;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -90,16 +91,14 @@ impl AcmeProcessController {
         }
 
         if let Some(status) = tx_process.try_wait()? {
-            let _ = rx_process.start_kill();
-            let _ = rx_process.wait().await;
+            stop_child(&mut rx_process).await;
             return Err(AcmeError::Process(format!(
                 "TX helper exited early with status {status}"
             )));
         }
 
         if let Some(status) = rx_process.try_wait()? {
-            let _ = tx_process.start_kill();
-            let _ = tx_process.wait().await;
+            stop_child(&mut tx_process).await;
             return Err(AcmeError::Process(format!(
                 "RX helper exited early with status {status}"
             )));
@@ -113,12 +112,26 @@ impl AcmeProcessController {
 
     pub async fn stop(&mut self) {
         if let Some(mut tx_process) = self.tx_process.take() {
-            let _ = tx_process.start_kill();
-            let _ = tx_process.wait().await;
+            stop_child(&mut tx_process).await;
         }
         if let Some(mut rx_process) = self.rx_process.take() {
-            let _ = rx_process.start_kill();
-            let _ = rx_process.wait().await;
+            stop_child(&mut rx_process).await;
+        }
+    }
+}
+
+async fn stop_child(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+
+    match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
     }
 }
