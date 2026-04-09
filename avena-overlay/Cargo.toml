@@ -1,6 +1,6 @@
 [package]
 name = "avena-overlay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Avena Overlay Network - encrypted, authenticated IP connectivity"
 license = "MIT OR Apache-2.0"
@@ -18,7 +18,12 @@ path = "src/bin/avena_keygen.rs"
 
 [dependencies]
 # Crypto
-ed25519-dalek = { version = "2", features = ["rand_core", "serde", "zeroize", "pkcs8"] }
+ed25519-dalek = { version = "2", features = [
+  "rand_core",
+  "serde",
+  "zeroize",
+  "pkcs8",
+] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 sha2 = "0.10"
 hkdf = "0.12"
@@ -43,7 +48,18 @@ mdns-sd = "0.11"
 # Async
 async-trait = "0.1"
 async-nats = "0.39"
-tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "time", "fs", "io-util", "process"] }
+tokio = { version = "1", features = [
+  "sync",
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "net",
+  "time",
+  "fs",
+  "io-util",
+  "process",
+] }
 
 # Logging
 tracing = "0.1"
