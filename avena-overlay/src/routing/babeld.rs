@@ -52,6 +52,13 @@ pub struct BabeldConfig {
     /// support IPv6 policy routing rules (where `ip -6 rule show` fails).
     #[serde(default)]
     pub ipv6_subtrees: Option<bool>,
+
+    /// Skip babeld's kernel sysctl setup.
+    ///
+    /// Useful in containers where `/proc/sys` is read-only. When enabled, the
+    /// host must provide the required forwarding and redirect settings.
+    #[serde(default = "default_skip_kernel_setup")]
+    pub skip_kernel_setup: bool,
 }
 
 fn default_socket_path() -> PathBuf {
@@ -78,6 +85,10 @@ const fn default_update_interval() -> u16 {
     4000
 }
 
+const fn default_skip_kernel_setup() -> bool {
+    false
+}
+
 impl Default for BabeldConfig {
     fn default() -> Self {
         Self {
@@ -88,6 +99,7 @@ impl Default for BabeldConfig {
             hello_interval: default_hello_interval(),
             update_interval: default_update_interval(),
             ipv6_subtrees: None,
+            skip_kernel_setup: default_skip_kernel_setup(),
         }
     }
 }
@@ -259,6 +271,21 @@ impl BabeldController {
                 "ipv6-subtrees {}",
                 if value { "true" } else { "false" }
             ));
+        }
+
+        if self.config.skip_kernel_setup {
+            let missing_sysctls = missing_container_sysctls();
+            if missing_sysctls.is_empty() {
+                info!(
+                    "babeld kernel setup skipped; required sysctls already appear to be set"
+                );
+            } else {
+                warn!(
+                    required_sysctls = %missing_sysctls.join(", "),
+                    "babeld kernel setup skipped; ensure the host has the required sysctls when running in a container"
+                );
+            }
+            cmd.arg("-C").arg("skip-kernel-setup true");
         }
 
         // Many babeld builds refuse to start without at least one interface.
@@ -492,6 +519,30 @@ impl BabeldController {
 fn interface_tunnel_statement(name: &str) -> String {
     // Same semantics as interface_tunnel_command, but without the trailing newline.
     format!("interface {name} type tunnel unicast true split-horizon true")
+}
+
+fn missing_container_sysctls() -> Vec<String> {
+    container_kernel_sysctls()
+        .into_iter()
+        .filter_map(|(path, expected)| match std::fs::read_to_string(path) {
+            Ok(current) if current.trim() == expected => None,
+            Ok(current) => Some(format!("{path}={expected} (current: {})", current.trim())),
+            Err(e) => Some(format!("{path}={expected} (unreadable: {e})")),
+        })
+        .collect()
+}
+
+fn container_kernel_sysctls() -> [(&'static str, &'static str); 8] {
+    [
+        ("/proc/sys/net/ipv6/conf/all/forwarding", "1"),
+        ("/proc/sys/net/ipv6/conf/default/forwarding", "1"),
+        ("/proc/sys/net/ipv6/conf/all/accept_redirects", "0"),
+        ("/proc/sys/net/ipv6/conf/default/accept_redirects", "0"),
+        ("/proc/sys/net/ipv4/conf/all/forwarding", "1"),
+        ("/proc/sys/net/ipv4/conf/default/forwarding", "1"),
+        ("/proc/sys/net/ipv4/conf/all/rp_filter", "0"),
+        ("/proc/sys/net/ipv4/conf/default/rp_filter", "0"),
+    ]
 }
 
 #[cfg(target_os = "linux")]
@@ -896,6 +947,7 @@ mod tests {
         assert_eq!(config.hello_interval, 1000);
         assert_eq!(config.update_interval, 4000);
         assert_eq!(config.debug_level, 0);
+        assert!(!config.skip_kernel_setup);
     }
 
     #[test]

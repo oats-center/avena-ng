@@ -38,3 +38,23 @@ If you also run a sibling service like NATS, give that container `Network=avena-
 - `51821/tcp` for handshake control
 
 Sibling containers decide their own published host ports, for example `4222/tcp` for NATS.
+
+## Container config
+
+For container runs, set this in `avena-overlay.toml`:
+
+```toml
+[routing.babel]
+skip_kernel_setup = true
+```
+
+When that flag is set, `avena-overlay` checks these sysctls from `/proc/sys` and logs only the missing ones:
+
+- `net.ipv6.conf.all.forwarding=1`
+- `net.ipv6.conf.default.forwarding=1`
+- `net.ipv6.conf.all.accept_redirects=0`
+- `net.ipv6.conf.default.accept_redirects=0`
+- `net.ipv4.conf.all.forwarding=1`
+- `net.ipv4.conf.default.forwarding=1`
+- `net.ipv4.conf.all.rp_filter=0`
+- `net.ipv4.conf.default.rp_filter=0`
