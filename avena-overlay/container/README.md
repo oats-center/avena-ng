@@ -32,6 +32,8 @@ systemctl start avena-overlay.service
 
 If you also run a sibling service like NATS, give that container `Network=avena-overlay.container` so it joins the overlay container's network namespace.
 
+Set `Notify=true` in the overlay quadlet so systemd waits for the daemon's `READY=1` notification.
+
 ## Published ports
 
 - `51820/udp` for WireGuard data

@@ -10,6 +10,7 @@ PublishPort=51820:51820/udp
 PublishPort=51821:51821/tcp
 AddCapability=NET_ADMIN
 AddDevice=/dev/net/tun
+Notify=true
 Environment=RUST_LOG=info
 
 [Service]

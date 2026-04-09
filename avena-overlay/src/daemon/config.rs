@@ -251,6 +251,10 @@ pub struct DiscoveryConfig {
 
 impl DiscoveryConfig {
     pub fn effective_mdns_interfaces(&self) -> Vec<String> {
+        if !self.enable_mdns {
+            return Vec::new();
+        }
+
         if !self.mdns_interfaces.is_empty() {
             self.mdns_interfaces.clone()
         } else if let Some(ref iface) = self.mdns_interface {
@@ -450,6 +454,16 @@ mod tests {
         assert!(config.telemetry.publish_nats);
         assert_eq!(config.telemetry.babel_snapshot_interval_secs, 1);
         assert!(config.acme.is_none());
+    }
+
+    #[test]
+    fn disabled_mdns_ignores_interface_list() {
+        let mut config = DiscoveryConfig::default();
+        config.enable_mdns = false;
+        config.mdns_interfaces = vec!["eth0".into()];
+        config.mdns_interface = Some("eth1".into());
+
+        assert!(config.effective_mdns_interfaces().is_empty());
     }
 
     #[test]

@@ -43,6 +43,100 @@ const TELEMETRY_SCHEMA_VERSION: u8 = 1;
 const DEFAULT_TELEMETRY_RUN_ID: &str = "standalone";
 const DEFAULT_TELEMETRY_TOKEN: &str = "unknown";
 
+#[cfg(unix)]
+fn systemd_notify(message: &str) {
+    if let Err(e) = systemd_notify_impl(message) {
+        debug!(error = %e, "sd_notify failed");
+    }
+}
+
+#[cfg(not(unix))]
+fn systemd_notify(_message: &str) {}
+
+#[cfg(unix)]
+fn systemd_notify_impl(message: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+
+    let socket = socket.as_os_str().as_bytes();
+    let (addr, len) = systemd_notify_addr(socket)?;
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let send_result = unsafe {
+        libc::sendto(
+            fd,
+            message.as_ptr().cast(),
+            message.len(),
+            0,
+            (&addr as *const libc::sockaddr_un).cast(),
+            len,
+        )
+    };
+
+    let send_error = if send_result < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+
+    unsafe {
+        libc::close(fd);
+    }
+
+    if let Some(err) = send_error {
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn systemd_notify_addr(socket: &[u8]) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+    let path = if socket.starts_with(b"@") {
+        &socket[1..]
+    } else {
+        socket
+    };
+
+    if socket.starts_with(b"@") {
+        if path.len() + 1 > addr.sun_path.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "notify socket path too long",
+            ));
+        }
+        addr.sun_path[0] = 0;
+        for (idx, byte) in path.iter().enumerate() {
+            addr.sun_path[idx + 1] = *byte as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sa_family_t>() + 1 + path.len();
+        Ok((addr, len as libc::socklen_t))
+    } else {
+        if path.len() + 1 > addr.sun_path.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "notify socket path too long",
+            ));
+        }
+        for (idx, byte) in path.iter().enumerate() {
+            addr.sun_path[idx] = *byte as libc::c_char;
+        }
+        addr.sun_path[path.len()] = 0;
+        let len = std::mem::size_of::<libc::sa_family_t>() + path.len() + 1;
+        Ok((addr, len as libc::socklen_t))
+    }
+}
+
 fn encode_handshake_packet(
     public_key: &[u8; 32],
     message: &HandshakeMessage,
@@ -580,6 +674,7 @@ impl OverlayDaemon {
             .expect("discovery_rx already taken");
         let inner = Arc::clone(&self.inner);
 
+        systemd_notify("STATUS=Announcing overlay presence");
         inner.announce_presence().await?;
 
         for peer in inner.discovery.resolve_static_peers().await {
@@ -593,6 +688,7 @@ impl OverlayDaemon {
             });
         }
 
+        systemd_notify("READY=1\nSTATUS=Running");
         info!("avena-overlay running. Press Ctrl+C to stop.");
 
         let mut dead_peer_interval =
@@ -847,6 +943,7 @@ impl OverlayDaemon {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutdown signal received");
+                    systemd_notify("STOPPING=1\nSTATUS=Shutting down");
                     break;
                 }
             }
@@ -2461,6 +2558,8 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    systemd_notify("STATUS=Starting overlay daemon");
 
     match OverlayDaemon::new(config).await {
         Ok(mut daemon) => {
